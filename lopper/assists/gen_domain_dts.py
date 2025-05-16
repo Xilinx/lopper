@@ -266,7 +266,7 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                             'psv_pmc_slave_boot_stream', 'psv_pmc_trng', 'psv_psm_global_reg', 'psv_rpu', 'psv_scntr']
 
     versal_gen2_linux_ignore_ip_list = ['mmi_udh_pll', 'mmi_common', 'mmi_pipe_gem_slcr',
-                            'mmi_udh_pll', 'mmi_udh_slcr', 'mmi_usb2phy', 'mmi_usb3phy_crpara', 'mmi_usb3phy_tca', 'mmi_usb_cfg',
+                            'mmi_udh_pll', 'mmi_udh_slcr', 'mmi_usb2phy', 'mmi_usb3phy_crpara', 'mmi_usb3phy_tca',
                             'pmc_rsa', 'pmc_aes', 'pmc_sha2', 'pmc_sha3', "rpu", "apu", "pmc_ppu1_mdm", "pmc_xppu_npi", "pmc_xppu",
                             "pmc_xmpu", "pmc_slave_boot_stream", "pmc_slave_boot", "pmc_ram_npi", "pmc_global", "ocm", "ocm_xmpu",
                             "lpd_xppu", "lpd_systmr_read", "lpd_systmr_ctrl", "lpd_slcr_secure", "lpd_slcr", "lpd_iou_slcr",
@@ -305,7 +305,7 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                 if "cpu" in node.propval('device_type', list)[0]:
                     continue
             if node.propval('status') != ['']:
-                if 'disabled' in node.propval('status', list)[0] and linux_dt:
+                if linux_dt and ('disabled' in node.propval('status', list)[0] or "@" not in node.name):
                     continue
                 elif "tcm" in node.propval('compatible', list)[0]:
                     continue
@@ -409,11 +409,16 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
     valid_alias_proplist = []
 
     zephyr_supported_schema_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "zephyr_supported_comp.yaml")
+    memnode_list = sdt.tree.nodes('/memory@.*')
     if utils.is_file(zephyr_supported_schema_file):
         schema = utils.load_yaml(zephyr_supported_schema_file)
         for node in root_sub_nodes:
             if node.parent:
                 if node.propval("compatible") != ['']:
+                    # R52
+                    if "arm,cortex-r52" in node["compatible"].value:
+                        if node.propval('xlnx,cpu-clk-freq-hz') != ['']:
+                            node["clock-frequency"] = node['xlnx,cpu-clk-freq-hz'].value
                     if node.propval('xlnx,ip-name') != ['']:
                         val = node.propval('xlnx,ip-name', list)[0]
                         if val == "axi_intc":
@@ -490,15 +495,86 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                                 new_node['#gpio-cells'] = 2
                                 new_node.label_set(node.label)
                                 node.add(new_node)
+                    # SDHC
+                    if any(version in node["compatible"].value for version in ("xlnx,versal-8.9a", "xlnx,versal-net-emmc")):
+                        version = lambda x: x in node["compatible"].value
+                        new_node = LopperNode()
+                        if version("xlnx,versal-net-emmc"):
+                            new_node.name = "mmc"
+                            new_node['compatible'] = "zephyr,mmc-disk"
+                            new_node['bus-width'] = node["xlnx,bus-width"].value
+                        else:
+                            new_node.name = "sdmmc"
+                            new_node['compatible'] = "zephyr,sdmmc-disk"
+                            node['power-delay-ms'] = 10
+                        node.add(new_node)
+                        node["compatible"] = "xlnx,versal-8.9a"
+                    # GPIOPS
+                    if any(version in node["compatible"].value for version in ("xlnx,pmc-gpio-1.0", "xlnx,versal-gpio-1.0")):
+                        version = lambda x: x in node["compatible"].value
+                        platform = sdt.tree['/']['family'].value
+                        if version("xlnx,pmc-gpio-1.0"):
+                            num_banks = [(0,26),(1,26),(3,32),(4,32)]
+                            if platform != ['VersalNet']:
+                                num_banks.extend([(2,26),(5,32)])
+                        else:
+                            num_banks = [(0,26),(3,32)]
+                            if platform != ['VersalNet']:
+                                num_banks.append((4,32))
+                        for bank in num_banks:
+                            new_node = LopperNode()
+                            new_node["compatible"] = "xlnx,ps-gpio-bank"
+                            new_node['reg'] = bank[0]
+                            new_node['#gpio-cells'] = 2
+                            new_prop = LopperProp( "gpio-controller" )
+                            new_node + new_prop
+                            new_node['ngpios'] = bank[1]
+                            new_node.name = f"{node.label}_bank@{bank[0]}"
+                            new_node.label_set(f"{node.label}_bank{bank[0]}")
+                            node.add(new_node)
+                        node['#address-cells'] = 1
+                        node['#size-cells'] = 0
+                        node['compatible'] = "xlnx,ps-gpio"
                     if is_supported_periph:
                         required_prop = is_supported_periph[0]["required"]
                         prop_list = list(node.__props__.keys())
                         valid_alias_proplist.append(node.name)
+                        # Create fixed clock nodes
+                        if 'clocks' in required_prop:
+                            if any(clock_prop := (re.search(r'xlnx,.*-clk-freq-hz$', prop)) for prop in prop_list):
+                                clk_freq = node[clock_prop.group()].value
+                            else:
+                                # If there is no clk-freq property use 0MHZ as default this prevent
+                                # build failure if any of the ip does not have this property.
+                                clk_freq = 0
+                            new_ref_clk = True
+                            # Check clock node with requested clk-freq is already available or not,
+                            # if yes use the existing clk node else create new ref clock node.
+                            for clk_node in sdt.tree.nodes(r'.*ref_clock$'):
+                                if clk_freq == clk_node['clock-frequency'].value:
+                                    if node.props('clocks') != []:
+                                        node.delete('clocks')
+                                    clock_prop = f"clocks = <&{clk_node.name}>"
+                                    node + LopperProp(clock_prop)
+                                    new_ref_clk = False
+                            if new_ref_clk:
+                                new_node = LopperNode()
+                                new_node.abs_path = "/clocks"
+                                new_node.name = node.label + "_ref_clock"
+                                new_node['compatible'] = ["fixed-clock"]
+                                new_node['#clock-cells'] = 0
+                                new_node['clock-frequency'] = clk_freq
+                                new_node.label_set(new_node.name)
+                                sdt.tree.add(new_node)
+                                if node.props('clocks') != []:
+                                    node.delete('clocks')
+                                clock_prop = f"clocks = <&{new_node.name}>"
+                                node + LopperProp(clock_prop)
                         for prop in prop_list:
                             if prop not in required_prop:
                                 node.delete(prop)
                     else:
-                        if node.name != "axi" and node.name != "soc":
+                        if node.name not in ("axi", "soc") and node not in memnode_list:
                             sdt.tree.delete(node)
 
     alias_node = sdt.tree['/aliases']
@@ -560,7 +636,7 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
 
     err_no_intc = "\nERROR: Zephyr OS requires the presence of at least one interrupt controller. Please ensure that the axi_intc is included in the design, with fast interrupts disabled.\r"
     err_no_timer = "\nERROR: Zephyr OS requires at least one timer controller with interrupts enabled for its scheduler. Please include the axi_timer in your hardware design and ensure its interrupts are properly connected.\r"
-    erro_intc_has_fast = "\nERROR: Zephyr OS does not support fast interrupt configurations. Please disable fast interrupts in your hardware design and attempt to build with the updated configuration.\r"
+    warn_intc_has_fast = "\nWARNING: Zephyr does not support fast interrupts; they will be handled as standard interrupts. Therefore, enabling FAST interrupts in the AXI INTC core will not improve interrupt latency. Additionally, fast interrupts are not supported in QEMU.\r"
     err_timer_nointr = "\nERROR: Zephyr OS requires at least one timer with interrupts enabled to manage its scheduler effectively. Please ensure that the interrupt pins for the timer are correctly connected in your hardware design and rebuild with the updated configuration.\r"
     if not is_axi_intc_present and not is_axi_timer_present:
         print(err_no_intc)
@@ -573,8 +649,7 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
         if is_axi_intc_present.propval('xlnx,has-fast') != ['']:
             val = is_axi_intc_present.propval('xlnx,has-fast', list)[0]
             if val != 0 or val != 0x0:
-                print(erro_intc_has_fast)
-                sys.exit(1)
+                print(warn_intc_has_fast)
     if not is_axi_timer_present:
         print(err_no_timer)
         sys.exit(1)

@@ -848,7 +848,6 @@ def xlnx_openamp_gen_outputs_only(sdt, machine, output_file, verbose = 0 ):
         ipi_irq_vect_id_rtos = hex(remote_vect_id-32)
 
         if platform == SOC_TYPE.ZYNQMP:
-            ipi_irq_vect_id_rtos = ipi_irq_vect_id
             host_bitmask = None
             for n in tree["/"].subnodes():
                 xlnx_ipi_id_pval = n.propval("xlnx,ipi-id")
@@ -970,7 +969,7 @@ def xlnx_openamp_gen_outputs(openamp_channel_info, channel_id, role, verbose = 0
                 soc_ipi_map[nobuf_ipi_key] = nobuf_ipi
 
         IPI_IRQ_VECT_ID = remote_ipi_irq_vect_id if role == 'remote' else host_ipi_irq_vect_id
-        IPI_IRQ_VECT_ID_FREERTOS = IPI_IRQ_VECT_ID if platform == SOC_TYPE.ZYNQMP else hex(int(IPI_IRQ_VECT_ID,16) - 32)
+        IPI_IRQ_VECT_ID_FREERTOS = hex(int(IPI_IRQ_VECT_ID,16) - 32)
 
         POLL_BASE_ADDR = remote_ipi_base if role == 'remote' else host_ipi_base
         # flip this as we are kicking other side with the bitmask value
@@ -1084,16 +1083,18 @@ def xlnx_rpmsg_parse(tree, node, openamp_channel_info, options, xlnx_options = N
         openamp_channel_info["carveouts_"+channel_id] = channel_carveouts_nodes
 
         # rpmsg native?
-        native = node.propval("openamp-xlnx-native")
+        native = []
 
         # no rpmsg userspace support in v2
         if openamp_channel_info[REMOTEPROC_D_TO_D_v2]:
             native = []
             for j in remote_nodes:
                 native.append(False)
-
-        if native == [] or len(native) != len(remote_nodes):
-            print("ERROR: malformed openamp-xlnx-native property.")
+        else:
+            # keep parsing of the property for backward compatibility
+            native = node.propval("openamp-xlnx-native")
+            if native == [] or len(native) != len(remote_nodes):
+                print("ERROR: malformed openamp-xlnx-native property.")
             return False
 
         native = native[i]
@@ -1342,7 +1343,7 @@ def xlnx_remoteproc_v2_add_cluster(tree, platform, cpu_config, cluster_ranges_va
       SOC_TYPE.ZYNQMP : "xlnx,zynqmp-r5fss",
       SOC_TYPE.VERSAL : "xlnx,versal-r5fss",
       SOC_TYPE.VERSAL_NET : "xlnx,versal-net-r52fss",
-      SOC_TYPE.VERSAL2 : "xlnx,versal2-r52fss",
+      SOC_TYPE.VERSAL2 : "xlnx,versal-net-r52fss",
     }
 
     cluster_modes = {
@@ -1809,11 +1810,6 @@ def xlnx_remoteproc_parse(tree, node, openamp_channel_info, verbose = 0 ):
             channel_elfload_nodes.append ( elfloadnode )
 
         if platform in [SOC_TYPE.ZYNQMP, SOC_TYPE.VERSAL, SOC_TYPE.VERSAL_NET, SOC_TYPE.VERSAL2]:
-            cpu_config = determine_cpus_config(remote_node)
-            if cpu_config ==  CPU_CONFIG.RPU_SPLIT and len(remote_nodes) == 1:
-                print("ERROR: CPU config is split but only 1 remote node", remote_node, "has been provided.")
-                return False
-
             ret = xlnx_remoteproc_rpu_parse(tree, node, openamp_channel_info, remote_node, channel_elfload_nodes, verbose)
             if not ret:
                 return ret
