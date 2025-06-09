@@ -130,17 +130,24 @@ class LopperSDT:
         if libfdt:
             lopper.log._info( f"loading dtb and using libfdt to manipulate tree" )
 
-        # check for required support applications
-        if libfdt:
-            support_bins = [ os.environ.get("LOPPER_DTC", "dtc"), os.environ.get("LOPPER_CPP", "cpp") ]
-        else:
-            support_bins = [ os.environ.get("LOPPER_CPP", "cpp") ]
+        if sdt_file:
+            # check for required support applications
+            if libfdt:
+                support_bins = [ os.environ.get("LOPPER_DTC", "dtc") ]
+            else:
+                support_bins = []
 
-        for s in support_bins:
-            lopper.log._info( f"checking for support binary: {s}" )
-            if not shutil.which(s):
-                lopper.log._error( f"support application '{s}' not found, exiting" )
-                sys.exit(2)
+            # cpp or pcpp is required for both libfdt and non-libfdt modes
+            preprocessor = (os.environ.get('LOPPER_CPP') or
+                                           shutil.which("cpp") or
+                                           shutil.which("pcpp") or
+                                           shutil.which("pcpp-python") or "").split()
+            support_bins.extend( preprocessor )
+            for s in support_bins:
+                lopper.log._info( f"checking for support binary: {s}" )
+                if not shutil.which(s):
+                    lopper.log._error( f"support application '{s}' not found, exiting" )
+                    sys.exit(2)
 
         self.use_libfdt = libfdt
 
@@ -749,7 +756,7 @@ class LopperSDT:
                 input_file_abs = input_file.resolve( True )
             if not input_file_abs:
                 raise FileNotFoundError( f"Unable to find file: {input_file}" )
-        except FileNotFoundError:
+        except (FileNotFoundError,NotADirectoryError):
             # check the path from which lopper is running, that
             # directory + lops, and paths specified on the command line
             input_file_abs = ""
@@ -772,7 +779,7 @@ class LopperSDT:
                         raise FileNotFoundError( f"Unable to find file: {input_file}" )
                     else:
                         lopper.log._debug( f"input_find: found {input_file_abs}" )
-                except FileNotFoundError:
+                except (FileNotFoundError,NotADirectoryError):
                     input_file_abs = ""
 
                 if not input_file_abs:
@@ -787,7 +794,7 @@ class LopperSDT:
                                 input_file_abs = input_file_with_ext.resolve( True )
                                 if not input_file_abs:
                                     raise FileNotFoundError( f"Unable to find input file: {mod_file}" )
-                        except FileNotFoundError:
+                        except (FileNotFoundError,NotADirectoryError):
                             input_file_abs = ""
 
             if not input_file_abs:
