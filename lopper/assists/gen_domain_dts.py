@@ -24,6 +24,8 @@ import common_utils as utils
 from domain_access import update_mem_node
 from openamp_xlnx import xlnx_openamp_find_channels, xlnx_openamp_parse
 from openamp_xlnx_common import openamp_linux_hosts, openamp_roles
+from openamp_xlnx import xlnx_openamp_zephyr_update_tree
+from zephyr_board_dt import process_overlay_with_lopper_api
 
 def delete_unused_props( node, driver_proplist , delete_child_nodes):
     if delete_child_nodes:
@@ -101,9 +103,11 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
     if openamp_present and (openamp_host or openamp_remote):
         xlnx_options = { "openamp_host":   openamp_roles[machine],
                          "openamp_remote": openamp_roles[machine],
-                         "openamp_role":   openamp_role }
-        if "--openamp_no_header" in options['args']:
-            xlnx_options["openamp_no_header"] = True
+                         "openamp_role":   openamp_role,
+                         "zephyr_dt" : True if zephyr_dt == 1 else False,
+                         "openamp_no_header": True if "--openamp_no_header" in options['args'] else False,
+                         "machine" : machine,
+                       }
         xlnx_openamp_parse(sdt, options, xlnx_options, verbose = 0 )
 
     # Delete other CPU Cluster nodes
@@ -395,7 +399,7 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
             xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine)
             if "a78" in machine:
                 new_dst_node = LopperNode()
-                new_dst_node['compatible'] = "arm,psci-1.0"
+                new_dst_node['compatible'] = "arm,psci-1.1"
                 new_dst_node['method'] = "smc"
                 new_dst_node.abs_path = "/psci "
                 new_dst_node.name = "psci "
@@ -409,6 +413,24 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                 proplist = schema["amd,mbv32"]["required"]
                 delete_unused_props( match_cpunode, proplist, False)
                 match_cpunode.parent.name = "cpus"
+        zephyr_board_dt = None
+        try:
+            zephyr_board_dt = options['args'][2]
+        except IndexError:
+            pass
+        if zephyr_board_dt and os.path.exists(zephyr_board_dt):
+            try:
+                # Read the overlay file
+                with open(zephyr_board_dt, 'r') as f:
+                    overlay_content = f.read()
+                cleaned_content = process_overlay_with_lopper_api(overlay_content, sdt.tree)
+                with open(os.path.join(sdt.outdir, "board.overlay"), 'w') as f:
+                    f.write(cleaned_content)
+            except Exception as e:
+                print(f"[ERROR] Failed to process overlay file: {e}")
+                import traceback
+                traceback.print_exc()
+
     return True
 
 def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
@@ -648,8 +670,11 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
     alias_prop_list = list(alias_node.__props__.keys())
     for prop in alias_prop_list:
         val = sdt.tree['/aliases'].propval(prop, list)[0]
+        pl_node_ref = None
+        if "amba_pl" in val:
+            pl_node_ref = True
         val = val.rsplit('/', 1)[-1]
-        if val not in valid_alias_proplist:
+        if val not in valid_alias_proplist or pl_node_ref:
             sdt.tree['/aliases'].delete(prop)
 
     max_mem_size = 0
@@ -666,10 +691,13 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                 var = sdt.tree[node].propval('stdout-path', list)[0]
                 dev_node = var.split(':')[0]
 
-                sdt.tree[node]['zephyr,console'] = dev_node
-                sdt.tree[node]['zephyr,shell-uart'] = dev_node
-    
-    sdt.tree['/chosen']['zephyr,sram'] = sram_node
+                if sdt.tree['/chosen'].propval('zephyr,console') == ['']:
+                   sdt.tree[node]['zephyr,console'] = dev_node
+                   sdt.tree[node]['zephyr,shell-uart'] = dev_node
+
+    if sdt.tree['/chosen'].propval('zephyr,sram') == ['']:
+        sdt.tree['/chosen'] + LopperProp(name="zephyr,sram", value = sram_node)
+
     return True
 
 def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
@@ -833,6 +861,13 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                                     new_node['#gpio-cells'] = 2
                                     new_node.label_set(node.label)
                                     node.add(new_node)
+                        #AXI-SPI
+                        if any(version in node["compatible"].value for version in ("xlnx,xps-spi-2.00.a", "xlnx,axi-quad-spi-3.2")):
+                            if node.propval('#address-cells') != ['1']:
+                                node['#address-cells'] = 1
+                            if node.propval('#size-cells') != ['0']:
+                                node['#size-cells'] = 0
+                            node["compatible"] = "xlnx,xps-spi-2.00.a"
                         if is_supported_periph:
                             required_prop = is_supported_periph[0]["required"]
                             prop_list = list(node.__props__.keys())
@@ -874,9 +909,10 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
         if node.name == "chosen":
                 var = sdt.tree[node].propval('stdout-path', list)[0]
                 dev_node = var.split(':')[0]
-                
-                sdt.tree[node]['zephyr,console'] = dev_node
-                sdt.tree[node]['zephyr,shell-uart'] = dev_node
+
+                if sdt.tree['/chosen'].propval('zephyr,console') == ['']:
+                    sdt.tree[node]['zephyr,console'] = dev_node
+                    sdt.tree[node]['zephyr,shell-uart'] = dev_node
  
         if node.name == "amba_pl":
                 sdt.tree.delete(node)
@@ -999,7 +1035,8 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
     defconfig_kconfig.write("\nendif\n")
     defconfig_kconfig.close()
 
-    sdt.tree['/chosen']['zephyr,sram'] = sram_node
+    if sdt.tree['/chosen'].propval('zephyr,sram') == ['']:
+        sdt.tree['/chosen'] + LopperProp(name="zephyr,sram", value = sram_node)
 
     # Update memory nodes
     # For DDR keep only device_type and remove compatible
