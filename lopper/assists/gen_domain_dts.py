@@ -46,6 +46,63 @@ def is_compat( node, compat_string_to_test ):
         return xlnx_generate_domain_dts
     return ""
 
+def filter_ipi_nodes_for_cpu(sdt, machine):
+    """
+    Filter IPI nodes for A78 processors:
+    Keep the IPI nodes with CPU name matching the expected A78 CPU name.
+    """
+    # Only process A78 machines, exit early for all others
+    if "a78" not in machine.lower():
+        return
+
+    # Extract expected A78_* CPU name
+    try:
+        match = re.search(r'a78[_]?(\d+)', machine.lower())
+        expected_cpu_name = f"A78_{match.group(1)}" if match else "A78_0"
+    except Exception as e:
+        print(f"[ERROR] Failed to extract CPU name from machine '{machine}': {e}")
+        return
+
+    try:
+        # Direct access to AXI node instead of looping through all subnodes
+        try:
+            axi_node = sdt.tree['/axi']
+        except KeyError:
+            print(f"[WARNING] AXI node not found in device tree")
+            return
+
+        ipi_nodes_to_remove = []
+
+        for node in axi_node.subnodes():
+            # Check if this is an IPI parent node
+            if (node.depth == 2 and  # Direct child of /axi/
+                node.propval('compatible') != [''] and
+                'xlnx,versal-ipi-mailbox' in node.propval('compatible', list) and
+                node.propval('xlnx,cpu-name') != [''] and
+                node.propval('xlnx,ip-name') != [''] and
+                'ipi' in node.propval('xlnx,ip-name', list)[0]):
+
+                ipi_cpu_name = node.propval('xlnx,cpu-name', list)[0]
+
+                # Only keep A78 nodes that match our target
+                if ipi_cpu_name.startswith('A78_'):
+                    if ipi_cpu_name != expected_cpu_name:
+                        ipi_nodes_to_remove.append(node)
+
+        # Remove unwanted A78 IPI parent nodes (this removes parent and all children automatically)
+        if ipi_nodes_to_remove:
+            for ipi_node in ipi_nodes_to_remove:
+                try:
+                    sdt.tree.delete(ipi_node)  # This removes parent and all children
+                except Exception as e:
+                    print(f"[ERROR] Failed to delete IPI node '{ipi_node.name}' (path: {ipi_node.abs_path}): {e}")
+                    pass
+
+    except Exception as e:
+        print(f"[ERROR] Failed to delete IPI node...")
+        return
+
+
 # tgt_node: is the top level domain node
 # sdt: is the system device-tree
 # options: User provided options (processor name)
@@ -162,6 +219,8 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                 # Remove the original node from amba_pl and add the new node to root
                 amba_pl_node.delete(subnode)
                 sdt.tree.add(subnode)
+
+    filter_ipi_nodes_for_cpu(sdt, machine)
 
     node_list = []
     for node in root_sub_nodes:
@@ -439,7 +498,7 @@ def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
 
     for node in root_sub_nodes:
         if node.depth == 1:
-            if "cpus" not in node.name and "amba" not in node.name and "memory" not in node.name and "chosen" not in node.name and "bus" not in node.name and "axi" not in node.name and "timer" not in node.name and "alias" not in node.name:
+            if "cpus" not in node.name and "amba" not in node.name and "memory" not in node.name and "chosen" not in node.name and "bus" not in node.name and "axi" not in node.name and "timer" not in node.name and "alias" not in node.name and "consumer" not in node.name:
                 sdt.tree.delete(node)
         elif node.name == "cpu-map" or node.name == "idle-states":
             sdt.tree.delete(node)
@@ -551,6 +610,9 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                         if node.propval('#size-cells') != ['0']:
                             node["#size-cells"] = LopperProp("#size-cells")
                             node["#size-cells"].value = 0
+                    # Mailbox
+                    if any(version in node["compatible"].value for version in ("vnd,mbox-consumer", "xlnx,mbox-versal-ipi-mailbox", "xlnx,mbox-versal-ipi-dest-mailbox")):
+                        continue
                     # PS-IIC
                     if "cdns,i2c-r1p14" in node["compatible"].value:
                         node["compatible"].value = ["cdns,i2c"]
