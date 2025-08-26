@@ -152,7 +152,11 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
     except IndexError:
         pass
 
-    openamp_present = xlnx_openamp_find_channels(sdt)
+    openamp_machine = None
+    if machine not in openamp_linux_hosts and linux_dt != 1:
+        openamp_machine = machine
+
+    openamp_present = xlnx_openamp_find_channels(sdt, openamp_machine)
     openamp_host = machine in openamp_linux_hosts and linux_dt == 1
     openamp_remote = machine in openamp_roles.keys() and linux_dt != 1 and machine not in openamp_linux_hosts
     openamp_role = "host" if openamp_host else "remote"
@@ -165,7 +169,7 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                          "openamp_no_header": True if "--openamp_no_header" in options['args'] else False,
                          "machine" : machine,
                        }
-        xlnx_openamp_parse(sdt, options, xlnx_options, verbose = 0 )
+        xlnx_openamp_parse(sdt, options, xlnx_options, 1)
 
     # Delete other CPU Cluster nodes
     cpunode_list = sdt.tree.nodes('/cpu.*@.*', strict=True)
@@ -494,6 +498,10 @@ def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
     root_node = sdt.tree['/']
     root_sub_nodes = root_node.subnodes()
 
+    if "amd,versal2" in root_node['compatible'].value:
+        root_node["model"] = "AMD Versal Gen 2"
+        root_node["compatible"] = "xlnx,versal2"
+
     for node in root_sub_nodes:
         if node.depth == 1:
             if "cpus" not in node.name and "amba" not in node.name and "memory" not in node.name and "chosen" not in node.name and "bus" not in node.name and "axi" not in node.name and "timer" not in node.name and "alias" not in node.name and "consumer" not in node.name:
@@ -502,6 +510,8 @@ def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
             sdt.tree.delete(node)
 
         if node.propval("compatible") != ['']:
+            if node.propval("compatible") == ['xlnx,versal-ipi-dest-mailbox']:
+                node.name = f"child@{hex(node.propval('reg')[1])[2:]}"
             if node.propval('xlnx,ip-name') != ['']:
                 val = node.propval('xlnx,ip-name', list)[0]
                 if "r52" in machine and (val == "psx_rcpu_gic" or val == "rcpu_gic"):
@@ -742,6 +752,7 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
             sdt.tree['/aliases'].delete(prop)
 
     max_mem_size = 0
+    sram_node = 0
     for node in root_sub_nodes:
         if node.propval('device_type') != ['']:
             val = node.propval('device_type', list)[0]

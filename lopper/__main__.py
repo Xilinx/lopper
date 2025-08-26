@@ -33,6 +33,31 @@ def at_exit_cleanup():
 with open(Path(__file__).parent / 'VERSION', 'r') as f:
     LOPPER_VERSION = f.read().strip()
 
+
+def parse_schema_argument(schema_arg):
+    """Parse schema argument to determine action and output path.
+
+    Returns: (action, target) tuple where:
+        action is one of: "none", "learn", "learn_dump", "load"
+        target is: None, output path, or schema path
+    """
+    if not schema_arg:
+        return ("learn", None)
+
+    if schema_arg == "none":
+        return ("none", None)
+    elif schema_arg == "learn":
+        return ("learn", None)
+    elif schema_arg.startswith("learn:"):
+        output_path = schema_arg[6:]  # Remove "learn:"
+        if not output_path:
+            print(f"[ERROR]: schema output path cannot be empty after 'learn:'")
+            sys.exit(1)
+        return ("learn_dump", output_path)
+    else:
+        # Assume it's a path to an existing schema
+        return ("load", schema_arg)
+
 def usage():
     prog = "lopper"
     print(f'Usage: {prog} [OPTION] <system device tree> [<output file>]...')
@@ -61,6 +86,7 @@ def usage():
     print('  -S, --save-temps    don\'t remove temporary files' )
     print('    , --cfgfile       specify a lopper configuration file to use (configparser format) ' )
     print('    , --cfgval        specify a configuration value to use (in configparser section format). Can be specified multiple times' )
+    print('    , --schema        one of: "path to a dts schema", "learn" or "none" ')
     print('  -h, --help          display this help and exit')
     print('  -O, --outdir        directory to use for output files')
     print('    , --server        after processing, start a server for ReST API calls')
@@ -95,11 +121,12 @@ def main():
     symbols = False
     warnings = []
     usage_flag = False
+    schema = None
 
     try:
         opts, args = getopt.getopt(sys.argv[1:], "I:W:A:t:dfvdhi:o:a:SO:D:x:",
                                    [ "debug=", "assist-paths=", "outdir", "enhanced",
-                                     "save-temps", "version", "werror","target=", "dump",
+                                     "schema=", "save-temps", "version", "werror","target=", "dump",
                                      "force","verbose","help","input=","output=","dryrun",
                                      "assist=","server", "auto", "permissive", 'symbols', "xlate=",
                                      "no-libfdt", "overlay", "cfgfile=", "cfgval=", "input-dirs"] )
@@ -144,6 +171,8 @@ def main():
             werror=True
         elif o in ('--server'):
             server=True
+        elif o in ('--schema'):
+            schema = a
         elif o in ('-S', '--save-temps' ):
             save_temps=True
         elif o in ('--no-libfdt' ):
@@ -347,6 +376,31 @@ def main():
                 # global section, not currently implemented
                 pass
 
+    if schema:
+        action, target = parse_schema_argument(schema)
+
+        if action == "none":
+            schema = None
+        elif action == "learn":
+            schema = "learn"
+        elif action == "learn_dump":
+            # Check if output file exists
+            if target != "-":  # Not stdout
+                output_path = Path(target)
+                if output_path.exists():
+                    print(f"[ERROR]: schema output file {target} already exists. "
+                          f"Please remove it or choose a different filename.")
+                    sys.exit(1)
+            schema = ("learn_dump", target)
+        elif action == "load":
+            schemaf = Path(target)
+            if not schemaf.exists():
+                print(f"[ERROR]: schema file {target} does not exist")
+                sys.exit(1)
+            schema = target
+    else:
+        schema = "learn"
+
     if xlate:
         for x in xlate:
             # *x_lop gets all remaining splits. We don't always have the ":", so
@@ -405,6 +459,17 @@ def main():
     device_tree.config = config
     device_tree.symbols = symbols
     device_tree.warnings = warnings
+    device_tree.schema = schema
+
+    if auto_run:
+        # look for lops that match the pattern of the input
+        # files, if so, queue them to run
+
+        # note: this may cause duplicates, since all input files are searched
+        #       and they may already be on the list. duplicates will be dealt
+        #       with later.
+        auto_assists = device_tree.find_any_matching_assists( inputfiles + [sdt] )
+        inputfiles.extend( auto_assists )
 
     device_tree.setup( sdt, inputfiles, "", force, libfdt, config )
     device_tree.assists_setup( cmdline_assists )

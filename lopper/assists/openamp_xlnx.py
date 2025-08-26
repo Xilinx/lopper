@@ -84,22 +84,19 @@ def get_rpmsg_carveout_nodes(tree, node):
     carveouts_node = tree[node.abs_path + "/domain-to-domain/rpmsg-relation"]
     if isinstance(carveouts_node, LopperNode):
         node = carveouts_node
-    carveout_prop = node.props("carveouts")
-    if carveout_prop == []:
+    carveout_prop = node.propval("carveouts")
+    if carveout_prop == ['']:
         print("ERROR: ", node, " is missing carveouts property")
         return []
-    carveouts_nodes = []
-    for phandle in carveout_prop[0].value:
-        tmp_node = tree.pnode( phandle )
-        carveouts_nodes.append ( tmp_node )
+    carveouts_nodes = [ tree.pnode(phandle) for phandle in carveout_prop ]
 
     return carveouts_nodes
-
 
 reserved_mem_nodes = []
 res_mem_bases = []
 res_mem_sizes = []
 def reserved_mem_node_check(tree, node, verbose = 0 ):
+    print(" -> reserved_mem_node_check", node)
     # check if given node conflicts with reserved memory nodes
 
     res_mem_node = tree["/reserved-memory"]
@@ -121,9 +118,13 @@ def reserved_mem_node_check(tree, node, verbose = 0 ):
         if rm_subnode not in reserved_mem_nodes:
             node_reg = rm_subnode.props("reg")
             if node_reg == []:
-                print("ERROR: malformed reserved-memory node: ", rm_subnode.abs_path)
-                return False
-            node_reg = node_reg[0].value
+                if rm_subnode.propval("start") == [''] or rm_subnode.propval("size") == ['']:
+                    print("ERROR: malformed reserved-memory node. No reg, or size and start: ", rm_subnode.abs_path)
+                    return False
+                rm_subnode + LopperProp(name="reg", value=[0, rm_subnode.propval("start")[0], 0, rm_subnode.propval("size")[0]])
+                rm_subnode.resolve()
+
+            node_reg = rm_subnode.propval("reg")
             if len(node_reg) != 4:
                 print("ERROR: malformed reserved-memory node: ", rm_subnode.abs_path)
                 return False
@@ -132,6 +133,10 @@ def reserved_mem_node_check(tree, node, verbose = 0 ):
 
             overlap = False
             for base,sz,existing_node in zip(res_mem_bases, res_mem_sizes, reserved_mem_nodes):
+                if isinstance(sz, str) or isinstance(base, str) or isinstance(new_sz, str) or isinstance(new_base, str):
+                    continue
+
+                print(" --> reserved_mem_node_check", node, rm_subnode, new_base, base, new_sz, sz)
                 if new_base < base and (new_base+new_sz) > base:
                     overlap = True
                 if new_base < (base+sz) and (new_base+new_sz) > (base+sz):
@@ -156,6 +161,8 @@ native_shm_node_count = 0
 def xlnx_rpmsg_construct_carveouts(tree, carveouts, rpmsg_carveouts, native, channel_id,
                                    openamp_channel_info, amba_node = None,
                                    elfload_node = None, verbose = 0 ):
+    print(" -> xlnx_rpmsg_construct_carveouts", channel_id)
+ 
     global native_shm_node_count
     res_mem_node = tree["/reserved-memory"]
     native_amba_shm_node = None
@@ -166,7 +173,11 @@ def xlnx_rpmsg_construct_carveouts(tree, carveouts, rpmsg_carveouts, native, cha
     vring_total_sz = 0
     for c in remote_carveouts:
         if "vring" in c.name:
-            vring_total_sz += c.props("size")[0].value
+            pval = c.propval("size")
+            if isinstance(pval, list):
+                pval = pval[0]
+
+            vring_total_sz += pval
 
     openamp_channel_info["shared_buf_offset_"+channel_id] = vring_total_sz
 
@@ -178,8 +189,13 @@ def xlnx_rpmsg_construct_carveouts(tree, carveouts, rpmsg_carveouts, native, cha
         if carveout.props("status") != []:
             continue
         elif carveout.props("no-map") != []:
-            start = carveout.props("start")[0].value
-            size = carveout.props("size")[0].value
+            start = carveout.propval("start")
+            size = carveout.propval("size")
+
+            if isinstance(start, list):
+                start = start[0]
+                size = size[0]
+
             # handle native RPMsg
             if native:
                 if start < native_shm_mem_area_start:
@@ -189,8 +205,10 @@ def xlnx_rpmsg_construct_carveouts(tree, carveouts, rpmsg_carveouts, native, cha
                 if 'vdev0buffer' in carveout.name:
                     native_shm_mem_area_size += size
             else:
-
-                new_node =  LopperNode(-1, "/reserved-memory/"+carveout.name)
+                try:
+                    new_node = tree["/reserved-memory/"+carveout.name]
+                except:
+                    new_node =  LopperNode(-1, "/reserved-memory/"+carveout.name)
                 new_node + LopperProp(name="no-map")
                 new_node + LopperProp(name="reg", value=[0, start, 0, size])
                 if not reserved_mem_node_check(tree, new_node):
@@ -262,6 +280,8 @@ def xlnxl_rpmsg_ipi_get_ipi_id(tree, ipi, role):
 def xlnx_rpmsg_ipi_parse_per_channel(remote_ipi, host_ipi, tree, node, openamp_channel_info,
                                      remote_node, channel_id, native, channel_index, 
                                      verbose = 0):
+    print(" -> xlnx_rpmsg_ipi_parse_per_channel", channel_id, host_ipi, remote_ipi, channel_index)
+ 
     ipi_id_prop_name = "xlnx,ipi-id"
     platform =  openamp_channel_info["platform"]
     buffered_ipi_chan = True
@@ -313,6 +333,8 @@ def xlnx_rpmsg_ipi_parse_per_channel(remote_ipi, host_ipi, tree, node, openamp_c
 def xlnx_rpmsg_ipi_parse(tree, node, openamp_channel_info,
                          remote_node, channel_id, native, channel_index, 
                          verbose = 0 ):
+    print(" -> xlnx_rpmsg_ipi_parse", node, remote_node, channel_index, channel_id)
+ 
     amba_node = None
     ipi_id_prop_name = "xlnx,ipi-id"
     host_to_remote_ipi = None
@@ -350,6 +372,7 @@ def xlnx_rpmsg_ipi_parse(tree, node, openamp_channel_info,
 def xlnx_rpmsg_kernel_update_ipis(tree, host_ipi, remote_ipi, gic_node_phandle,
                                   core_node, openamp_channel_info, channel_id):
     target_remote_node = None
+    print(" -> xlnx_rpmsg_kernel_update_ipis", host_ipi, remote_ipi, core_node, channel_id)
 
     # in case of remote run, flip the ipis so that its present for remote parsing later
     if openamp_channel_info['role'+channel_id] == 'remote':
@@ -402,6 +425,8 @@ def xlnx_rpmsg_update_ipis(tree, channel_id, openamp_channel_info, verbose = 0 )
 
 
 def xlnx_rpmsg_update_tree(tree, node, channel_id, openamp_channel_info, verbose = 0 ):
+    print(" -> xlnx_rpmsg_update_tree", node, channel_id)
+ 
     platform = openamp_channel_info["platform"]
     cpu_config = None
     host_ipi = None
@@ -457,8 +482,19 @@ def xlnx_rpmsg_update_tree(tree, node, channel_id, openamp_channel_info, verbose
     if not native:
         for rc in rpmsg_carveouts:
             new_mem_region_prop_val.append(rc.phandle)
-        # update property with new values
-        mem_region_prop.value = new_mem_region_prop_val
+
+    # If DDRBOOT, ensure that it is after RPMSG carveouts
+    if openamp_channel_info["ddrboot"+channel_id]:
+        ddrboot_node = None
+        for index, phandle in enumerate(new_mem_region_prop_val):
+            if "ddrboot" in tree.pnode(phandle).name:
+                ddrboot_node = index
+                break
+        ddrboot_node = new_mem_region_prop_val.pop(ddrboot_node)
+        new_mem_region_prop_val.append(ddrboot_node)
+
+    # update property with new values
+    mem_region_prop.value = new_mem_region_prop_val
 
     ret = xlnx_rpmsg_update_ipis(tree, channel_id, openamp_channel_info, verbose)
     if ret != True:
@@ -476,27 +512,14 @@ def xlnx_openamp_get_ddr_elf_load(machine, sdt, options):
     if "args" in options.keys():
         zephyr_mode = "zephyr_dt" in options["args"]
 
-    global machine_to_dt_mappings
-    global machine_to_dt_mappings_v2
-
     # validate machine
-    mach_to_dt_map = machine_to_dt_mappings
-    for v in machine_to_dt_mappings_v2.values():
-        try:
-            lookup = tree[v]
-            mach_to_dt_map = machine_to_dt_mappings_v2
-            break
-        except KeyError:
-            continue
-
-    if machine not in mach_to_dt_map.keys():
-        print("OPENAMP: XLNX: ERROR: unsupported machine to remoteproc node mapping: ", machine)
-        return None
+    global machine_to_dt_mappings_v2
+    mach_to_dt_map = machine_to_dt_mappings_v2
 
     try:
         target_node = tree[mach_to_dt_map[machine]]
     except KeyError:
-        print("OPENAMP: XLNX: ERROR: could not find mapping:", machine, mach_to_dt_map[machine])
+        print("OPENAMP: XLNX: ERROR: unable to find node for machine and node: ", machine, mach_to_dt_map[machine])
         return None
 
     mem_reg_val = target_node.propval('memory-region')
@@ -517,43 +540,28 @@ def xlnx_openamp_get_ddr_elf_load(machine, sdt, options):
 
 def xlnx_openamp_zephyr_update_tree_ipi(target_node, sdt, options):
     if target_node.propval('mboxes') != ['']:
-        openamp_mbox_node = sdt.tree.pnode(target_node.propval('mboxes')[0])
+        ipi_child = sdt.tree.pnode(target_node.propval('mboxes')[0])
     else:
         return False
 
-    remoteproc_remote_ipi_id = openamp_mbox_node.propval('xlnx,ipi-id')
-    remoteproc_host_ipi_id = openamp_mbox_node.parent.propval('xlnx,ipi-id')
+    ipi_parent = ipi_child.parent
 
-    ipi_parent = None
-    ipi_child = None
-
-    for node in sdt.tree['/axi'].subnodes():
-        if node.propval('xlnx,ipi-id') == remoteproc_remote_ipi_id and node.parent == sdt.tree['/axi']:
-            ipi_parent = node
-            for subnode in ipi_parent.subnodes():
-                if subnode.propval('xlnx,ipi-id') == remoteproc_host_ipi_id:
-                    ipi_child = subnode
-
-    remoteproc_parent = openamp_mbox_node.parent
-    remoteproc_child = openamp_mbox_node
-
-    ipi_child.name = f"mailbox@{hex(remoteproc_parent['reg'].value[1])[2:]}"
-
+    ipi_child.name = f"child@{hex(ipi_child['reg'].value[1])[2:]}"
     child_props = {
       "compatible" : 'xlnx,mbox-versal-ipi-dest-mailbox', "status" : 'okay', "#mbox-cells" : 1,
       "interrupt-parent" : ipi_parent['interrupt-parent'].value,
-      "reg" : remoteproc_parent['reg'].value,
-      "reg-names": remoteproc_parent['reg-names'].value,
+      "reg" : ipi_child['reg'].value,
+      "reg-names": ipi_child['reg-names'].value,
       "xlnx,ipi-id" : ipi_child["xlnx,ipi-id"].value
     }
 
     parent_props = {
       "compatible" : 'xlnx,mbox-versal-ipi-mailbox', "status" : 'okay', "#mbox-cells" : 1, "#address-cells" : 2, "#size-cells" : 2,
       "interrupt-parent" : ipi_parent['interrupt-parent'].value,
-      "reg" : remoteproc_child['reg'].value,
+      "reg" : ipi_parent['reg'].value,
       "xlnx,ipi-id" : ipi_parent["xlnx,ipi-id"].value,
       "interrupts" : ipi_parent["interrupts"].value,
-      "reg-names": remoteproc_child['reg-names'].value,
+      "reg-names": ipi_parent['reg-names'].value,
     }
 
     parent_props["interrupts"][2] = 0x2
@@ -579,7 +587,7 @@ def xlnx_openamp_zephyr_update_tree_ipi(target_node, sdt, options):
     sdt.tree.add(mbox_consumer_node)
 
     for ipi_subnode in ipi_parent.subnodes():
-        if ipi_subnode != ipi_child and ipi_subnode != ipi_parent:
+        if ipi_subnode != ipi_parent and ipi_subnode != ipi_child:
             sdt.tree - ipi_subnode
 
     return True
@@ -588,11 +596,28 @@ def xlnx_openamp_zephyr_update_memories(target_node, sdt, options):
     mem_reg_val = target_node.propval('memory-region')
     memory_region_nodes = [sdt.tree.pnode(phandle) for phandle in mem_reg_val]
 
-    elf_load_node = memory_region_nodes.pop(0)
+    elf_load_node = None
+    elf_load_node_idx = -1
+    vring0_node = None
+    vring1_node = None
+    shbuf_node = None
+    for i, mrn in enumerate(memory_region_nodes):
+        if "ddrboot" in mrn.name:
+            elf_load_node = mrn
+            elf_load_node_idx = i
+        if "vdev0buffer" in mrn.name:
+            shbuf_node = mrn
+        if "vring1" in mrn.name:
+            vring1_node = mrn
+        if "vring0" in mrn.name:
+            vring0_node = mrn
+
+    ipc_nodes = [ vring0_node, vring1_node, shbuf_node ]
+
     elf_load_node + LopperProp(name="device_type", value="memory")
 
     # get reg property for each reserved memory node
-    memory_region_regs = [node['reg'].value for node in memory_region_nodes]
+    memory_region_regs = [node['reg'].value for node in ipc_nodes]
 
     # find base of IPC
     reg_column = [row[1] for row in memory_region_regs]
@@ -600,17 +625,17 @@ def xlnx_openamp_zephyr_update_memories(target_node, sdt, options):
     # total size of IPC
     sz_column = [row[3] for row in memory_region_regs]
 
-    ipc_reg = [0x0, min(reg_column), 0x0, sum(sz_column)]
-
+    # keep elf load node
+    memory_region_nodes.pop(elf_load_node_idx)
     # remove unneeded nodes
-    for node in memory_region_nodes:
-        sdt.tree.delete(node)
+    [sdt.tree.delete(node) for node in memory_region_nodes]
 
     # create IPC node
-    base_str = hex(ipc_reg[1])[2:] # hex creates string '0x1..2'. remove the leading '0x'
-    ipc_node = LopperNode(-1, f"/memory@{base_str}")
+    base_str = hex(min(reg_column))[2:] # hex creates string '0x1..2'. remove the leading '0x'
+    ipc_node = LopperNode(-1, f"/reserved-memory/memory@{base_str}")
     ipc_node + LopperProp(name="compatible", value="mmio-sram")
-    ipc_node + LopperProp(name="reg", value=ipc_reg)
+    ipc_node + LopperProp(name="reg", value=[0x0, min(reg_column), 0x0, sum(sz_column)])
+    ipc_node.label = f"ipc_shm_{base_str}"
     sdt.tree.add(ipc_node)
 
     # Add and update zephyr properties
@@ -628,23 +653,10 @@ def xlnx_openamp_zephyr_update_tree(machine, sdt, options):
     xlnx_openamp_zephyr_update_memories(target_node, sdt, options)
     xlnx_openamp_zephyr_update_tree_ipi(target_node, sdt, options)
 
-    sdt.tree['/chosen']['zephyr,console'] = "serial0"
-    sdt.tree['/chosen']['zephyr,shell-uart'] = "serial0"
-    sdt.tree['/chosen']['stdout-path'] = "serial0:115200n8"
-
-    for subnode in sdt.tree['/axi'].subnodes():
-        if 'serial1' == subnode.label:
-            sdt.tree - subnode
-            break
-
     if sdt.tree['/chosen'].propval('zephyr,flash') != ['']:
         sdt.tree['/chosen'].delete(sdt.tree['/chosen']['zephyr,flash'])
     if sdt.tree['/chosen'].propval('zephyr,ocm') != ['']:
         sdt.tree['/chosen'].delete(sdt.tree['/chosen']['zephyr,ocm'])
-
-    root_node = sdt.tree['/']
-    root_node["model"] = "AMD Versal Gen 2"
-    root_node["compatible"] = "xlnx,versal2"
 
     return True
 
@@ -660,7 +672,7 @@ def xlnx_openamp_gen_outputs_only(sdt, machine, output_file, verbose = 0 ):
     try:
         target_node = tree[machine_to_dt_mappings_v2[machine]]
     except KeyError:
-        print("OPENAMP: XLNX: ERROR: could not find mapping:", machine, machine_to_dt_mappings_v2[machine])
+        print("OPENAMP: XLNX: ERROR: xlnx_openamp_gen_outputs_only: could not find mapping:", machine, machine_to_dt_mappings_v2[machine])
         return False
 
     mem_reg_val = target_node.propval("memory-region")
@@ -809,6 +821,8 @@ def xlnx_rpmsg_parse_generate_native_amba_node(tree):
     return amba_node
 
 def xlnx_rpmsg_parse(tree, node, openamp_channel_info, options, xlnx_options = None, verbose = 0 ):
+    print(" -> xlnx_rpmsg_parse", node)
+ 
     # Xilinx OpenAMP subroutine to collect RPMsg information from RPMsg
     # relation
     amba_node = None
@@ -830,11 +844,11 @@ def xlnx_rpmsg_parse(tree, node, openamp_channel_info, options, xlnx_options = N
         print("ERROR: ", node, "is missing remote property")
         return False
 
-    remote_nodes = populate_remote_nodes(tree, node.props("remote")[0])
-    carveout_prop = node.props("carveouts")[0]
-    if carveout_prop == []:
-        print("ERROR: ", node, " is missing carveouts property")
+    # check for remote property
+    if node.propval("remote") == ['']:
+        print("ERROR: ", node, "is missing remote property")
         return False
+    remote_nodes = [ tree.pnode(remote_node) for remote_node in node.propval("remote") ]
 
     channel_ids = []
     for i, remote_node in enumerate(remote_nodes):
@@ -965,6 +979,12 @@ def check_bit_set(n, k):
 
 
 def determine_cpus_config(remote_domain):
+  print(" -> determine_cpus_config ", remote_domain, remote_domain.propval("cpu_config_str"), remote_domain.propval("cpus"))
+  if remote_domain.propval("cpu_config_str") == ['split']:
+      return CPU_CONFIG.RPU_SPLIT
+  elif remote_domain.propval("cpu_config_str") == ['lockstep']:
+      return CPU_CONFIG.RPU_LOCKSTEP
+
   cpus_prop_val = remote_domain.propval("cpus")
   cpu_config =  cpus_prop_val[2] # split or lockstep
 
@@ -975,6 +995,12 @@ def determine_cpus_config(remote_domain):
 
 
 def determinte_rpu_core(tree, cpu_config, remote_node):
+    print(" -> determinte_rpu_core", cpu_config, remote_node)
+ 
+    if remote_node.propval("core_num") != ['']:
+        core_index = int(remote_node.propval("core_num")[0])
+        return RPU_CORE(core_index)
+
     remote_cpus = remote_node.props("cpus")[0]
 
     try:
@@ -987,6 +1013,8 @@ def determinte_rpu_core(tree, cpu_config, remote_node):
 
 
 def xlnx_remoteproc_construct_carveouts(tree, channel_id, openamp_channel_info, verbose = 0 ):
+    print(" -> xlnx_remoteproc_construct_carveouts", channel_id)
+ 
     carveouts = openamp_channel_info["elfload"+channel_id]
     new_ddr_nodes = []
     res_mem_node = None
@@ -1001,16 +1029,32 @@ def xlnx_remoteproc_construct_carveouts(tree, channel_id, openamp_channel_info, 
 
     # only applicable for DDR carveouts
     for carveout in carveouts:
+        print(" --> ", carveout)
         # SRAM banks have status prop
         # SRAM banks are not in reserved memory
         if carveout.props("status") != []:
             continue
         elif carveout.props("no-map") != []:
-            start = carveout.props("start")[0].value
-            size = carveout.props("size")[0].value
+            start = carveout.propval("start")
+            size = carveout.propval("size")
+
+            if isinstance(start, list):
+                start = start[0]
+                size = size[0]
+
             base_str = hex(start)[2:] # remove first two chars '0x' from string
             node_name = f"{carveout.name}@{base_str}"
-            new_node = LopperNode(-1, f"/reserved-memory/{carveout.name}@{base_str}")
+            new_node = None
+
+            for n in tree["/reserved-memory/"].subnodes():
+                if carveout.name == n.name:
+                    new_node = n
+                    break
+            if new_node == None:
+                new_node = LopperNode(-1, f"/reserved-memory/{carveout.name}@{base_str}")
+            else:
+                new_node.name = f"{carveout.name}@{base_str}"
+
             new_node + LopperProp(name="no-map")
             new_node + LopperProp(name="reg", value=[0, start, 0, size])
             tree.add(new_node)
@@ -1093,8 +1137,8 @@ def xlnx_remoteproc_v2_parse_tcm_node(tcm_bank, core_reg_names, cluster_ranges_v
     if use_lockstep:
         cluster_tcm_absolute_addr = tcm_absolute_view_base & 0xFFF00000 + rpu_view_base_pval
 
-    cluster_ranges_val.extend((rpu_core.value, hex(rpu_view_base_pval), 0, hex(cluster_tcm_absolute_addr), 0, hex(rpu_bank_sz)))
-    core_reg_val.extend((rpu_core.value, hex(rpu_view_base_pval), 0, hex(rpu_bank_sz)))
+    cluster_ranges_val.extend((rpu_core.value % 2, hex(rpu_view_base_pval), 0, hex(cluster_tcm_absolute_addr), 0, hex(rpu_bank_sz)))
+    core_reg_val.extend((rpu_core.value % 2, hex(rpu_view_base_pval), 0, hex(rpu_bank_sz)))
 
 def xlnx_remoteproc_v2_add_cluster(tree, platform, cpu_config, cluster_ranges_val, cluster_node_path):
     driver_compat_str  = {
@@ -1145,7 +1189,7 @@ def xlnx_remoteproc_v2_add_core(tree, openamp_channel_info, channel_id, power_do
     core_names = { SOC_TYPE.VERSAL_NET: "r52f", SOC_TYPE.VERSAL: "r5f", SOC_TYPE.ZYNQMP: "r5f" }
     core_names[SOC_TYPE.VERSAL2] = core_names[SOC_TYPE.VERSAL_NET]
 
-    core_node = LopperNode(-1, "{}/{}@{}".format( cluster_node_path, core_names[platform], openamp_channel_info["rpu_core"+channel_id]))
+    core_node = LopperNode(-1, "{}/{}@{}".format( cluster_node_path, core_names[platform], int(openamp_channel_info["rpu_core"+channel_id]) % 2))
 
     core_node_props = {
       "compatible" : compatible_strs[platform],
@@ -1154,6 +1198,9 @@ def xlnx_remoteproc_v2_add_core(tree, openamp_channel_info, channel_id, power_do
       "reg-names": core_reg_names,
       "memory-region": [ val for val in openamp_channel_info["new_ddr_nodes"+channel_id] ]
     }
+
+    if openamp_channel_info["new_ddr_nodes"+channel_id] == []:
+        core_node_props.pop("memory-region")
 
     for key in core_node_props.keys():
         core_node + LopperProp(name=key, value = core_node_props[key])
@@ -1278,6 +1325,8 @@ def xlnx_remoteproc_v2_interim(tree, channel_id, cpu_config, openamp_channel_inf
 
 
 def xlnx_remoteproc_v2_construct_cluster(tree, channel_id, openamp_channel_info, verbose = 0):
+    print(" -> xlnx_remoteproc_v2_construct_cluster", channel_id)
+ 
     cpu_config = openamp_channel_info["cpu_config"+channel_id]
 
     rpu_core = determinte_rpu_core(tree, cpu_config, openamp_channel_info["remote_node"+channel_id] )
@@ -1315,6 +1364,8 @@ def xlnx_remoteproc_v2_construct_cluster(tree, channel_id, openamp_channel_info,
 
 
 def xlnx_remoteproc_construct_cluster(tree, channel_id, openamp_channel_info, verbose = 0):
+    print(" -> xlnx_remoteproc_construct_cluster", channel_id)
+ 
     platform = openamp_channel_info["platform"]
     cpu_config = openamp_channel_info["cpu_config"+channel_id]
     node = openamp_channel_info["node"+channel_id]
@@ -1429,9 +1480,13 @@ def xlnx_remoteproc_construct_cluster(tree, channel_id, openamp_channel_info, ve
     return True
 
 def xlnx_remoteproc_update_tree(tree, channel_id, openamp_channel_info, verbose = 0 ):
+    print(" -> xlnx_remoteproc_update_tree", channel_id)
+ 
     global info_rproc_driver_version
     node = openamp_channel_info["node"+channel_id]
     host_node = node.parent.parent
+
+    print(" --> ", node, host_node)
 
     platform = openamp_channel_info["platform"]
 
@@ -1457,6 +1512,8 @@ def xlnx_remoteproc_update_tree(tree, channel_id, openamp_channel_info, verbose 
 
 
 def xlnx_remoteproc_rpu_parse(tree, node, openamp_channel_info, remote_node, elfload_nodes, verbose = 0):
+    print(" -> xlnx_remoteproc_rpu_parse", node)
+ 
     cpu_config = determine_cpus_config(remote_node)
     platform = get_platform(tree, verbose)
     rpu_core = None
@@ -1472,17 +1529,21 @@ def xlnx_remoteproc_rpu_parse(tree, node, openamp_channel_info, remote_node, elf
 
     rpu_cluster_node = tree.pnode(remote_node.props("cpus")[0].value[0])
     rpu_core_node = rpu_cluster_node.abs_path + "/cpu@"
+
+    print(" --> xlnx_remoteproc_rpu_parse - found rpu_core_node", rpu_core_node)
     # all cores are in cluster topologically in DTS
     rpu_core_int_val = int(rpu_core)
     rpu_core = str(int(rpu_core)) 
 
     rpu_core_node = tree[rpu_core_node+rpu_core]
+    print(" --> xlnx_remoteproc_rpu_parse - found rpu_core_node", rpu_core_node)
 
     if rpu_core_node.props("power-domains") == []:
         print("ERROR: RPU core does not have power-domains property.")
         return False
 
     rpu_core_pd_prop = rpu_core_node.props("power-domains")[0]
+    print(" --> xlnx_remoteproc_rpu_parse - found power domain for core")
     channel_id = "_"+node.parent.parent.name+"_"+remote_node.name
     openamp_channel_info["elfload"+channel_id] = elfload_nodes
     openamp_channel_info["rpu_core_pd_prop"+channel_id] = rpu_core_pd_prop
@@ -1526,18 +1587,9 @@ def get_platform(tree, verbose = 0):
 
     return platform
 
-def get_remote_node(tree, remote_nodes, index):
-    return tree.pnode( remote_nodes[i] )
-
-def populate_remote_nodes(tree, remote_prop):
-    remote_nodes = []
-
-    for remote_node in remote_prop.value:
-        remote_nodes.append( tree.pnode(remote_node) )
-
-    return remote_nodes
-
 def xlnx_remoteproc_parse(tree, node, openamp_channel_info, verbose = 0 ):
+    print(" -> xlnx_remoteproc_parse", node)
+ 
     # Xilinx OpenAMP subroutine to collect RPMsg information from Remoteproc
     # relation
     elfload_nodes = []
@@ -1549,11 +1601,10 @@ def xlnx_remoteproc_parse(tree, node, openamp_channel_info, verbose = 0 ):
     openamp_channel_info["platform"] = platform
 
     # check for remote property
-    if node.props("remote") == []:
+    if node.propval("remote") == ['']:
         print("ERROR: ", node, "is missing remote property")
         return False
-
-    remote_nodes = populate_remote_nodes(tree, node.props("remote")[0])
+    remote_nodes = [ tree.pnode(remote_node) for remote_node in node.propval("remote") ]
 
     # check for elfload prop
     if node.props("elfload") == []:
@@ -1574,12 +1625,12 @@ def xlnx_remoteproc_parse(tree, node, openamp_channel_info, verbose = 0 ):
             ret = xlnx_remoteproc_rpu_parse(tree, node, openamp_channel_info, remote_node, channel_elfload_nodes, verbose)
             if not ret:
                 return ret
-
         channel_id = "_"+node.parent.parent.name+"_"+remote_node.name
 
         openamp_channel_info["elfload"+channel_id] = channel_elfload_nodes
         openamp_channel_info["remote_node"+channel_id] = remote_node
         openamp_channel_info["node"+channel_id] = node
+        openamp_channel_info["ddrboot"+channel_id] = remote_node.propval("xlnx,ddr-boot") == [1]
         ret = xlnx_remoteproc_update_tree(tree, channel_id, openamp_channel_info, verbose = 0 )
         if not ret:
             print("ERROR: Failed to update tree for Remoteproc.")
@@ -1611,12 +1662,13 @@ def xlnx_openamp_remove_channels(tree, verbose = 0):
                 tree - n
 
 
-def xlnx_openamp_find_channels(sdt, verbose = 0):
+def xlnx_openamp_find_channels(sdt, machine = None):
     # Xilinx OpenAMP subroutine to parse OpenAMP Channel
     # information and generate Device Tree information.
     tree = sdt.tree
     domains_present = False
     compat_strs = [REMOTEPROC_D_TO_D_v2, REMOTEPROC_D_TO_D, RPMSG_D_TO_D]
+
     for n in tree["/"].subnodes():
         if n.name == "domains":
             domains_present = True
@@ -1625,20 +1677,25 @@ def xlnx_openamp_find_channels(sdt, verbose = 0):
         return False
 
     for n in tree["/domains"].subnodes():
-            node_compat = n.props("compatible")
-            if node_compat != []:
-                node_compat = node_compat[0].value
-
-                if node_compat in compat_strs:
-                    return True
-                if isinstance(node_compat, list) and node_compat[0] in compat_strs:
-                    return True
+        if n.propval("compatible") in compat_strs and n.parent.propval("cluster_cpu") == machine:
+            return True
+        node_compat = n.propval("compatible")[0]
+        if node_compat in compat_strs:
+            if machine == None:
+                return True
+            elif n.parent.propval("cluster_cpu")[0] == machine:
+                # if machine provided, then attempt to find domain with
+                # matching machine. Else return False
+                return True
+            if isinstance(node_compat, list) and node_compat[0] in compat_strs and machine == None:
+                return True
 
     return False
 
 def xlnx_openamp_parse(sdt, options, xlnx_options = None, verbose = 0 ):
     # Xilinx OpenAMP subroutine to parse OpenAMP Channel
     # information and generate Device Tree information.
+    print(" -> xlnx_openamp_parse")
     tree = sdt.tree
     ret = -1
     openamp_channel_info = {}
@@ -1676,16 +1733,11 @@ def xlnx_openamp_parse(sdt, options, xlnx_options = None, verbose = 0 ):
        print('ERROR: Failed to parse arguments in openamp module.', err)
        return False
 
-    if zephyr_target:
-        machine = xlnx_options["machine"]
-        xlnx_openamp_zephyr_update_tree(machine, sdt, options)
-        xlnx_openamp_remove_channels(tree)
-        return True
-
     for n in tree["/domains"].subnodes():
-            node_compat = n.props("compatible")
-            if node_compat != []:
-                node_compat = node_compat[0].value
+            node_compat = n.propval("compatible")
+            if node_compat != ['']:
+                if not isinstance(node_compat, str):
+                    node_compat = node_compat[0]
                 if node_compat in [REMOTEPROC_D_TO_D_v2, REMOTEPROC_D_TO_D]:
                     openamp_channel_info[REMOTEPROC_D_TO_D_v2] = (node_compat == REMOTEPROC_D_TO_D_v2)
                     ret = xlnx_remoteproc_parse(tree, n, openamp_channel_info, verbose)
@@ -1694,6 +1746,12 @@ def xlnx_openamp_parse(sdt, options, xlnx_options = None, verbose = 0 ):
 
                 if ret == False:
                     return ret
+    if zephyr_target:
+        machine = xlnx_options["machine"]
+        xlnx_openamp_zephyr_update_tree(machine, sdt, options)
+        xlnx_openamp_remove_channels(tree)
+        return True
+
 
     opts,args2 = getopt.getopt( args, "l:m:n:pv", [ "verbose", "permissive", "openamp_no_header", "openamp_role=", "openamp_host=", "openamp_remote=", "openamp_output_filename=", "zephyr_dt" ] )
 
