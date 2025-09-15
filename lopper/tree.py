@@ -725,6 +725,8 @@ class LopperProp():
             is returned.
         """
 
+        debug = False
+
         ## Note: you cannot print a node from within this routine, or
         ##       an infinite loop will result (printing nodes calls
         ##       resolve, which calls this function ...
@@ -751,7 +753,6 @@ class LopperProp():
         if self.phandle_resolution == False:
             return phandle_map
 
-        debug = False
         # this is too verbose, kept for reference
         # debug = self.__dbg__
         dname = self.name
@@ -1430,6 +1431,14 @@ class LopperProp():
 
         self.pclass = prop_type
 
+        is_bits = False
+        resolver_type = None
+        resolver = lopper.schema.get_schema_manager().resolver
+        if resolver:
+            resolver_type = resolver.get_property_type(self.name)
+            if resolver.is_bits_format(self.name):
+                is_bits = True
+
         if self.phandle_resolution:
             phandle_map = self.phandle_map()
         else:
@@ -1537,7 +1546,7 @@ class LopperProp():
                         drop_sub_record = False
                         phandle_sub_record = []
 
-                        if self.binary:
+                        if self.binary and not is_bits:
                             phandle_sub_record.append( "[" )
                         else:
                             # we have to open with a '<', if this is a list of numbers
@@ -1614,7 +1623,7 @@ class LopperProp():
                             if phandle_sub_record:
                                 formatted_records.extend( phandle_sub_record )
 
-                                if self.binary:
+                                if self.binary and not is_bits:
                                     formatted_records.append( "]" )
                                 else:
                                     formatted_records.append( ">" )
@@ -1626,16 +1635,18 @@ class LopperProp():
                                     formatted_records.append( ";" )
                 else:
                     # no phandles
-                    resolver = lopper.schema.get_schema_manager().resolver
-                    if resolver:
-                        resolver_type = resolver.get_property_type(self.name)
+                    if resolver_type:
                         if resolver_type == LopperFmt.UINT16:
                             formatted_records.append( '/bits/ 16 ' )
+
+                        if resolver_type == LopperFmt.UINT8:
+                            if is_bits:
+                                formatted_records.append( '/bits/ 8 ' )
                     else:
                         resolver_type = None
 
                     if list_of_nums:
-                        if self.binary:
+                        if self.binary and not is_bits:
                             formatted_records.append( "[" )
                         else:
                             # we have to open with a '<', if this is a list of numbers
@@ -1653,11 +1664,16 @@ class LopperProp():
                             
                         if list_of_nums:
                             if self.binary:
-                                formatted_records.append( f"{i:02X}" )
+                                if is_bits:
+                                    formatted_records.append( f"0x{i:02X}" ) # Format as 2 hex digits
+                                else:
+                                    formatted_records.append( f"{i:02X}" )
                             else:
                                 try:
                                     if resolver_type == LopperFmt.UINT16:
                                         hex_string = f'0x{i:04x}'  # Format as 4 hex digits
+                                    elif resolver_type == LopperFmt.UINT8:
+                                        hex_string = f'0x{i:02x}'  # Format as 2 hex digits
                                     else:
                                         if check_32_bit(i):
                                             hex_string = f'0x{i:x}'
@@ -1674,7 +1690,7 @@ class LopperProp():
                             formatted_records.append( f"\"{dtc_string}\"" )
 
                     if list_of_nums:
-                        if self.binary:
+                        if self.binary and not is_bits:
                             formatted_records.append( "];" )
                         else:
                             formatted_records.append( ">;" );
@@ -4567,29 +4583,49 @@ class LopperTree:
 
         # aka "new node"
         if not existing_node:
-            # delete any explict phandle properties on added nodes as
-            # we process them. The node variable "phandle" tracks this
-            # and we don't want them to get out of sync. So only having
-            # one wherever possible is better
-            if node.phandle != -1:
-                try:
-                    pprop = node.__props__["phandle"]
-                    node - pprop
-                except Exception as e:
-                    pass
+            # we delete any explict phandle properties on added nodes
+            # as we process them. The node variable "phandle" tracks
+            # this and we don't want them to get out of sync. So only
+            # having one wherever possible is better
 
-            # set a default of 0, since there are existing tests for it
+            # Set a default of 0, since there are existing tests for it
             # note: a phandle of 0 is invalid, and this will never be
-            #       output if it stays at zero. Only using -1 would be better
-            #       but we'd have to convert all users to a function or
-            #       double conditional
-            node.phandle = 0
+            #       output if it stays at zero. Only using -1 would be
+            #       better but we'd have to convert all users to a
+            #       function or double conditional
 
-            # a node that is being added has come programatically.
-            # node's from FDTs are brought in via load(). So if
-            # there's a phandle in this new node, we just clear it,
-            # since it could be from another tree context and not
-            # useful here.
+            # A node that is being added (this routine) has come
+            # programatically. node's from FDTs are brought in via
+            # load(). So if there's a phandle in this new node, and we
+            # don't trust the caller, we clear it, since it could be
+            # from another tree context and not useful here.
+
+            # We are currently forcing "trusted caller" until there's
+            # a programtic way to deferentiate between a move vs an
+            # external add
+
+            # Also note that if we store (via schema) tye symbolic
+            # value of the phandle, we can just clear all phandles on
+            # add() and recreated them via the symbolic reference But
+            # currently, the property value is numeric, and is the
+            # phandle number of the node, as such, we can't clear
+            # phandles on the way in, unless we were to search the
+            # tree and update phandle referneces with new values on a
+            # move (delete + add))
+
+            trust_caller = True
+            if trust_caller:
+                if node.phandle == -1:
+                    node.phandle = 0
+            else:
+                if node.phandle != -1:
+                    try:
+                        pprop = node.__props__["phandle"]
+                        node - pprop
+                    except Exception as e:
+                        pass
+
+                    node.phandle = 0
 
             # if the node is ever referenced, it will GET a phandle
             # created then. Once that phandle is written to the FDT,
@@ -4600,9 +4636,8 @@ class LopperTree:
             #       into the dictionary when calling load, that way we don't
             #       count on the current behaviour to not drop the properties.
 
-            # the following won't run, since we set the phandle to zero
-            # above, but it is kept in case we allow this in the future and
-            # need the conflict resolution block to return
+            # The following only runs in the trusted caller case,
+            # since otherwise we set the phandle to zero above
             if node.phandle > 0:
                 # we need to generate a new phandle on a collision
                 try:

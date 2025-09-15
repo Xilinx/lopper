@@ -23,6 +23,11 @@ _init( "schema.py" )
 
 # Add properties to debug as needed
 PROPERTY_DEBUG_LIST = [
+    # "ceva,p0-retry-params",
+    # "ceva,p0-cominit-params",
+    # "xlnx,max-frl-rate",
+    # "parallel-memories",
+    # "xlnx,cpu-clk-freq-hz",
     # "xlnx,aie-gen",
     # "xlnx,num-queues",
     # "cooling-device",
@@ -353,9 +358,13 @@ class DTSSchemaGenerator:
         # Simple state machine for parsing
         current_path = []
         current_compatible = None
+        in_reference_block = False  # Track if we're in a &label { } block
+
+        self.label_to_path = {}  # Map labels to their paths
 
         lines = dts_content.split('\n')
         i = 0
+        debug = False
 
         while i < len(lines):
             line = lines[i].strip()
@@ -368,12 +377,74 @@ class DTSSchemaGenerator:
                 i += 1
                 continue
 
-            # Node opening
-            node_match = re.match(r'([\w-]+)(@[\w,.-]+)?\s*{', line)
+            # Skip preprocessor directives
+            if line.startswith('#line') or line.startswith('#include') or line.startswith('#'):
+                if debug:
+                    _warning(f"DEBUG: Skipping preprocessor directive at line {i}: {line}")
+                i += 1
+                continue
+
+            # Handle root node specially
+            if re.match(r'^/\s*{', line):
+                # This is a root node, reset path
+                current_path = []
+                if debug:
+                    _warning(f"DEBUG: Found root node declaration at line {i}")
+                i += 1
+                continue
+
+            # Check for node reference syntax: &label {
+            ref_match = re.match(r'&(\w+)\s*{', line)
+            if ref_match:
+                in_reference_block = True
+                label = ref_match.group(1)
+
+                if label in self.label_to_path:
+                    # Set current_path to the referenced node's path
+                    ref_path = self.label_to_path[label]
+                    current_path = ref_path.split('/') if ref_path else []
+                    if debug:
+                        _warning(f"DEBUG: Node reference &{label} -> path {ref_path}")
+                        _warning(f"  current_path set to: {current_path}")
+                else:
+                    if debug:
+                        _warning(f"WARNING: Unknown label reference: &{label}")
+                    # Try to find it by searching existing nodes
+                    found = False
+                    for node in self.nodes:
+                        # Check if the label might match the node name
+                        node_name = node['name']
+                        if label in node_name or node_name in label:
+                            current_path = node['path'].split('/')
+                            if debug:
+                                _warning(f"  Found by name search: {node['path']}")
+                            found = True
+                            break
+
+                    if not found:
+                        # If still not found, assume it's a new node at root
+                        current_path = [label]
+                        if debug:
+                            _warning(f"  Creating new path for unknown label: /{label}")
+
+                i += 1
+                continue
+
+            # Node opening (with optional label)
+            node_match = re.match(r'(?:(\w+):\s+)?([\w-]+)(@[\w,.-]+)?\s*{', line)
             if node_match:
-                node_name = node_match.group(1)
-                node_addr = node_match.group(2) or ''
+                label = node_match.group(1)
+                node_name = node_match.group(2)
+                node_addr = node_match.group(3) or ''
+
                 current_path.append(node_name + node_addr)
+
+                # Store label mapping if present
+                if label:
+                    full_path = '/'.join(current_path)
+                    self.label_to_path[label] = full_path
+                    if debug:
+                        _warning(f"DEBUG: Stored label '{label}' -> path '{full_path}'")
 
                 # Track node patterns
                 if '@' in node_name + node_addr:
@@ -390,9 +461,24 @@ class DTSSchemaGenerator:
                 continue
 
             # Node closing
+            # if line.startswith('}'):
             if line == '};':
-                if current_path:
-                    current_path.pop()
+                if in_reference_block:
+                    # End of reference block, return to root
+                    current_path = []
+                    in_reference_block = False
+                    if debug:
+                        _warning(f"DEBUG: End of reference block, returning to root")
+                else:
+                    # Normal node closing
+                    if current_path:
+                        current_path.pop()
+                        if debug:
+                            _warning(f"DEBUG: Popped node, current_path now: {current_path}")
+                    else:
+                        if debug:
+                            _warning(f"WARNING: Found }} but current_path is already empty!")
+
                 current_compatible = None
                 i += 1
                 continue
@@ -427,6 +513,12 @@ class DTSSchemaGenerator:
                         if prop_name in PROPERTY_DEBUG_SET:
                             _warning(f"Found /bits/ {bit_width} directive for {prop_name}")
                             _warning(f"     prop value: {prop_value}")
+                    else:
+                        if hasattr(self, 'bit_width_hints') and prop_name in self.bit_width_hints:
+                            _debug( f"NOTE: possibly invalid dts {prop_name} had a bit hint, but was now found without")
+
+                            # force 32 bit when we have a mismatch like this
+                            self.bit_width_hints[prop_name] = 32
 
                     # Check if the property is complete (ends with semicolon)
                     is_complete = prop_value.endswith(';')
@@ -436,8 +528,8 @@ class DTSSchemaGenerator:
                         prop_value = prop_value[:-1].strip()
 
                     if prop_name in PROPERTY_DEBUG_SET:
-                        print(f"DEBUG is_complete value: {is_complete}")
-                        print(f"prop_value: {prop_value}")
+                        _warning(f"DEBUG is_complete value: {is_complete}")
+                        _warning(f"prop_value: {prop_value}")
 
                     # Only check for multi-line if the property didn't end with semicolon
                     if not is_complete and '=' in line:
@@ -446,6 +538,7 @@ class DTSSchemaGenerator:
                         j = i + 1
                         while j < len(lines):
                             next_line = lines[j].strip()
+                            next_line = self.strip_dts_comments(next_line)
                             if next_line:
                                 value_lines.append(next_line)
                                 if next_line.endswith(';'):
@@ -462,12 +555,14 @@ class DTSSchemaGenerator:
                     prop_type = self._determine_property_type(prop_name, prop_value)
 
                     # Store property info
+                    full_path = '/' + '/'.join(current_path) if current_path else '/'
+
                     self.properties[prop_name].append({
                         'type': prop_type,
                         'value': prop_value,
                         'original_value': prop_value,  # Keep original for safety
-                        'path': '/'.join(current_path),
-                        'compatible': current_compatible
+                        'path': full_path,
+                        'compatible': current_compatible,
                     })
 
                     # Track compatible string
@@ -485,10 +580,51 @@ class DTSSchemaGenerator:
                         self.nodes[-1]['properties'][prop_name] = prop_type
 
                     # Track path-specific properties
-                    full_path = '/'.join(current_path)
                     self.path_properties[full_path].add((prop_name, prop_type))
 
+                    if prop_name in PROPERTY_DEBUG_SET:
+                        _warning(f"adding path: {full_path} for {(prop_name, prop_type)}")
+
             i += 1
+
+        # Optimize path_properties - only keep entries for properties with multiple types
+        if debug:
+            _warning("\nOptimizing path-specific properties...")
+
+        mixed_type_props = set()
+
+        # First, identify properties with multiple types
+        for prop_name, occurrences in self.properties.items():
+            type_set = {occ['type'] for occ in occurrences}
+            if len(type_set) > 1:
+                mixed_type_props.add(prop_name)
+                if prop_name in PROPERTY_DEBUG_SET or 'req' in prop_name:
+                    types_summary = defaultdict(int)
+                    for occ in occurrences:
+                        types_summary[occ['type']] += 1
+                    # _warning(f"  {prop_name}: {dict(types_summary)}")
+
+        # Now rebuild path_properties with only mixed-type properties
+        optimized_path_properties = defaultdict(set)
+        original_count = sum(len(props) for props in self.path_properties.values())
+
+        for path, prop_set in self.path_properties.items():
+            for prop_name, prop_type in prop_set:
+                if prop_name in mixed_type_props:
+                    optimized_path_properties[path].add((prop_name, prop_type))
+
+        # Replace with optimized version
+        self.path_properties = optimized_path_properties
+        optimized_count = sum(len(props) for props in self.path_properties.values())
+
+        if debug:
+            _warning(f"Path properties optimization complete:")
+            _warning(f"  Properties with mixed types: {len(mixed_type_props)}")
+            _warning(f"  Path entries: {original_count} -> {optimized_count}")
+            if original_count > 0:
+                _warning(f"  Reduction: {((original_count - optimized_count) / original_count * 100):.1f}%")
+            else:
+                _warning( f" Reduction: none")
 
         return analyzed_patterns, phandle_map
 
@@ -580,12 +716,12 @@ class DTSSchemaGenerator:
             elif bit_width == 16:
                 prop_type = 'uint16-array' if is_array else 'uint16'
             elif bit_width == 8:
-                prop_type = 'uint8-array' if is_array else 'uint8'
+                prop_type = 'uint8-bits-array' if is_array else 'uint8'
             else:
                 prop_type = 'uint32-array' if is_array else 'uint32'
 
             if name in PROPERTY_DEBUG_SET:
-                print(f"  Determined type from /bits/ {bit_width}: {prop_type}")
+                _warning(f"  Determined type from /bits/ {bit_width}: {prop_type}")
 
             return prop_type
 
@@ -746,8 +882,24 @@ class DTSSchemaGenerator:
             unique_types = len(type_counts)
 
             if unique_types > 1:
-                if prop_name in PROPERTY_DEBUG_SET:
-                    _warning(f"  SKIPPING due to multiple types!")
+                # For uint32/string combinations, create a union
+                if set(type_counts.keys()) == {'uint32', 'string'}:
+                    definitions[prop_name] = {
+                        'oneOf': [
+                            self._get_property_schema_def('uint32'),
+                            self._get_property_schema_def('string')
+                        ],
+                        'description': f'Mixed type: uint32 ({type_counts["uint32"]}x) or string ({type_counts["string"]}x)',
+                        # Store type frequency for resolver
+                        '_type_frequencies': {
+                            'uint32': type_counts['uint32'],
+                            'string': type_counts['string']
+                        }
+                    }
+                    if prop_name in PROPERTY_DEBUG_SET:
+                        _warning(f"  Created union type: uint32 | string")
+                        _warning(f"  Frequencies: uint32={type_counts['uint32']}, string={type_counts['string']}")
+
                 continue
 
             # Get the (possibly normalized) type
@@ -829,7 +981,9 @@ class DTSSchemaGenerator:
 
         for path, props in self.path_properties.items():
             if props:
-                overrides[path] = {
+                normalized_path = '/' + path if not path.startswith('/') else path
+
+                overrides[normalized_path] = {
                     'type': 'object',
                     'properties': {
                         prop_name: self._get_property_schema_def(prop_type)
@@ -880,8 +1034,31 @@ class DTSSchemaGenerator:
             }
         elif prop_type == 'uint32':
             return self._get_cell_schema()
+
         elif prop_type == 'uint64':
-            return {'type': 'string', 'pattern': '^<0x[0-9a-fA-F]+ 0x[0-9a-fA-F]+>$'}
+            return {
+                'oneOf': [
+                    {
+                        'type': 'integer',
+                        'minimum': 0,
+                        'maximum': 18446744073709551615,  # 2^64 - 1
+                        'format': 'uint64'
+                    },
+                    {
+                        'type': 'string',
+                        'pattern': '^<(0x[0-9a-fA-F]+|[0-9]+)>$',
+                        'format': 'uint64'
+                    }
+                ],
+                'format': 'uint64'
+            }
+        elif prop_type == 'uint64-array':
+            return {
+                'type': 'string',
+                'pattern': '^<(\\s*(0x[0-9a-fA-F]+|[0-9]+)\\s*)+>$',
+                'format': 'uint64-array',
+                'description': 'Array of 64-bit unsigned integers'
+            }
         elif prop_type == 'uint32-array':
             return self._get_cell_array_schema()
         elif prop_type.startswith('uint32-matrix-'):
@@ -920,6 +1097,13 @@ class DTSSchemaGenerator:
                 'type': 'string',
                 'pattern': r'^\[[0-9a-fA-F\s]+\]$',
                 'format': 'uint8-array'  # Add a format hint
+            }
+        elif prop_type == 'uint8-bits-array':  # /bits/ 8 with multiple values
+            return {
+                'type': 'string',
+                'pattern': '^<(\\s*(0x[0-9a-fA-F]+|[0-9]+)\\s*)+>$',
+                'format': 'uint8-bits-array',  # New format name
+                'description': 'Array of 8-bit values from /bits/ 8'
             }
         elif prop_type == 'string':
             return {'type': 'string'}
@@ -1123,6 +1307,26 @@ class DTSPropertyTypeResolver:
                 'type': fmt_type
             })
 
+    def is_bits_format(self, prop_name, node_path=None):
+        """Check if property uses /bits/ format vs byte array format"""
+
+        # Get the schema definition
+        prop_def = None
+        if prop_name in self.schema.get('property_definitions', {}):
+            prop_def = self.schema['property_definitions'][prop_name]
+
+        if not prop_def:
+            return False
+
+        # Path-specific override
+        if node_path and node_path in self._path_properties:
+            path_props = self._path_properties[node_path].get('properties', {})
+            if prop_name in path_props:
+                prop_def = path_props[prop_name]
+
+        format_str = prop_def.get('format', '')
+
+        return '-bits' in format_str
 
     def _schema_to_lopper_fmt(self, prop_name, prop_def):
         """Convert schema property definition to LopperFmt type"""
@@ -1139,6 +1343,21 @@ class DTSPropertyTypeResolver:
 
         # Handle oneOf schemas first
         if 'oneOf' in prop_def:
+            # Check if we have type frequency information
+            type_frequencies = prop_def.get('_type_frequencies', {})
+
+            if type_frequencies:
+                # Use the most common type
+                most_common = max(type_frequencies, key=type_frequencies.get)
+
+                if prop_name in PROPERTY_DEBUG_SET:
+                    _warning(f"  Using most common type '{most_common}' from frequencies: {type_frequencies}")
+
+                if most_common == 'uint32':
+                    return LopperFmt.UINT32
+                elif most_common == 'string':
+                    return LopperFmt.STRING
+
             # Look at the first option to determine type
             first_option = prop_def['oneOf'][0] if prop_def['oneOf'] else {}
             opt_format = first_option.get('format', '')
@@ -1181,11 +1400,18 @@ class DTSPropertyTypeResolver:
         # Handle direct type definitions
         elif prop_type == 'string':
             # Check for format hint FIRST
+            if prop_def.get('format') == 'uint8':
+                return LopperFmt.UINT8
+
             if prop_def.get('format') == 'uint8-array':
                 return LopperFmt.UINT8
 
-            if prop_def.get('format') == 'uint8':
-                return LopperFmt.UINT8
+            if prop_def.get('format') == 'uint8-bits' or prop_def.get('format') == 'uint8-bits-array':
+                # This is /bits/ 8 format
+                return LopperFmt.UINT8  # But caller knows it's from /bits/
+
+            if prop_def.get('format') == 'uint16-array':
+                return LopperFmt.UINT16
 
             # Check if it has a pattern that indicates it's actually cell data
             pattern = prop_def.get('pattern', '')
@@ -1220,6 +1446,9 @@ class DTSPropertyTypeResolver:
             return LopperFmt.UINT8
         elif prop_type == 'uint8-array':
             return LopperFmt.UINT8
+        elif prop_type == 'uint8-bits' or prop_type == 'uint8-bits-array':
+            # This is /bits/ 8 format
+            return LopperFmt.UINT8  # But caller knows it's from /bits/
         elif prop_type == 'string-array':
             return LopperFmt.MULTI_STRING
         elif prop_type.startswith('phandle'):
