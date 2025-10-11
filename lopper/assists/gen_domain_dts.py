@@ -738,6 +738,47 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                             node['power-delay-ms'] = 10
                         node.add(new_node)
                         node["compatible"] = "xlnx,versal-8.9a"
+                    # CANFD
+                    if "xlnx,canfd-2.0" in node["compatible"].value:
+                        node["compatible"] = "xlnx,canfd-2.0"
+                    # OSPI
+                    if "xlnx,versal-ospi-1.0" in node["compatible"].value:
+                        node["compatible"].value = ["xlnx,versal-ospi-1.0"]
+                        if node.propval('#address-cells') != [1]:
+                            node["#address-cells"] = LopperProp("#address-cells")
+                            node["#address-cells"].value = 1
+                            node.add(node["#address-cells"])
+                        if node.propval('#size-cells') != [0]:
+                            node["#size-cells"] = LopperProp("#size-cells")
+                            node["#size-cells"].value = 0
+                            node.add(node["#size-cells"])
+                    # SPIPS
+                    if "cdns,spi-r1p6" in node["compatible"].value:
+                        if node.propval('#address-cells') != [1]:
+                            node["#address-cells"] = LopperProp("#address-cells")
+                            node["#address-cells"].value = 1
+                            node.add(node["#address-cells"])
+                        if node.propval('#size-cells') != [0]:
+                            node["#size-cells"] = LopperProp("#size-cells")
+                            node["#size-cells"].value = 0
+                            node.add(node["#size-cells"])
+                    #ADMA
+                    if any(version in node["compatible"].value for version in ("xlnx,zynqmp-dma-1.0", "amd,versal2-dma-1.0")):
+                        if node.props("clocks") != [] and node.propval("clocks") != []:
+                            node["clocks"].value = []
+                        if node.props('clock-names') != []:
+                            desired_clock_names = ["clk_main", "clk_apb"]
+                            clk_names = node.propval("clock-names")
+                            if clk_names == []:
+                                clk_names_list = []
+                            else:
+                                clk_names_list = [str(x) for x in clk_names]
+                            if clk_names_list != desired_clock_names:
+                                node["clock_names"].value = desired_clock_names
+                        if node.props("#dma-cells") != [] and node.propval("#dma-cells") != [1]:
+                            node['#dma-cells'].value = [1]
+                        if node.props("xlnx,bus-width") != [] and node.propval("xlnx,bus-width") != [64]:
+                            node["xlnx,bus-width"].value = [64]
                     # GPIOPS
                     if any(version in node["compatible"].value for version in ("xlnx,pmc-gpio-1.0", "xlnx,versal-gpio-1.0")):
                         version = lambda x: x in node["compatible"].value
@@ -789,15 +830,23 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                             if new_ref_clk:
                                 new_node = LopperNode()
                                 new_node.abs_path = "/clocks"
-                                new_node.name = node.label + "_ref_clock"
+                                if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
+                                    new_node.name = "adma_ref_clk"
+                                else:
+                                    new_node.name = node.label + "_ref_clock"
                                 new_node['compatible'] = ["fixed-clock"]
                                 new_node['#clock-cells'] = 0
+                                if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
+                                    clk_freq = 450000000
                                 new_node['clock-frequency'] = clk_freq
                                 new_node.label_set(new_node.name)
                                 sdt.tree.add(new_node)
                                 if node.props('clocks') != []:
                                     node.delete('clocks')
-                                clock_prop = f"clocks = <&{new_node.name}>"
+                                if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
+                                    clock_prop = f"clocks = <&{new_node.name}>, <&{new_node.name}>"
+                                else:
+                                    clock_prop = f"clocks = <&{new_node.name}>"
                                 node + LopperProp(clock_prop)
                         for prop in prop_list:
                             if prop not in required_prop:
@@ -836,11 +885,126 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                    sdt.tree[node]['zephyr,console'] = dev_node
                    sdt.tree[node]['zephyr,shell-uart'] = dev_node
 
+                   # Find CANFD nodes for zephyr,canbus
+                   can_nodes = []
+                   for root_node in root_sub_nodes:
+                       if root_node.propval('compatible') != ['']:
+                           compatible_list = root_node.propval('compatible', list)
+                           if any('xlnx,canfd-2.0' in compat for compat in compatible_list):
+                               can_nodes.append(root_node)
+
+                   # Set zephyr,canbus to first CANFD node if available
+                   if can_nodes:
+                       sdt.tree[node]['zephyr,canbus'] = can_nodes[0].abs_path
+
     if sdt.tree['/chosen'].propval('zephyr,sram') == ['']:
         sdt.tree['/chosen'] + LopperProp(name="zephyr,sram", value = sram_node)
 
     return True
 
+def generate_board_kconfig_defconfig(isa_string, cpu_node, intc_node, num_interrupts):
+    """
+    Generate board-level Kconfig.defconfig content based on hardware configuration.
+    Similar to boards/amd/mbv32/Kconfig.defconfig structure.
+
+    Args:
+        isa_string: The RISC-V ISA string from cflags.yaml
+        cpu_node: The CPU node from device tree
+        intc_node: The interrupt controller node
+        num_interrupts: Number of interrupts detected
+
+    Returns:
+        str: Complete board-level Kconfig.defconfig content
+    """
+    license_content = '''#
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# This is an auto-generated board-level Kconfig.defconfig file.
+# It configures RISC-V ISA extensions and board-specific features
+# based on the hardware configuration detected from your design.
+#
+
+'''
+
+    content = license_content
+    content += f"if BOARD_MBV32\n"
+    # Parse ISA string to determine what extensions are available
+    # Base ISA configurations - always add RV32I for MicroBlaze RISC-V
+    content += "config RISCV_ISA_RV32I\n"
+    content += "        default y\n\n"
+
+    # Always add zicsr and zifencei for MicroBlaze RISC-V as they are typically required
+    # These are fundamental extensions needed for proper RISC-V operation
+    content += "config RISCV_ISA_EXT_ZICSR\n"
+    content += "        default y\n\n"
+    content += "config RISCV_ISA_EXT_ZIFENCEI\n"
+    content += "        default y\n\n"
+    # Standard extension mappings for board-level configuration
+    extension_mapping = {
+        'm': 'RISCV_ISA_EXT_M',
+        'a': 'RISCV_ISA_EXT_A',
+        'c': 'RISCV_ISA_EXT_C',
+        'f': 'RISCV_ISA_EXT_F',
+        'd': 'RISCV_ISA_EXT_D',
+        'zba': 'RISCV_ISA_EXT_ZBA',
+        'zbb': 'RISCV_ISA_EXT_ZBB',
+        'zbc': 'RISCV_ISA_EXT_ZBC',
+        'zbs': 'RISCV_ISA_EXT_ZBS',
+    }
+
+    # Track added extensions to avoid duplicates (zicsr and zifencei already added)
+    added_extensions = {'zicsr', 'zifencei'}
+    # Process ISA string for additional extensions
+    if isa_string:
+        # Split by underscore to get different parts
+        isa_parts = isa_string.split('_')
+        for part in isa_parts:
+            part_lower = part.lower()
+            # Handle base ISA part (rv32imafc style)
+            if part_lower.startswith('rv32i'):
+                # Extract single-letter extensions after rv32i
+                extensions_part = part_lower[5:]  # Remove 'rv32i'
+                for ext_char in extensions_part:
+                    if ext_char in extension_mapping and ext_char not in added_extensions:
+                        content += f"config {extension_mapping[ext_char]}\n"
+                        content += "        default y\n\n"
+                        added_extensions.add(ext_char)
+            # Handle explicit Z-extensions (but skip zicsr/zifencei as already added)
+            elif part_lower in extension_mapping and part_lower not in added_extensions:
+                content += f"config {extension_mapping[part_lower]}\n"
+                content += "        default y\n\n"
+                added_extensions.add(part_lower)
+
+    # Add interrupt controller configuration - always add for MicroBlaze RISC-V
+    # This matches the structure found in boards/amd/mbv32/Kconfig.mbv32
+    # MicroBlaze RISC-V designs typically use multi-level interrupt controllerscontent += "config MULTI_LEVEL_INTERRUPTS\n"
+    content += "        default y\n\n"
+    content += "config 2ND_LEVEL_INTERRUPTS\n"
+    content += "        default y\n\n"
+    content += "config 2ND_LVL_INTR_00_OFFSET\n"
+    content += "        default 11\n\n"
+    content += "config 2ND_LVL_ISR_TBL_OFFSET\n"
+    content += "        default 12\n\n"
+    content += "config MAX_IRQ_PER_AGGREGATOR\n"
+    content += "        default 32\n\n"
+
+    # Add additional board-specific configurations based on hardware
+    if cpu_node:
+        # Add PMP configuration if available and valid
+        if cpu_node.propval('xlnx,pmp-entries') != ['']:
+            pmp_entries = cpu_node.propval('xlnx,pmp-entries', list)[0]
+            if pmp_entries > 0 and pmp_entries % 8 == 0:  # Valid PMP configuration
+                content += "config PMP_SLOTS\n"
+                content += f"        default {pmp_entries}\n\n"
+                if cpu_node.propval('xlnx,pmp-granularity') != ['']:
+                    pmp_granularity = cpu_node.propval('xlnx,pmp-granularity', list)[0]
+                    granularity_val = pow(pmp_granularity + 2, 2)
+                    content += "config PMP_GRANULARITY\n"
+                    content += f"        default {granularity_val}\n\n"
+    content += "endif\n"
+    return content
 def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
     root_node = sdt.tree[tgt_node]
     root_sub_nodes = root_node.subnodes()
@@ -955,6 +1119,37 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                         is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
                         if "xlnx,xps-timer-1.00.a" in node["compatible"].value:
                             node["compatible"].value = ["amd,xps-timer-1.00.a"]
+                        #AXI-ETHERNET-DMA
+                        if "xlnx,eth-dma" in node["compatible"].value:
+                            node["compatible"].value = ["xlnx,eth-dma"]
+                        #AXI-ETHERNET
+                        if "xlnx,axi-ethernet-1.00.a" in node["compatible"].value:
+                            node["compatible"].value = ["xlnx,axi-ethernet-1.00.a"]
+                            subnodes = node.subnodes()
+                            for subnode in subnodes:
+                                node.delete(subnode)
+                            emacnode = LopperNode()
+                            required_prop = [value for key,value in schema.items() if key in node["compatible"].value][0]["required"]
+                            required_prop.reverse()
+                            for prop in required_prop:
+                                if prop == "compatible":
+                                    emacnode[prop] = ["xlnx,axi-ethernet-1.00.a"]
+                                elif prop == "reg" or prop == "status":
+                                    continue
+                                else:
+                                    emacnode[prop] = node[prop]
+                            emacnode.name = "ethernet-mac"
+                            emacnode.label_set("axi_ethernet")
+                            node.add(emacnode)
+                            for prop in required_prop:
+                                if prop not in ["compatible", "reg", "status"] and node.props(prop) != []:
+                                    node.delete(prop)
+                            node["compatible"].value = ["xlnx,axi-ethernet-subsystem-7.2"]
+                            node.label_set("axi_enet")
+                            name = node.name
+                            parts = name.split("@")
+                            new_name = f"axi-{parts[0]}-subsystem@{parts[1]}"
+                            node.name = new_name
                         # UARTNS550
                         if "xlnx,axi-uart16550-2.0" in node["compatible"].value:
                             node["compatible"].value = ["ns16550"]
@@ -1171,6 +1366,10 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                         defconfig_kconfig.write("  default %s\n" % str(val))
 
                     defconfig_kconfig.close()
+                    board_defconfig_content = generate_board_kconfig_defconfig(isa, node, is_axi_intc_present, num_intr)
+                    board_defconfig_file = os.path.join(sdt.outdir, f"board_Kconfig.defconfig")
+                    with open(board_defconfig_file, 'w') as board_defconfig:
+                        board_defconfig.write(board_defconfig_content)
 
 
     defconfig_kconfig = open(soc_defconfig_file, 'a')

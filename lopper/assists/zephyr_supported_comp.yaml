@@ -228,6 +228,26 @@ xlnx,versal-net-emmc:
     - interrupts
     - clocks
 
+xlnx,zynqmp-dma-1.0:
+  required:
+    - compatible
+    - reg
+    - '#dma-cells'
+    - interrupts
+    - clocks
+    - clock-names
+    - xlnx,bus-width
+
+amd,versal2-dma-1.0:
+  required:
+    - compatible
+    - reg
+    - '#dma-cells'
+    - interrupts
+    - clocks
+    - clock-names
+    - xlnx,bus-width
+
 xlnx,versal-gpio-1.0:
   required:
     - compatible
@@ -285,3 +305,68 @@ amd,versal2-ufs:
     - interrupt-parent
     - clocks
     - clock-names
+
+xlnx,canfd-2.0:
+  required:
+    - compatible
+    - reg
+    - interrupts
+    - clocks
+
+xlnx,versal-ospi-1.0:
+  required:
+    - compatible
+    - status
+    - reg
+    - interrupts
+    - interrupt-parent
+    - cdns,fifo-depth
+    - cdns,fifo-width
+    - '#address-cells'
+    - '#size-cells'
+
+cdns,spi-r1p6:
+  required:
+    - compatible
+    - status
+    - reg
+    - interrupts
+    - interrupt-parent
+    - cdns,num-ss-bits
+    - is-decoded-cs
+    - clock-frequency
+    - clocks
+    - '#address-cells'
+    - '#size-cells'
+
+xlnx,eth-dma:
+  required:
+    - compatible
+    - reg
+    - '#dma-cells'
+    - status
+    - interrupt-parent
+    - interrupts
+    - xlnx,addrwidth
+    - dma-channels
+    - clock-frequency
+    - xlnx,include-dre
+
+xlnx,axi-ethernet-subsystem-7.2:
+  required:
+    - compatible
+    - reg
+    - status
+
+xlnx,axi-ethernet-1.00.a:
+  required:
+    - compatible
+    - reg
+    - status
+    - interrupt-parent
+    - interrupts
+    - axistream-connected
+    - axistream-control-connected
+    - local-mac-address
+    - xlnx,rxcsum
+    - xlnx,txcsum
