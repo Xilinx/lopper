@@ -1586,9 +1586,18 @@ def xlnx_openamp_parse(sdt, options, xlnx_options = None, verbose = 0 ):
             if o in ('-l', "--openamp_role"):
                 role = a
 
-    if role == 'host' and get_platform(tree, verbose) != SOC_TYPE.VERSAL2:
-        for node in tree["/"].subnodes():
-            if "cdns,ttc" in node.propval('compatible'):
+    # TTC handling for VRK160, 165 and VK385
+    ttc_keep_match = any(
+        item.lower().startswith(base.lower())
+        for base in [ 'xcvr1602', 'xcvr1652', 'xc2ve3858' ]
+        for item in tree['/']['device_id'].value
+    )
+    labels_to_keep = [ 'ttc0', 'ttc1' ] if ttc_board_match else []
+
+    if role == 'host':
+        for node in tree["/"].subnodes(children_only=True, name="timer@*"):
+            # VRK165/160 boards and VEK385 - keep ttc0 and ttc1 in linux case.
+            if "cdns,ttc" in node.propval('compatible') and node.label not in labels_to_keep:
                 tree.delete(node)
 
     xlnx_openamp_remove_channels(tree)
