@@ -63,6 +63,7 @@ Additional Resources
 
 - `Zephyr Project Documentation <https://docs.zephyrproject.org/>`_
 - `AMD Embedded Documentation <https://www.amd.com/en/products/embedded>`_
+- See section :ref:`_chapter4-openamp-use-cases` for OpenAMP use-case workflow.
 
 Support
 -------
