@@ -1592,7 +1592,7 @@ def xlnx_openamp_parse(sdt, options, xlnx_options = None, verbose = 0 ):
         for base in [ 'xcvr1602', 'xcvr1652', 'xc2ve3858' ]
         for item in tree['/']['device_id'].value
     )
-    labels_to_keep = [ 'ttc0', 'ttc1' ] if ttc_board_match else []
+    labels_to_keep = [ 'ttc0', 'ttc1' ] if ttc_keep_match else []
 
     if role == 'host':
         for node in tree["/"].subnodes(children_only=True, name="timer@*"):
