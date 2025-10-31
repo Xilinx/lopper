@@ -13,4 +13,4 @@ Welcome to Linux Device Tree Generation for AMD SOCs using Lopper and SDT's docu
    chapter1-introduction.rst
    chapter2-linux_device_tree_generation.rst
    chapter3-overlay_generation.rst
-
+   chapter4-openamp_use_cases.rst
