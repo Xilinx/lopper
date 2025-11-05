@@ -32,7 +32,7 @@ try:
     from lopper.yaml import *
     yaml_support = True
 except Exception as e:
-    print( f"[WARNING]: cant load yaml, disabling support: {e}" )
+    lopper.log._warning( f"cant load yaml, disabling support: {e}" )
     yaml_support = False
 
 # Default processing type
@@ -47,6 +47,30 @@ def stdoutIO(stdout=None):
         sys.stdout = stdout
         yield stdout
         sys.stdout = old
+
+def resolve_path_with_drive_preservation(path_obj):
+    """
+    Resolves a path to absolute form while preserving drive substitution on Windows.
+
+    On Windows, this function checks if the file exists before resolving to preserve
+    substituted drives. On other systems or when the file doesn't exist, it uses
+    the standard resolve() method.
+
+    Args:
+        path_obj (Path): Path object to resolve
+
+    Returns:
+        Path: Resolved absolute path
+    """
+    if sys.platform.startswith("win") and path_obj.exists():
+        # For Windows, if the file exists, convert to absolute path but preserve drive substitution
+        return path_obj.absolute()
+    else:
+        # Original behavior for other systems or when file doesn't exist
+        if sys.version_info.minor < 6:
+            return path_obj.resolve()
+        else:
+            return path_obj.resolve(True)
 
 def lopper_type(cls):
     global Lopper
@@ -283,8 +307,8 @@ class LopperSDT:
                 # compile
                 with open( fpp.name, 'wb') as wfd:
                     for f in sdt_files:
-                        if re.search( r".dts$", f ):
-                            with open(f,'rb') as fd:
+                        if f.endswith(".dts") or f.endswith(".dtsi"):
+                            with open(f, 'rb') as fd:
                                 shutil.copyfileobj(fd, wfd)
 
                         elif re.search( r".yaml$", f ):
@@ -319,7 +343,7 @@ class LopperSDT:
             #       filter out non-dts files before the call .. we should probably still do
             #       that.
             sdt_file = Path( sdt_file )
-            sdt_file_abs = sdt_file.resolve( True )
+            sdt_file_abs = resolve_path_with_drive_preservation(sdt_file)
 
             # we need the original location of the main SDT file on the search path
             # in case there are dtsi files, etc.
@@ -578,13 +602,13 @@ class LopperSDT:
 
         if self.verbose:
             search_paths = self.load_paths + [ lopper_directory ] + [ lopper_directory + "/assists/" ]
-            print( "" )
-            print( "Lopper summary:")
+            print("")
+            print("Lopper summary:")
             print( f"   system device tree: {sdt_files}" )
             print( f"   lops: {lop_files}" )
             print( f"   search paths: {search_paths}" )
             print( f"   output: {self.output_file}" )
-            print( "" )
+            print("")
 
         # Individually compile the input files. At some point these may be
         # concatenated with the main SDT if dtc is doing some of the work, but for
@@ -644,7 +668,7 @@ class LopperSDT:
         for a in assists:
             a_file = self.assist_find( a )
             if a_file:
-                self.assists.append( LopperAssist( str(a_file.resolve()) ) )
+                self.assists.append( LopperAssist( str(resolve_path_with_drive_preservation(a_file)) ) )
             else:
                 lopper.log._error( f"assist {a} not found" )
                 os._exit(1)
@@ -846,7 +870,7 @@ class LopperSDT:
                         lopper.log._warning( f"output assist {cb_func} failed: {e}" )
                         exc_type, exc_obj, exc_tb = sys.exc_info()
                         fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-                        print(exc_type, fname, exc_tb.tb_lineno)
+                        lopper.log._warning( f"{exc_type} {fname} {exc_tb.tb_lineno}" )
                         if self.werror:
                             sys.exit(1)
             else:
@@ -934,10 +958,7 @@ class LopperSDT:
 
         input_file = Path( input_file_name )
         try:
-            if sys.version_info.minor < 6:
-                input_file_abs = input_file.resolve()
-            else:
-                input_file_abs = input_file.resolve( True )
+            input_file_abs = resolve_path_with_drive_preservation(input_file)
             if not input_file_abs:
                 raise FileNotFoundError( f"Unable to find file: {input_file}" )
         except (FileNotFoundError,NotADirectoryError):
@@ -954,10 +975,7 @@ class LopperSDT:
                 lopper.log._debug( f"input_find: checking directory: {s} for: {input_file}")
                 input_file_test = Path( s + "/" + input_file.as_posix() )
                 try:
-                    if sys.version_info.minor < 6:
-                        input_file_abs = input_file_test.resolve()
-                    else:
-                        input_file_abs = input_file_test.resolve( True )
+                    input_file_abs = resolve_path_with_drive_preservation(input_file_test)
 
                     if not input_file_abs:
                         raise FileNotFoundError( f"Unable to find file: {input_file}" )
@@ -972,12 +990,9 @@ class LopperSDT:
                         # try it with a the extension
                         input_file_with_ext = Path( s + "/" + input_file.as_posix() + extension )
                         try:
-                            if sys.version_info.minor < 6:
-                                input_file_abs = input_file_with_ext.resolve()
-                            else:
-                                input_file_abs = input_file_with_ext.resolve( True )
-                                if not input_file_abs:
-                                    raise FileNotFoundError( f"Unable to find input file: {mod_file}" )
+                            input_file_abs = resolve_path_with_drive_preservation(input_file_with_ext)
+                            if not input_file_abs:
+                                raise FileNotFoundError( f"Unable to find input file: {input_file_with_ext}" )
                         except (FileNotFoundError,NotADirectoryError):
                             input_file_abs = ""
 
@@ -1269,7 +1284,7 @@ class LopperSDT:
                         # is it a phandle?
                         node = self.tree.pnode(line)
                         if node:
-                            print( "%s {" % node )
+                            print( f"{node} {{" )
                             for p in node:
                                 print( f"    {p}" )
                             print( "}" )
@@ -1336,10 +1351,9 @@ class LopperSDT:
                             else:
                                 selected_nodes_possible = tree.__selected__
 
-                            if self.verbose > 1:
-                                lopper.log._debug( f"selected potential nodes:" )
-                                for n in selected_nodes_possible:
-                                    print( f"       {n}" )
+                            lopper.log._debug( "selected potential nodes:", level=lopper.log.TRACE )
+                            for n in selected_nodes_possible:
+                                lopper.log._debug( f"       {n}", level=lopper.log.TRACE )
 
                         if prop and prop_val:
                             invert_result = False
@@ -1439,10 +1453,9 @@ class LopperSDT:
                             selected_nodes = selected_nodes_possible
 
 
-                    if self.verbose > 1:
-                        lopper.log._debug( f"select pass done: selected nodes:" )
-                        for n in selected_nodes:
-                            print( f"    {n}" )
+                    lopper.log._debug( "select pass done: selected nodes:", level=lopper.log.TRACE )
+                    for n in selected_nodes:
+                        lopper.log._debug( f"    {n}", level=lopper.log.TRACE )
 
                     # these are now our possible selected nodes for any follow
                     # up "or" conditions
@@ -1586,10 +1599,9 @@ class LopperSDT:
                             lopper.log._warning( f"exception caught during output processing: {e}" )
 
                 if output_regex:
-                    if self.verbose > 2:
-                        lopper.log._debug( f"output lop, final nodes:" )
-                        for oo in output_nodes:
-                            print( f"       {oo.abs_path}" )
+                    lopper.log._debug( "output lop, final nodes:", level=lopper.log.TRACE )
+                    for oo in output_nodes:
+                        lopper.log._debug( f"       {oo.abs_path}", level=lopper.log.TRACE )
 
                 if not output_tree and output_nodes:
                     output_tree = LopperTreePrinter()
@@ -1771,11 +1783,10 @@ class LopperSDT:
                 else:
                     return False
 
-            if self.verbose:
-                lopper.log._info( f"assist lop detected" )
-                if cb:
-                    print( f"        cb: {cb}" )
-                print( f"        id: {cb_id} opts: {cb_opts}" )
+            lopper.log._info( "assist lop detected" )
+            if cb:
+                lopper.log._debug( f"        cb: {cb}" )
+            lopper.log._debug( f"        id: {cb_id} opts: {cb_opts}" )
 
             cb_funcs = self.find_compatible_assist( cb_node, cb_id )
             if cb_funcs:
@@ -1787,7 +1798,7 @@ class LopperSDT:
                         lopper.log._warning( f"assist %{cb_func} failed: {e}" )
                         exc_type, exc_obj, exc_tb = sys.exc_info()
                         fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-                        print(exc_type, fname, exc_tb.tb_lineno)
+                        lopper.log._warning( f"{exc_type} {fname} {exc_tb.tb_lineno}" )
                         # exit if warnings are treated as errors
                         if self.werror:
                             sys.exit(1)
@@ -2518,8 +2529,7 @@ class LopperSDT:
                         cond_exec = f['cond'].value[0]
                         tgt_lop = fdt_tree.pnode(cond_exec)
                         cond_exec_value = lop_results[tgt_lop.name]
-                        if self.verbose > 1:
-                            print( f"[INFO]: conditional {tgt_lop.name} has result {cond_exec_value}")
+                        lopper.log._debug( f"conditional {tgt_lop.name} has result {cond_exec_value}" )
                         if cond_exec_value:
                             noexec = False
                         else:
@@ -2536,7 +2546,7 @@ class LopperSDT:
                     result = self.exec_lop( f, fdt_tree )
                     lop_results[f.name] = result
 
-                    lopper.log._info( f"[INFO]: ------> logged result {result} for lop {f.name}" )
+                    lopper.log._info( f"------> logged result {result} for lop {f.name}" )
 
 
 class LopperFile:
@@ -2553,4 +2563,3 @@ class LopperFile:
         self.dtb = ""
         self.fdt = ""
         self.tree = None
-
