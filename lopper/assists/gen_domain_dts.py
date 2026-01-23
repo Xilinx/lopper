@@ -758,6 +758,16 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                             node["#size-cells"] = LopperProp("#size-cells")
                             node["#size-cells"].value = 0
                             node.add(node["#size-cells"])
+                        num_cs_value = node.propval('num-cs')
+                        num_cs_value = num_cs_value[0] if (num_cs_value and num_cs_value != ['']) else 1
+                        node["cdns,num-ss-bits"] = LopperProp("cdns,num-ss-bits")
+                        node["cdns,num-ss-bits"].value = num_cs_value
+                        node.add(node["cdns,num-ss-bits"])
+                        decoded_cs = node.propval('is-decoded-cs')
+                        decoded_cs = decoded_cs[0] if (decoded_cs and decoded_cs != ['']) else 0
+                        node["is-decoded-cs"] = LopperProp("is-decoded-cs")
+                        node["is-decoded-cs"].value = decoded_cs
+                        node.add(node["is-decoded-cs"])
                     #ADMA
                     if any(version in node["compatible"].value for version in ("xlnx,zynqmp-dma-1.0", "amd,versal2-dma-1.0")):
                         if node.props("clocks") != [] and node.propval("clocks") != []:
@@ -813,37 +823,27 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                                 # If there is no clk-freq property use 0MHZ as default this prevent
                                 # build failure if any of the ip does not have this property.
                                 clk_freq = 0
-                            new_ref_clk = True
-                            # Check clock node with requested clk-freq is already available or not,
-                            # if yes use the existing clk node else create new ref clock node.
-                            for clk_node in sdt.tree.nodes(r'.*ref_clock$'):
-                                if clk_freq == clk_node['clock-frequency'].value:
-                                    if node.props('clocks') != []:
-                                        node.delete('clocks')
-                                    clock_prop = f"clocks = <&{clk_node.name}>"
-                                    node + LopperProp(clock_prop)
-                                    new_ref_clk = False
-                            if new_ref_clk:
-                                new_node = LopperNode()
-                                new_node.abs_path = "/clocks"
-                                if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
-                                    new_node.name = "adma_ref_clk"
-                                else:
-                                    new_node.name = node.label + "_ref_clock"
-                                new_node['compatible'] = ["fixed-clock"]
-                                new_node['#clock-cells'] = 0
-                                if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
-                                    clk_freq = 450000000
-                                new_node['clock-frequency'] = clk_freq
-                                new_node.label_set(new_node.name)
-                                sdt.tree.add(new_node)
-                                if node.props('clocks') != []:
-                                    node.delete('clocks')
-                                if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
-                                    clock_prop = f"clocks = <&{new_node.name}>, <&{new_node.name}>"
-                                else:
-                                    clock_prop = f"clocks = <&{new_node.name}>"
-                                node + LopperProp(clock_prop)
+                            # Always create individual clock node for each peripheral
+                            new_node = LopperNode()
+                            new_node.abs_path = "/clocks"
+                            if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
+                                new_node.name = "adma_ref_clk"
+                            else:
+                                new_node.name = node.label + "_ref_clock"
+                            new_node['compatible'] = ["fixed-clock"]
+                            new_node['#clock-cells'] = 0
+                            if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
+                                clk_freq = 450000000
+                            new_node['clock-frequency'] = clk_freq
+                            new_node.label_set(new_node.name)
+                            sdt.tree.add(new_node)
+                            if node.props('clocks') != []:
+                                node.delete('clocks')
+                            if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
+                                clock_prop = f"clocks = <&{new_node.name}>, <&{new_node.name}>"
+                            else:
+                                clock_prop = f"clocks = <&{new_node.name}>"
+                            node + LopperProp(clock_prop)
                         for prop in prop_list:
                             if prop not in required_prop:
                                 node.delete(prop)
@@ -1148,6 +1148,10 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                             if node.propval('reg-shift') != ['2']:
                                node["reg-shift"] = LopperProp("reg-shift")
                                node["reg-shift"].value = 2
+                            if node.propval('current-speed') == ['']:
+                               # Using default IP baud-rate of 9600, but change according to uart-setup for prints
+                               node["current-speed"] = LopperProp("current-speed")
+                               node["current-speed"].value = 9600
                         # MDM RISCV DEBUG UARTLITE
                         if "xlnx,mdm-riscv-1.0" in node["compatible"].value:
                             node["compatible"].value = ["xlnx,xps-uartlite-1.00a"]
