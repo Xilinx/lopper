@@ -24,14 +24,51 @@ This document describes the ongoing migration from `lopper_sanity.py` to pytest-
     - `TestPropertyAccess` - Property index and dict access
     - `TestAliases` - Alias lookups
 
-### 📋 TODO - High Priority
-- **YAML tests** - Migrate `yaml_sanity_test()` from lopper_sanity.py
-- **FDT tests** - Migrate `fdt_sanity_test()`
-- **Schema tests** - Migrate `schema_type_sanity_test()`
+- **YAML tests** (`tests/test_yaml.py`) - **6 tests migrated** (100% complete)
+  - Complete 1:1 migration of `yaml_sanity_test()` from lopper_sanity.py (lines 2534-2569)
+  - All test classes migrated:
+    - `TestYAMLReadWrite` - YAML load and write operations
+    - `TestYAMLToTree` - YAML to tree conversion and DTS writing
+    - `TestSDTToYAML` - Device tree to YAML conversion
+    - `TestComplexPropertyAccess` - Complex nested property access from YAML
+
+- **FDT tests** (`tests/test_fdt.py`) - **15 tests migrated** (100% complete)
+  - Complete 1:1 migration of `fdt_sanity_test()` from lopper_sanity.py (lines 2412-2533)
+  - All test classes migrated:
+    - `TestFDTExport` - FDT export to dictionary
+    - `TestTreeLoadFromFDT` - Loading tree from exported FDT
+    - `TestTreeSync` - Syncing tree changes back to FDT
+    - `TestNodeDeletion` - Node and property deletion
+    - `TestNodeAddition` - Adding nodes and properties
+    - `TestNodeIteration` - Tree and subnode iteration
+    - `TestStringTypeDetection` - String decoding in node printing
+
+- **Schema tests** (`tests/test_schema.py`) - **14 tests migrated** (100% complete)
+  - Complete 1:1 migration of `schema_type_sanity_test()` from lopper_sanity.py (lines 2335-2411)
+  - All test classes migrated:
+    - `TestSchemaTypeDetection` - Schema-based property type detection (8 tests)
+    - `TestPropertyFormatPreservation` - Format preservation in output (6 tests)
+
+- **Format tests** (`tests/test_format.py`) - **1 test migrated** (100% complete)
+  - Complete 1:1 migration of `format_sanity_test()` from lopper_sanity.py (lines 2328-2333)
+  - Test class migrated:
+    - `TestDTSWrite` - DTS writing with enhanced mode
+
+- **Lops tests** (`tests/test_lops.py`) - **18 tests migrated** (100% complete)
+  - Complete 1:1 migration of `lops_sanity_test()` from lopper_sanity.py (lines 2172-2305)
+  - All test classes migrated:
+    - `TestLopsNodeDeletion` - Node deletion via lops (1 test)
+    - `TestLopsNodeRename` - Node renaming via lops (1 test)
+    - `TestLopsPropertyRemoval` - Property removal via lops (2 tests)
+    - `TestLopsNodeAddition` - Node addition via lops (1 test)
+    - `TestLopsPropertyModification` - Property modification via lops (2 tests)
+    - `TestLopsSelectiveOutput` - Selective node output (2 tests)
+    - `TestLopsPropertyAddition` - Property addition via lops (2 tests)
+    - `TestLopsSubtrees` - Subtree operations (3 tests)
+    - `TestLopsListModification` - List property modifications (4 tests)
 
 ### 📋 TODO - Medium Priority
-- **Lops tests** - Migrate `lops_sanity_test()` and `lops_code_test()`
-- **Format tests** - Migrate `format_sanity_test()`
+- **Lops code tests** - Migrate `lops_code_test()`
 
 ### 📋 TODO - Lower Priority
 - **Assists tests** - Migrate `assists_sanity_test()`

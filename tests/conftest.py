@@ -2,17 +2,33 @@
 Pytest configuration and shared fixtures for Lopper tests.
 """
 
+import sys
 import pytest
 import tempfile
 import shutil
 from pathlib import Path
+from io import StringIO
 
-from lopper import Lopper
+from lopper import Lopper, LopperSDT
 from lopper.tree import LopperTree
 
 # Import the device tree setup function from lopper_sanity
 # This ensures we use the exact same test data
 import lopper_sanity
+
+
+class Capturing(list):
+    """Context manager to capture stdout."""
+    def __enter__(self):
+        self._stdout = sys.stdout
+        sys.stdout = self._stringio = StringIO()
+        return self
+    def __exit__(self, *args):
+        self.extend(self._stringio.getvalue().splitlines())
+        sys.stdout = self._stdout
+    def reset(self):
+        del self._stringio
+        sys.stdout = self._stdout
 
 
 @pytest.fixture(scope="session")
@@ -84,3 +100,219 @@ def lopper_tree(compiled_fdt):
     tree = LopperTree()
     tree.load(Lopper.export(compiled_fdt))
     return tree
+
+
+@pytest.fixture(scope="session")
+def yaml_test_file(test_outdir):
+    """
+    Setup a YAML test file for testing.
+
+    Uses the same YAML content from lopper_sanity.py's setup_yaml()
+    to ensure consistency with existing tests.
+    """
+    yaml_path = lopper_sanity.setup_yaml(test_outdir)
+    return yaml_path
+
+
+@pytest.fixture
+def lopper_sdt(system_device_tree, test_outdir):
+    """
+    Create a LopperSDT instance for FDT testing.
+
+    This is a function-scoped fixture, so each test gets a fresh LopperSDT.
+    Configured the same way as in lopper_sanity.py's fdt_sanity_test.
+    """
+    # Check if libfdt is available
+    libfdt_available = False
+    try:
+        import libfdt
+        libfdt_available = True
+    except ImportError:
+        pass
+
+    sdt = LopperSDT(system_device_tree)
+    sdt.dryrun = False
+    sdt.verbose = 0
+    sdt.werror = False
+    sdt.output_file = test_outdir + "/fdt-output.dts"
+    sdt.cleanup_flag = True
+    sdt.save_temps = False
+    sdt.enhanced = True
+    sdt.outdir = test_outdir
+    sdt.libfdt = libfdt_available
+
+    # Setup the device tree
+    sdt.setup(system_device_tree, [], "", True, libfdt=libfdt_available)
+
+    return sdt
+
+
+@pytest.fixture
+def format_lopper_sdt(test_outdir):
+    """
+    Create a LopperSDT instance for format testing.
+
+    Uses the format test device tree from lopper_sanity.py's setup_format_tree().
+    """
+    # Check if libfdt is available
+    libfdt_available = False
+    try:
+        import libfdt
+        libfdt_available = True
+    except ImportError:
+        pass
+
+    # Setup the format test tree
+    format_tree = lopper_sanity.setup_format_tree(test_outdir)
+
+    sdt = LopperSDT(format_tree)
+    sdt.dryrun = False
+    sdt.verbose = 0
+    sdt.werror = False
+    sdt.output_file = test_outdir + "/format-output.dts"
+    sdt.cleanup_flag = True
+    sdt.save_temps = False
+    sdt.enhanced = True
+    sdt.outdir = test_outdir
+    sdt.use_libfdt = libfdt_available
+
+    # Setup the device tree
+    sdt.setup(format_tree, [], "", True, libfdt=libfdt_available)
+
+    return sdt
+
+
+@pytest.fixture
+def schema_lopper_sdt(test_outdir):
+    """
+    Create a LopperSDT instance for schema type testing.
+
+    Uses the schema test device tree from lopper_sanity.py's setup_schema_types_tree().
+    Configured the same way as in schema_type_sanity_test().
+    """
+    # Check if libfdt is available
+    libfdt_available = False
+    try:
+        import libfdt
+        libfdt_available = True
+    except ImportError:
+        pass
+
+    # Setup the schema types test tree
+    schema_tree = lopper_sanity.setup_schema_types_tree(test_outdir)
+
+    sdt = LopperSDT(schema_tree)
+    sdt.dryrun = False
+    sdt.verbose = 0
+    sdt.werror = False
+    sdt.output_file = test_outdir + "/schema-types-output.dts"
+    sdt.cleanup_flag = True
+    sdt.save_temps = False
+    sdt.enhanced = True
+    sdt.outdir = test_outdir
+    sdt.use_libfdt = libfdt_available
+    sdt.schema = ("learn_dump", test_outdir + "/schema-types-schema.yaml")
+
+    # Setup the device tree
+    sdt.setup(schema_tree, [], "", True, libfdt=libfdt_available)
+
+    # Perform lops (needed for schema learning)
+    sdt.perform_lops()
+
+    # Write output file (needed for pattern checks)
+    if sdt.output_file:
+        sdt.write(enhanced=True)
+
+    return sdt
+
+
+@pytest.fixture
+def lops_device_tree(test_outdir):
+    """
+    Create a LopperSDT instance for lops testing.
+
+    Uses the same device tree and lops file from lopper_sanity.py's lops_sanity_test().
+    Configured the same way as in lops_sanity_test().
+    """
+    # Check if libfdt is available
+    libfdt_available = False
+    try:
+        import libfdt
+        libfdt_available = True
+    except ImportError:
+        # lops_sanity_test returns early if libfdt not available
+        pytest.skip("libfdt not available, lops tests require libfdt")
+
+    # Setup the system device tree (not the simple one)
+    dt = lopper_sanity.setup_system_device_tree(test_outdir)
+
+    # Setup the lops file
+    lop_file = lopper_sanity.setup_lops(test_outdir)
+
+    sdt = LopperSDT(dt)
+    sdt.dryrun = False
+    sdt.verbose = 5
+    sdt.werror = False
+    sdt.output_file = test_outdir + "/sdt-output.dts"
+    sdt.cleanup_flag = True
+    sdt.save_temps = False
+    sdt.enhanced = True
+    sdt.outdir = test_outdir
+    sdt.use_libfdt = libfdt_available
+
+    # Setup with lop file
+    sdt.setup(dt, [lop_file], "", True, libfdt=libfdt_available)
+
+    # Perform the lops
+    sdt.perform_lops()
+
+    # Sync and write output
+    from lopper import Lopper
+    Lopper.sync(sdt.FDT, sdt.tree.export())
+    sdt.write(enhanced=True)
+
+    return sdt
+
+
+@pytest.fixture
+def lops_code_output(test_outdir):
+    """
+    Create output from lops_code_test for testing.
+
+    Uses the same device tree and lops from lopper_sanity.py's lops_code_test().
+    Captures stdout during lop execution for verification.
+    """
+    # Check if libfdt is available
+    libfdt_available = False
+    try:
+        import libfdt
+        libfdt_available = True
+    except ImportError:
+        pass
+
+    # Setup system device tree
+    dt = lopper_sanity.setup_system_device_tree(test_outdir)
+
+    # Setup the code lops file
+    lop_file = lopper_sanity.setup_code_lops(test_outdir)
+
+    sdt = LopperSDT(dt)
+    sdt.dryrun = False
+    sdt.verbose = 0
+    sdt.werror = False
+    sdt.output_file = test_outdir + "/lops-code-output.dts"
+    sdt.cleanup_flag = True
+    sdt.save_temps = False
+    sdt.enhanced = True
+    sdt.outdir = test_outdir
+    sdt.use_libfdt = libfdt_available
+
+    # Setup with lop file
+    sdt.setup(dt, [lop_file], "", True, libfdt=libfdt_available)
+
+    # Capture stdout during lop execution
+    with Capturing() as output:
+        sdt.perform_lops()
+
+    # Return the captured output as a string
+    return output._stringio.getvalue()

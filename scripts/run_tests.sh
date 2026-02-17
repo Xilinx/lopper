@@ -9,6 +9,7 @@ echo "========================================="
 echo "Running pytest test suite..."
 echo "========================================="
 
+PYTEST_FAILED=0
 if pytest -v tests/ --tb=short --junitxml=pytest-results.xml 2>&1 | tee pytest_output.txt; then
     echo "✅ Pytest tests passed!"
 else
@@ -22,6 +23,7 @@ echo "Running lopper_sanity.py legacy test suite..."
 echo "========================================="
 
 # Run tests and capture output
+LEGACY_FAILED=0
 python3 lopper_sanity.py --all 2>&1 | tee test_output.txt
 TEST_EXIT_CODE=${PIPESTATUS[0]}
 
@@ -41,8 +43,10 @@ echo "Legacy tests passed: $PASSED"
 echo "Legacy tests failed: $FAILED"
 
 # Parse pytest results
-PYTEST_PASSED=$(grep -c "PASSED" pytest_output.txt || true)
-PYTEST_FAILED_COUNT=$(grep -c "FAILED" pytest_output.txt || true)
+# Count PASSED in test lines (e.g., "tests/test_tree.py::TestFoo::test_bar PASSED")
+PYTEST_PASSED=$(grep -E "^tests/.*PASSED" pytest_output.txt | wc -l || true)
+# Count FAILED in test lines only (not in summary)
+PYTEST_FAILED_COUNT=$(grep -E "^tests/.*FAILED" pytest_output.txt | wc -l || true)
 
 echo "Pytest tests passed: $PYTEST_PASSED"
 echo "Pytest tests failed: $PYTEST_FAILED_COUNT"
