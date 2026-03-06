@@ -34,6 +34,7 @@ import lopper.log
 import logging
 
 import lopper.schema
+import lopper.audit
 
 lopper.log._init( __name__ )
 lopper.log._init( "tree.py" )
@@ -1983,24 +1984,16 @@ class LopperNode(object):
             for p in self.__props__.values():
                 p.__dbg__ = value
         else:
-            # we do it this way, otherwise the property "ref" breaks
-            super().__setattr__(name, value)
-
             if name == "phandle":
-                # someone is assigning a phandle, the tree's pnodes need to
-                # be updated
-                if self.tree:
-                    # only non-zero phandles need update
-                    if value > 0:
-                        # this really should be interal to the tree, and will
-                        # be in the future. We need some sort of Node "update"
-                        # since the pnode assignemnt is only done in the add()
-                        # (same with label updates).
-                        #
-                        # if strict is set, we could check to see if a phandle
-                        # is already mapped and warn/error.
-                        #
-                        self.tree.__pnodes__[value] = self
+                # Delegate to phandle_set() which handles:
+                # - duplicate phandle detection (with -W duplicate_phandle)
+                # - tree __pnodes__ index updates
+                # - phandle property sync
+                # Note: phandle_set() uses __dict__ to set the value, avoiding recursion
+                self.phandle_set(value)
+            else:
+                # we do it this way, otherwise the property "ref" breaks
+                super().__setattr__(name, value)
 
             # This is left for reference. When this is added, the overhead
             # makes processing slower AND it seems to break some labels in
@@ -2314,19 +2307,55 @@ class LopperNode(object):
         return npath
 
     def phandle_set(self,value):
-        old_phandle = self.phandle
+        # Get old phandle, defaulting to 0 if not yet set (during __init__)
+        try:
+            old_phandle = self.__dict__.get('phandle', 0)
+        except:
+            old_phandle = 0
 
-        self.phandle = value
+        # Update the tree's phandle index if we are assigned to a tree
+        if self.tree and value > 0:
+            # Check for duplicate phandle before making any changes
+            existing = self.tree.__pnodes__.get(value)
+            if existing and existing is not self:
+                # Warn if duplicate_phandle or all warnings enabled
+                if "duplicate_phandle" in self.tree.warnings or "all" in self.tree.warnings:
+                    msg = (f"duplicate_phandle: phandle {value:#x} already mapped to "
+                           f"{existing.abs_path}, now being claimed by {self.abs_path}")
+                    if self.tree.werror:
+                        lopper.log._error(msg, also_exit=1)
+                    else:
+                        lopper.log._warning(msg)
+
+            # Remove old phandle from index if it existed and is different
+            if old_phandle > 0 and old_phandle != value:
+                try:
+                    del self.tree.__pnodes__[old_phandle]
+                except:
+                    pass
+                # WARNING: Changing a node's phandle from one non-zero value to another
+                # can orphan references. Other nodes may have properties that reference
+                # this node by its numeric phandle (not by symbol/label). Those properties
+                # will now point to an invalid phandle. We don't currently maintain a
+                # reverse lookup of "all properties referencing a given phandle", so we
+                # cannot automatically update those references. A tree walk would be
+                # required to find and fix them, which is expensive.
+                # TODO: Consider maintaining a reverse lookup map for phandle references.
+                _warning(f"phandle_set: changing phandle from {old_phandle} to {value} "
+                         f"for node {self.abs_path} - this may orphan numeric references")
+            # Add new phandle to index
+            self.tree.__pnodes__[value] = self
+
+        # Set the phandle attribute (after index updates to avoid recursion via __setattr__)
+        self.__dict__['phandle'] = value
 
         # is there a phandle property ? That is only used
         # in printing, but it should be updated to match
         try:
             phandle_prop = self.__props__["phandle"]
-            self.__props__["phandle"].value = self.phandle
+            self.__props__["phandle"].value = value
         except:
             True
-
-        # TOOD: consider if we should update the tree, if we are assigned to one ?
 
     def label_set(self,value):
         # someone is labelling a node, the tree's lnodes need to be
@@ -2678,6 +2707,9 @@ class LopperNode(object):
 
         new_ph = self.tree.phandle_gen()
         self.phandle = new_ph
+
+        # Update the tree's phandle index so pnode() lookups work
+        self.tree.__pnodes__[new_ph] = self
 
         _debug( "phandle {self.phandle} created for node {self.abs_path}" )
 
@@ -3088,6 +3120,13 @@ class LopperNode(object):
         lopper.log._debug( f"merging secondary node: {other_node.abs_path} into: {self.abs_path}")
         # export the dictionary (properties)
         o_export = other_node.export()
+
+        # Preserve the target node's identity - we only want to merge properties,
+        # not change the path/name/phandle of the target node
+        o_export['__path__'] = self.abs_path
+        o_export['__fdt_name__'] = self.name
+        o_export['__fdt_number__'] = self.number
+        o_export['__fdt_phandle__'] = self.phandle
 
         # load them into the node, keep children intact, this is a single
         # node operation
@@ -4087,8 +4126,6 @@ class LopperTree:
                                 node_string="node:" + node_string
                                 lopper.log._warning( node_string )
 
-
-
     def overlay_of( self, parent_tree ):
         # we are becoming an overlay_of the passed tree
         self._type = "dts_overlay"
@@ -4362,6 +4399,11 @@ class LopperTree:
             # some extensive testing
             for p in n:
                 p.resolve()
+
+        # Check for invalid phandle references if warning is enabled
+        # This fires regardless of --permissive since user explicitly requested it
+        if "invalid_phandle" in self.warnings or "all" in self.warnings:
+            lopper.audit.report_invalid_phandles(self, werror=self.werror)
 
         self.__check__ = False
 
