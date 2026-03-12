@@ -232,7 +232,62 @@ def wildcard_devices( tree, domains_node ):
 
     Returns:
         None
+
+    The parent domain for glob expansion is determined in this order:
+    1. Explicit 'parent:' property on the individual domain
+    2. parent: auto - infer by walking up the tree hierarchy
+    3. Sibling domain with 'openamp,domain-v1,devices' compatible string
+
+    Peer exclusion: If any domain uses glob patterns, explicit device references
+    in sibling domains are removed from the devices pool before glob expansion.
+    This ensures explicit references take priority over glob matches.
     """
+    # Find sibling domain with devices compatible string
+    # This domain serves as the device inventory for glob matching
+    devices_domain = None
+    for sibling in domains_node.subnodes(children_only=True):
+        try:
+            compat = sibling["compatible"].value
+            if isinstance(compat, list):
+                compat = ','.join(compat)
+            if ',devices' in compat:
+                devices_domain = sibling
+                _debug( f"found devices domain: {devices_domain.abs_path}" )
+                break
+        except:
+            pass
+
+    # Peer exclusion: if any domain has globs, remove explicit refs from pool
+    if devices_domain:
+        has_globs = False
+        explicit_devices = set()
+
+        # First pass: check for globs and collect explicit device refs
+        for domain in domains_node.subnodes():
+            if domain == devices_domain:
+                continue
+            try:
+                access_chunks = domain_access( domain )
+                for a in access_chunks:
+                    dev = a.get("dev", "")
+                    if is_glob_pattern( dev ):
+                        has_globs = True
+                    else:
+                        explicit_devices.add( dev )
+            except:
+                pass
+
+        # If globs exist, remove explicit devices from the pool
+        if has_globs and explicit_devices:
+            _debug( f"peer exclusion: removing {len(explicit_devices)} explicit devices from pool" )
+            pool_access = domain_access( devices_domain )
+            if pool_access:
+                filtered_access = [a for a in pool_access if a.get("dev", "") not in explicit_devices]
+                removed_count = len(pool_access) - len(filtered_access)
+                if removed_count > 0:
+                    _info( f"peer exclusion: removed {removed_count} explicitly-claimed devices from glob pool" )
+                    domain_access( devices_domain, filtered_access )
+
     for domain in domains_node.subnodes():
         _debug( f"wildcard device expansion: processing {domain.abs_path}" )
 
@@ -253,23 +308,34 @@ def wildcard_devices( tree, domains_node ):
                         d_parent = domain_parent( domain )
                         parent_domain = None
 
+                        # Try to find parent domain in priority order:
+                        # 1. Explicit parent: property
+                        # 2. parent: auto (walk up tree)
+                        # 3. Sibling with ,devices compatible
                         if d_parent:
-                            # Explicit parent: property
                             d_parent_path = d_parent.value
-                            try:
-                                if d_parent_path.startswith('/'):
-                                    parent_domain = tree[d_parent_path]
-                                else:
-                                    nodes = tree.nodes( d_parent_path + "$" )
-                                    parent_domain = nodes[0] if nodes else None
-                            except Exception as e:
-                                _error( f"glob in {domain.abs_path}: explicit parent '{d_parent_path}' not found: {e}", True )
-                        else:
-                            # No explicit parent: property, try to infer by walking up tree
-                            parent_domain = infer_parent_domain( tree, domain )
+                            if d_parent_path == "auto":
+                                # parent: auto - infer by walking up tree
+                                _debug( f"parent: auto - inferring parent domain" )
+                                parent_domain = infer_parent_domain( tree, domain )
+                            else:
+                                # Explicit parent: property on domain
+                                try:
+                                    if d_parent_path.startswith('/'):
+                                        parent_domain = tree[d_parent_path]
+                                    else:
+                                        nodes = tree.nodes( d_parent_path + "$" )
+                                        parent_domain = nodes[0] if nodes else None
+                                except:
+                                    pass
+
+                        # Fallback to devices domain if no parent found yet
+                        if not parent_domain and devices_domain and devices_domain != domain:
+                            _debug( f"using devices domain: {devices_domain.abs_path}" )
+                            parent_domain = devices_domain
 
                         if not parent_domain:
-                            _error( f"glob in {domain.abs_path}: no parent domain with devices found (explicit or inferred)", True )
+                            _error( f"glob in {domain.abs_path}: no parent domain found (use parent: property or add domain with compatible containing ',devices')", True )
 
                         # Get parent's access list and verify it has devices
                         parent_access = domain_access( parent_domain )
