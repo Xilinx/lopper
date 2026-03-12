@@ -1,6 +1,6 @@
 #/*
 # * Copyright (c) 2020 Xilinx Inc. All rights reserved.
-# * Copyright (c) 2024 - 2026 Advanced Micro Devices, Inc.  All rights reserved.
+# * Copyright (c) 2024 - 2025 Advanced Micro Devices, Inc.  All rights reserved.
 # *
 # * Author:
 # *       Appana Durga Kedareswara rao <appana.durga.kedareswara.rao@amd.com>
@@ -116,7 +116,7 @@ def xlnx_generate_xparams(tgt_node, sdt, options):
             if has_drivers:
                 has_drivers = os.path.join(utils.get_dir_path(sdt.dts), "drivers")
                 yaml_list = glob.glob(has_drivers + '/**/data/*.yaml', recursive=True)
-                yaml_file_abs = [yaml for yaml in yaml_list if f"{drv}.yaml" in yaml]
+                yaml_file_abs = [yaml for yaml in yaml_list if f"{drv}.yaml" == utils.get_base_name(yaml)]
                 if yaml_file_abs:
                     yaml_file_abs = yaml_file_abs[0]
         else:
@@ -175,7 +175,7 @@ def xlnx_generate_xparams(tgt_node, sdt, options):
 
                     if prop == "reg":
                         try:
-                            val, size = bm_config.get_cpu_mapped_address(node, sdt, options)
+                            val, size = bm_config.scan_reg_size(node, node[prop].value, 0)
                             plat.buf(f'\n#define XPAR_{label_name}_BASEADDR {hex(val)}')
                             plat.buf(f'\n#define XPAR_{label_name}_HIGHADDR {hex(val + size -1)}')
                             canondef_dict.update({"BASEADDR":hex(val)})
@@ -190,15 +190,10 @@ def xlnx_generate_xparams(tgt_node, sdt, options):
                             if num_of_addr > 1:
                                 for j in range(1, num_of_addr):
                                     try:
-                                        mapped_val, mapped_size = bm_config.get_cpu_mapped_address(node, sdt, options, j)
-                                        plat.buf(f'\n#define XPAR_{label_name}_BASEADDR_{j} {hex(mapped_val)}')
-                                    except (IndexError, KeyError):
-                                        # Fallback to original scan_reg_size if mapping fails
-                                        try:
-                                            val, size = bm_config.scan_reg_size(node, node[prop].value, j)
-                                            plat.buf(f'\n#define XPAR_{label_name}_BASEADDR_{j} {hex(val)}')
-                                        except IndexError:
-                                            pass
+                                        val, size = bm_config.scan_reg_size(node, node[prop].value, j)
+                                        plat.buf(f'\n#define XPAR_{label_name}_BASEADDR_{j} {hex(val)}')
+                                    except IndexError:
+                                        pass
                         except KeyError:
                             pass
                     elif prop == "compatible":
