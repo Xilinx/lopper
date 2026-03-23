@@ -18,7 +18,7 @@ from lopper.tree import LopperNode
 
 sys.path.append(os.path.dirname(__file__))
 
-from baremetalconfig_xlnx import compat_list, get_cpu_node, get_mapped_nodes, get_label
+from baremetalconfig_xlnx import compat_list, get_cpu_node, get_mapped_nodes, get_label, scan_reg_size
 from common_utils import to_cmakelist
 import common_utils as utils
 from domain_access import update_mem_node
@@ -99,6 +99,81 @@ def filter_ipi_nodes_for_cpu(sdt, machine):
     except Exception as e:
         print(f"[ERROR] Failed to delete IPI node...")
         return
+
+
+def check_console_uart_accessibility(sdt, options):
+    """
+    Check if the console UART (from /chosen/stdout-path) is accessible to MicroBlaze RISC-V.
+
+    Logic:
+    1. Read /chosen/stdout-path to get configured console UART alias (e.g., serial0)
+    2. Resolve alias to get actual UART device node
+    3. Check if UART is accessible using accessible_by() API
+    4. If accessible: enable PS UART (set status="okay")
+    5. If NOT accessible: find PL UART that is accessible and update /chosen/stdout-path
+
+    This ensures Vitis BSP and Zephyr use the same console UART.
+
+    Args:
+        sdt: System device tree
+        options: User options with processor name
+    """
+    try:
+        # Only process for MicroBlaze RISC-V
+        match_cpunode = get_cpu_node(sdt, options)
+        cpu_ip = match_cpunode.propval('xlnx,ip-name', list)
+        if not cpu_ip or cpu_ip[0] not in ('microblaze', 'microblaze_riscv'):
+            return
+
+        chosen_node = sdt.tree['/chosen']
+        if chosen_node.propval('stdout-path') == ['']:
+            return
+
+        stdout_path = chosen_node.propval('stdout-path', list)[0]
+        alias_name = stdout_path.split(':')[0]
+
+        alias_node = sdt.tree['/aliases']
+        if alias_node.propval(alias_name) == ['']:
+            return
+
+        uart_path = alias_node.propval(alias_name, list)[0]
+
+        try:
+            uart_node = sdt.tree[uart_path]
+        except KeyError:
+            return
+
+        # Check if UART is accessible by any CPU cluster using accessible_by() API
+        is_accessible = bool(sdt.tree.accessible_by(uart_node))
+
+        if is_accessible:
+            current_status = uart_node.propval('status', list)
+            if current_status and current_status[0] == 'disabled':
+                uart_node['status'] = 'okay'
+        else:
+            pl_uart_compatibles = [
+                'xlnx,axi-uart16550', 'xlnx,xps-uart16550',
+                'xlnx,xps-uartlite', 'xlnx,mdm-riscv',
+                'ns16550'
+            ]
+
+            accessible_pl_uart = None
+            for node in sdt.tree.nodes('/.*'):
+                if node.propval('compatible') != ['']:
+                    node_compatibles = node.propval('compatible', list)
+                    if any(compat in node_compatibles for compat in pl_uart_compatibles):
+                        # Check if this PL UART is accessible using accessible_by() API
+                        if sdt.tree.accessible_by(node):
+                            accessible_pl_uart = node
+                            break
+
+            if accessible_pl_uart:
+                pl_uart_label = accessible_pl_uart.label if accessible_pl_uart.label else "serial_pl"
+                alias_node[pl_uart_label] = accessible_pl_uart.abs_path
+                baud_rate = ":" + stdout_path.split(':')[1] if ':' in stdout_path else ""
+                chosen_node['stdout-path'] = pl_uart_label + baud_rate
+    except Exception:
+        pass
 
 
 # tgt_node: is the top level domain node
@@ -198,6 +273,11 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                 sdt.tree.add(subnode)
 
     filter_ipi_nodes_for_cpu(sdt, machine)
+
+    # Check console UART accessibility for MicroBlaze Zephyr DTS
+    # This ensures Vitis BSP and Zephyr use the same accessible console UART
+    if zephyr_dt:
+        check_console_uart_accessibility(sdt, options)
 
     node_list = []
     cpu_ip = match_cpunode.propval('xlnx,ip-name', list)
@@ -434,6 +514,75 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                         if "okay" in node.propval('status', list)[0]:
                             node.propval('status', list)[0] = "disabled"
 
+    # For MicroBlaze/MicroBlaze RISC-V: remap PS peripheral interrupts to AXI INTC.
+    # PS peripherals like sysmon have GIC-format interrupts (3-cell) but on MicroBlaze
+    # they are routed via ps_pl_irq through xlconcat to the AXI INTC. The SDT does not
+    # capture this cross-domain routing, so we detect and remap here.
+    cpu_ip_name = match_cpunode.propval('xlnx,ip-name', list)[0]
+    if cpu_ip_name in ('microblaze', 'microblaze_riscv'):
+        axi_intc_node = None
+        for node in sdt.tree['/'].subnodes():
+            if node.propval('xlnx,ip-name', list) == ['axi_intc']:
+                axi_intc_node = node
+                break
+
+        if axi_intc_node is not None:
+            intc_phandle = axi_intc_node.phandle
+            num_intr = axi_intc_node.propval('xlnx,num-intr-inputs', list)[0]
+
+            for node in sdt.tree['/'].subnodes():
+                if node.propval('interrupts') == [''] or node.propval('compatible') == ['']:
+                    continue
+
+                intr_val = node.propval('interrupts')
+                if len(intr_val) < 3:
+                    continue
+
+                # Use property_find() to walk parent chain for interrupt-parent
+                prop, _ = node.property_find('interrupt-parent')
+                if not prop:
+                    continue
+
+                # Use deref() to resolve the phandle to a node
+                intr_parent = sdt.tree.deref(prop.value[0])
+                if not intr_parent:
+                    continue
+
+                inc = intr_parent.propval('#interrupt-cells', list)[0]
+                if inc != 3:
+                    continue
+
+                # Remap known PS peripherals routed via ps_pl_irq to AXI INTC
+                compat = node.propval('compatible', list)
+                if 'xlnx,versal-sysmon' in compat:
+                    # Determine the AXI INTC input by finding the next input
+                    # after all PL peripherals already connected to the INTC
+                    used_inputs = set()
+                    for n in sdt.tree['/'].subnodes():
+                        if n.propval('interrupts') == ['']:
+                            continue
+                        n_prop, _ = n.property_find('interrupt-parent')
+                        if not n_prop:
+                            continue
+                        if n_prop.value[0] == intc_phandle and n != node:
+                            n_intr = n.propval('interrupts')
+                            if len(n_intr) >= 2:
+                                used_inputs.add(n_intr[0])
+
+                    sysmon_intr_id = None
+                    if used_inputs:
+                        next_input = max(used_inputs) + 1
+                        if next_input < num_intr:
+                            sysmon_intr_id = next_input
+                    else:
+                        sysmon_intr_id = 0
+
+                    if sysmon_intr_id is not None:
+                        from lopper.tree import LopperProp
+                        node['interrupt-parent'] = LopperProp(
+                            name='interrupt-parent', value=[intc_phandle])
+                        node.add(node['interrupt-parent'])
+                        node['interrupts'].value = [sysmon_intr_id, 0x2]
     # Remove symbol node referneces
     symbol_node = sdt.tree['/__symbols__']
     prop_list = list(symbol_node.__props__.keys())
@@ -591,6 +740,11 @@ def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
                     node["clock-frequency"] = 32767
             elif compatible == "cdns,ttc":
                 # TTC: Convert 3-cell interrupts to 4-cell GIC format by adding 0xa0 priority
+                intr_list = node["interrupts"].value
+                node["interrupts"].value = [cell for i in range(0, len(intr_list), 3)
+                                for cell in intr_list[i:i+3] + [0xa0]]
+            elif compatible == "xlnx,versal-gem":
+                # GEM: Convert 3-cell interrupts to 4-cell GICv3 format
                 intr_list = node["interrupts"].value
                 node["interrupts"].value = [cell for i in range(0, len(intr_list), 3)
                                 for cell in intr_list[i:i+3] + [0xa0]]
@@ -878,6 +1032,41 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                         node['#address-cells'] = 1
                         node['#size-cells'] = 0
                         node['compatible'] = "xlnx,ps-gpio"
+                    # GEM (Gigabit Ethernet MAC) — xlnx,versal-gem / cdns,gem
+                    if "xlnx,versal-gem" in node["compatible"].value:
+                        # Remove any pre-existing sub-nodes
+                        for subnode in node.subnodes():
+                            node.delete(subnode)
+                        # --- Build ethernet_mac child node ---
+                        mac_node = LopperNode()
+                        mac_node["compatible"] = ["xlnx,gem"]
+                        mac_node["status"] = "okay"
+                        # clock-frequency: read from xlnx,enet-clk-freq-hz (set by pcw.dtsi)
+                        if node.propval('xlnx,enet-clk-freq-hz') != ['']:
+                            mac_node["clock-frequency"] = node["xlnx,enet-clk-freq-hz"].value
+                        # Copy interrupts (already converted to 4-cell GICv3 format)
+                        if node.propval('interrupts') != ['']:
+                            mac_node["interrupts"] = node["interrupts"].value
+                        # Fixed MAC tuning parameters
+                        mac_node["amba-ahb-burst-length"] = 16
+                        mac_node["hw-rx-buffer-size"] = 3
+                        mac_node["hw-rx-buffer-offset"] = 0
+                        mac_node + LopperProp("hw-tx-buffer-size-full")
+                        mac_node["rx-buffer-descriptors"] = 32
+                        mac_node["tx-buffer-descriptors"] = 32
+                        mac_node["rx-buffer-size"] = 1536
+                        mac_node["tx-buffer-size"] = 1536
+                        mac_node + LopperProp("discard-rx-fcs")
+                        mac_node + LopperProp("unicast-hash")
+                        mac_addr_prop = LopperProp(name="local-mac-address")
+                        mac_addr_prop.value = [0x00, 0x0a, 0x35, 0x00, 0x01, 0x02]
+                        mac_addr_prop.binary = True
+                        mac_node + mac_addr_prop
+                        mac_node.name = "ethernet_mac"
+                        mac_node.label_set(f"{node.label}_mac")
+                        node.add(mac_node)
+                        node["compatible"].value = ["xlnx,gem-controller"]
+                        is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
                     if is_supported_periph:
                         required_prop = is_supported_periph[0]["required"]
                         prop_list = list(node.__props__.keys())
@@ -1063,7 +1252,16 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
     root_sub_nodes = root_node.subnodes()
     symbol_node = sdt.tree['/__symbols__']
     valid_alias_proplist = []
-
+    stdout_baud = None
+    try:
+        chosen_node = sdt.tree['/chosen']
+        if chosen_node.propval('stdout-path') != ['']:
+            stdout_path = chosen_node.propval('stdout-path', list)[0]
+            match = re.search(r':(\d+)', str(stdout_path))
+            if match:
+                stdout_baud = int(match.group(1))
+    except Exception:
+        stdout_baud = None
     """
     DRC Checks
     1) Interrupt controller is present or not
@@ -1110,6 +1308,203 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
         print(err_timer_nointr)
         sys.exit(1)
 
+    memnode_list = sdt.tree.nodes('/memory@.*')
+    for mem_node in memnode_list:
+        if mem_node.propval('ranges') != ['']:
+            mem_node.delete('ranges')
+
+    # MicroBlaze Zephyr DTS should only keep PL peripherals plus core nodes
+    # when the design includes both PS and PL (MicroBlaze) domains.
+    has_pl_mb = False
+    try:
+        match_cpunode = get_cpu_node(sdt, options)
+        cpu_ip = match_cpunode.propval('xlnx,ip-name', list)
+        has_pl_mb = bool(cpu_ip and cpu_ip[0] == "microblaze_riscv")
+    except Exception:
+        has_pl_mb = any(
+            node.propval('xlnx,ip-name') != [''] and node.propval('xlnx,ip-name', list)[0] == "microblaze_riscv"
+            for node in root_sub_nodes
+        )
+
+    has_ps_axi = False
+    ps_serial_data_to_recreate = []
+    ps_ipi_data_to_recreate = []
+
+    try:
+        axi_node = sdt.tree['/axi']
+        has_ps_axi = True
+
+        if has_pl_mb:
+            ps_uart_compatibles = ['arm,pl011', 'arm,sbsa-uart', 'arm,primecell']
+            ps_ipi_compatibles = ['xlnx,versal-ipi-mailbox']
+            for node in list(axi_node.subnodes()):
+                if node.propval('compatible') != ['']:
+                    node_compatibles = node.propval('compatible', list)
+                    if any(compat in node_compatibles for compat in ps_uart_compatibles):
+                        if 'serial' in node.name.lower() and node.propval('status', list) == ['okay']:
+                            node_data = {
+                                'name': node.name,
+                                'label': node.label,
+                                'properties': {}
+                            }
+                            for prop_name, prop_obj in node.__props__.items():
+                                node_data['properties'][prop_name] = prop_obj.value
+                            ps_serial_data_to_recreate.append(node_data)
+                    elif any(compat in node_compatibles for compat in ps_ipi_compatibles):
+                        if node.propval('status', list) == ['okay']:
+                            node_data = {
+                                'name': node.name,
+                                'label': node.label,
+                                'properties': {},
+                                'children': []
+                            }
+                            for prop_name, prop_obj in node.__props__.items():
+                                node_data['properties'][prop_name] = prop_obj.value
+                            for child in node.child_nodes.values():
+                                child_data = {
+                                    'name': child.name,
+                                    'label': child.label,
+                                    'properties': {}
+                                }
+                                for prop_name, prop_obj in child.__props__.items():
+                                    child_data['properties'][prop_name] = prop_obj.value
+                                node_data['children'].append(child_data)
+                            ps_ipi_data_to_recreate.append(node_data)
+    except Exception:
+        pass
+
+    if has_pl_mb and has_ps_axi:
+        allowed_top_nodes = {
+            "amba_pl",
+            "soc",
+            "chosen",
+            "aliases",
+            "clocks",
+            "__symbols__",
+        }
+        for node in list(root_sub_nodes):
+            if node.depth != 1:
+                continue
+            if node.name in allowed_top_nodes:
+                continue
+            if node.name.startswith("memory@"):
+                continue
+            if node.name.startswith("cpus"):
+                continue
+            sdt.tree.delete(node)
+        root_sub_nodes = root_node.subnodes()
+
+        if ps_serial_data_to_recreate or ps_ipi_data_to_recreate:
+            target_bus = None
+            try:
+                target_bus = sdt.tree['/soc']
+            except KeyError:
+                try:
+                    target_bus = sdt.tree['/amba_pl']
+                except KeyError:
+                    pass
+
+            if target_bus:
+                for idx, serial_data in enumerate(ps_serial_data_to_recreate):
+                    try:
+                        new_serial_path = f"{target_bus.abs_path}/{serial_data['name']}"
+                        serial_label = f"serial{idx}"
+
+                        new_serial = LopperNode(-1, new_serial_path)
+                        new_serial.tree = sdt.tree
+                        new_serial.label = serial_label
+
+                        new_serial + LopperProp(name="compatible", value=["arm,sbsa-uart"])
+                        new_serial + LopperProp(name="status", value=["okay"])
+
+                        if 'reg' in serial_data['properties']:
+                            new_serial + LopperProp(name="reg", value=serial_data['properties']['reg'])
+
+                        baudrate = serial_data['properties']['xlnx,baudrate'][0] if 'xlnx,baudrate' in serial_data['properties'] else 115200
+                        new_serial + LopperProp(name="current-speed", value=[baudrate])
+
+                        sdt.tree.add(new_serial)
+
+                        alias_path = new_serial.abs_path.replace("/amba_pl/", "/soc/")
+                        alias_node = sdt.tree['/aliases']
+                        alias_node + LopperProp(name=serial_label, value=alias_path)
+
+                        valid_alias_proplist.append(serial_data['name'])
+                    except Exception:
+                        pass
+                if ps_ipi_data_to_recreate:
+                    _schema_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "zephyr_supported_comp.yaml")
+                    _schema = utils.load_yaml(_schema_file) if utils.is_file(_schema_file) else {}
+                    ipi_parent_required = _schema.get('xlnx,versal-ipi-mailbox', {}).get('required', [])
+                    ipi_child_required = _schema.get('xlnx,versal-ipi-dest-mailbox', {}).get('required', [])
+
+                    for ipi_data in ps_ipi_data_to_recreate:
+                        try:
+                            new_ipi_path = f"{target_bus.abs_path}/{ipi_data['name']}"
+                            ipi_label = ipi_data['label']
+
+                            new_ipi = LopperNode(-1, new_ipi_path)
+                            new_ipi.tree = sdt.tree
+                            new_ipi.label = ipi_label
+
+                            for prop_name, prop_val in ipi_data['properties'].items():
+                                if ipi_parent_required and prop_name not in ipi_parent_required:
+                                    continue
+                                if prop_name == 'compatible':
+                                    new_ipi + LopperProp(name="compatible", value=["xlnx,mbox-versal-ipi-mailbox"])
+                                else:
+                                    new_ipi + LopperProp(name=prop_name, value=prop_val)
+
+                            sdt.tree.add(new_ipi)
+
+                            for child_data in ipi_data.get('children', []):
+                                new_child = LopperNode()
+                                # Match ARM path naming: child@<reg_addr_hex>
+                                child_reg = child_data['properties'].get('reg', [])
+                                if len(child_reg) > 1:
+                                    new_child.name = f"child@{hex(child_reg[1])[2:]}"
+                                else:
+                                    new_child.name = child_data['name']
+                                new_child.label = child_data['label']
+                                for prop_name, prop_val in child_data['properties'].items():
+                                    if ipi_child_required and prop_name not in ipi_child_required:
+                                        continue
+                                    if prop_name == 'compatible':
+                                        new_child + LopperProp(name="compatible", value=["xlnx,mbox-versal-ipi-dest-mailbox"])
+                                    else:
+                                        new_child + LopperProp(name=prop_name, value=prop_val)
+                                new_ipi.add(new_child)
+
+                        except Exception:
+                            pass
+
+        try:
+            chosen_node = sdt.tree['/chosen']
+            memnode_list = sdt.tree.nodes('/memory@.*')
+            ddr_memory = None
+            bram_memory = None
+            ocm_memory = None
+            for mem_node in memnode_list:
+                mem_path = mem_node.abs_path.lower()
+                mem_name = mem_node.name.lower()
+
+                if 'ddr' in mem_path or 'ddr' in mem_name or any(addr in mem_name for addr in ['@40000000', '@80000000', '@8000', '@4000', 'axi_noc', 'noc']):
+                    if not ddr_memory:
+                        ddr_memory = mem_node
+                elif any(keyword in mem_path or keyword in mem_name for keyword in ['bram', 'axi_bram', 'axi-bram', 'blockram', 'dlmb', 'ilmb', 'lmb']):
+                    if not bram_memory:
+                        bram_memory = mem_node
+                elif any(keyword in mem_path or keyword in mem_name for keyword in ['ocm', 'tcm']) or (mem_name.startswith('memory@') and 'sram' in mem_path):
+                    if not ocm_memory:
+                        ocm_memory = mem_node
+
+            selected_sram = ddr_memory or bram_memory or ocm_memory
+
+            if selected_sram:
+                chosen_node['zephyr,sram'] = LopperProp(name="zephyr,sram", value=selected_sram.abs_path)
+        except Exception:
+            pass
+
     license_content = '''#
 # Copyright (c) 2024 - 2025 Advanced Micro Devices, Inc.
 #
@@ -1145,16 +1540,25 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
             if val == "microblaze_riscv":
                 compatlist = ['amd,mbv32', 'riscv']
                 node['compatible'] = compatlist
-                new_node = LopperNode()
-                new_node.name = "interrupt-controller"
-                new_node['compatible'] = "riscv,cpu-intc"
-                new_prop = LopperProp( "interrupt-controller" )
-                new_node + new_prop
-                new_node['#interrupt-cells'] = 1
-                new_node.label_set("cpu_intc")
-                node.add(new_node)
-                phandle_val = new_node.phandle_or_create()
-                new_node + LopperProp(name="phandle", value=phandle_val)
+
+                # Find existing interrupt-controller child or create a new one
+                intc_node = None
+                for child in node.child_nodes.values():
+                    if child.name == "interrupt-controller":
+                        intc_node = child
+                        break
+                if not intc_node:
+                    intc_node = LopperNode()
+                    intc_node.name = "interrupt-controller"
+                    node.add(intc_node)
+
+                intc_node.label_set("cpu_intc")
+                intc_node['compatible'] = "riscv,cpu-intc"
+                intc_node['#interrupt-cells'] = 1
+                if 'interrupt-controller' not in intc_node.__props__:
+                    intc_node + LopperProp("interrupt-controller")
+                phandle_val = intc_node.phandle_or_create()
+                intc_node + LopperProp(name="phandle", value=phandle_val)
 
     zephyr_supported_schema_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "zephyr_supported_comp.yaml")
     if utils.is_file(zephyr_supported_schema_file):
@@ -1216,9 +1620,13 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                                node["reg-shift"] = LopperProp("reg-shift")
                                node["reg-shift"].value = 2
                             if node.propval('current-speed') == ['']:
-                               # Using default IP baud-rate of 9600, but change according to uart-setup for prints
                                node["current-speed"] = LopperProp("current-speed")
-                               node["current-speed"].value = 9600
+                               if node.propval('xlnx,baudrate') != ['']:
+                                   node["current-speed"].value = node["xlnx,baudrate"].value
+                               elif stdout_baud:
+                                   node["current-speed"].value = stdout_baud
+                               else:
+                                   node["current-speed"].value = 9600
                         # MDM RISCV DEBUG UARTLITE
                         if "xlnx,mdm-riscv-1.0" in node["compatible"].value:
                             node["compatible"].value = ["xlnx,xps-uartlite-1.00a"]
@@ -1464,4 +1872,3 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
             mem_node.delete('xlnx,ip-name')
 
     return True
-
