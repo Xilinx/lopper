@@ -808,6 +808,9 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                     if any(version in node["compatible"].value for version in ("arm,cortex-r52", "arm,cortex-a78")):
                         if node.propval('xlnx,timestamp-clk-freq') != ['']:
                             node["clock-frequency"] = node['xlnx,timestamp-clk-freq'].value
+                    if any(version in node["compatible"].value for version in ("arm,cortex-r52", "arm,cortex-r5")):
+                        if node.name != ['']:
+                            node.name = "cpu@0"
                     if node.propval('xlnx,ip-name') != ['']:
                         val = node.propval('xlnx,ip-name', list)[0]
                         if val == "axi_intc":
@@ -1513,7 +1516,6 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
 
 '''
     fix_part= '''
-	imply ARCH_CPU_IDLE_CUSTOM
 	select CLOCK_CONTROL
 	select CLOCK_CONTROL_FIXED_RATE_CLOCK
 	select CONSOLE
@@ -1834,6 +1836,13 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                     if num_intr:
                         defconfig_kconfig.write("config NUM_IRQS\n")
                         defconfig_kconfig.write("\tdefault %s\n\n" % str(num_intr))
+
+                    # Add custom CPU idle capability
+                    defconfig_kconfig.write("config ARCH_HAS_CUSTOM_CPU_IDLE\n")
+                    defconfig_kconfig.write("\tdefault y\n\n")
+                    # Add custom atomic CPU idle capability
+                    defconfig_kconfig.write("config ARCH_HAS_CUSTOM_CPU_ATOMIC_IDLE\n")
+                    defconfig_kconfig.write("\tdefault y\n\n")
 
                     # Add SYS_CLOCK_HW_CYCLES_PER_SEC at the end
                     val = node.propval('clock-frequency', list)[0]
