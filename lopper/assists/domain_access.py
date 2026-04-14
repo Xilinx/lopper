@@ -233,17 +233,25 @@ def core_domain_access( tgt_node, sdt, options ):
                 #       processing, pass it by absolute path.
                 tgt_node = sdt.tree[sdt.target_domain]
             except Exception as e:
-                tree = sdt.tree['/'].print( as_string=True )
-                _error( f"domain_access: target domain {sdt.target_domain} cannot be found in input:\n{tree}", True )
+                try:
+                    domains_dump = sdt.tree['/domains'].print( as_string=True )
+                except Exception:
+                    domains_dump = "(no /domains node found)"
+                _error( f"domain_access: target domain {sdt.target_domain} cannot be found in input.\n"
+                        f"Available domains:\n{domains_dump}", True )
 
         else:
-            try:
-                if command_line_target:
+            if command_line_target:
+                try:
                     tgt_node = sdt.tree[command_line_target]
-            except:
-                tgt_node = ""
-
-            if not tgt_node:
+                except Exception as e:
+                    try:
+                        domains_dump = sdt.tree['/domains'].print( as_string=True )
+                    except Exception:
+                        domains_dump = "(no /domains node found)"
+                    _error( f"domain_access: target domain '{command_line_target}' cannot be found in input.\n"
+                            f"Available domains:\n{domains_dump}", True )
+            else:
                 try:
                     tgt_node = sdt.tree["/domains/default"]
                 except:
@@ -343,24 +351,22 @@ def core_domain_access( tgt_node, sdt, options ):
 
     # 2c) domain subnode phandle references
     #
-    # Scan all properties in ALL subnodes of the domain for phandle references.
-    # Any integer value that resolves to an existing node via pnode() is a valid
-    # phandle reference and should be refcounted. This keeps carveouts, elfload,
-    # mbox, and other phandle-referenced nodes alive for later processing by
-    # assists like openamp. This is intentionally broad to catch any nested
-    # structure (domain-to-domain, resource groups, etc.) that references
-    # external nodes.
+    # Scan all subnodes of the domain (including the domain node itself) for
+    # genuine phandle references and refcount their targets. This keeps
+    # carveouts, elfload, mbox, and other phandle-referenced nodes alive for
+    # later processing by assists like openamp.
+    #
+    # We use prop.resolve_phandles() rather than blindly calling pnode() on
+    # every integer value. resolve_phandles() consults the cells-specifier
+    # infrastructure (#xxx-cells) to identify which positions in a property
+    # are actual phandle slots, so address/size cells in properties like
+    # 'memory' or 'reg' are never mistaken for phandle references.
     try:
-        for subnode in domain_node.subnodes():
+        for subnode in domain_node.subnodes(children_only=True):
             for prop in subnode:
-                prop_val = prop.value
-                if prop_val and prop_val != ['']:
-                    for val in prop_val:
-                        if isinstance(val, int) and val > 0:
-                            ref_node = sdt.tree.pnode(val)
-                            if ref_node:
-                                sdt.tree.ref_all(ref_node, True)
-                                _info(f"domain_access: refcounting domain subnode phandle: {ref_node.abs_path}")
+                for ref_node in prop.resolve_phandles():
+                    sdt.tree.ref_all(ref_node, True)
+                    _info(f"domain_access: refcounting domain subnode phandle: {ref_node.abs_path}")
     except Exception as e:
         _warning(f"domain_access: exception in domain subnode refcounting: {e}")
 
