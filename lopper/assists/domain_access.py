@@ -351,28 +351,22 @@ def core_domain_access( tgt_node, sdt, options ):
 
     # 2c) domain subnode phandle references
     #
-    # Scan all properties in actual child subnodes of the domain for phandle
-    # references. Any integer value that resolves to an existing node via
-    # pnode() is a valid phandle reference and should be refcounted. This keeps
+    # Scan all subnodes of the domain (including the domain node itself) for
+    # genuine phandle references and refcount their targets. This keeps
     # carveouts, elfload, mbox, and other phandle-referenced nodes alive for
     # later processing by assists like openamp.
     #
-    # NOTE: we use children_only=True to avoid scanning the domain node itself.
-    # LopperNode.subnodes() includes self by default, and scanning the domain
-    # node's own properties (e.g. memory, access) would cause false-positive
-    # phandle matches: memory address integers can collide with phandle values,
-    # pulling in unrelated nodes (e.g. /axi and all its children) via ref_all.
+    # We use prop.resolve_phandles() rather than blindly calling pnode() on
+    # every integer value. resolve_phandles() consults the cells-specifier
+    # infrastructure (#xxx-cells) to identify which positions in a property
+    # are actual phandle slots, so address/size cells in properties like
+    # 'memory' or 'reg' are never mistaken for phandle references.
     try:
         for subnode in domain_node.subnodes(children_only=True):
             for prop in subnode:
-                prop_val = prop.value
-                if prop_val and prop_val != ['']:
-                    for val in prop_val:
-                        if isinstance(val, int) and val > 0:
-                            ref_node = sdt.tree.pnode(val)
-                            if ref_node:
-                                sdt.tree.ref_all(ref_node, True)
-                                _info(f"domain_access: refcounting domain subnode phandle: {ref_node.abs_path}")
+                for ref_node in prop.resolve_phandles():
+                    sdt.tree.ref_all(ref_node, True)
+                    _info(f"domain_access: refcounting domain subnode phandle: {ref_node.abs_path}")
     except Exception as e:
         _warning(f"domain_access: exception in domain subnode refcounting: {e}")
 
