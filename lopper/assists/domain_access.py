@@ -237,13 +237,13 @@ def core_domain_access( tgt_node, sdt, options ):
                 _error( f"domain_access: target domain {sdt.target_domain} cannot be found in input:\n{tree}", True )
 
         else:
-            try:
-                if command_line_target:
+            if command_line_target:
+                try:
                     tgt_node = sdt.tree[command_line_target]
-            except:
-                tgt_node = ""
-
-            if not tgt_node:
+                except Exception as e:
+                    tree_dump = sdt.tree['/'].print( as_string=True )
+                    _error( f"domain_access: target domain '{command_line_target}' cannot be found in input:\n{tree_dump}", True )
+            else:
                 try:
                     tgt_node = sdt.tree["/domains/default"]
                 except:
