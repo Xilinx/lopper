@@ -35,6 +35,39 @@ import logging
 _init(__name__)
 _init("domain_access.py")
 
+# ---------------------------------------------------------------------------
+# Reserved-memory survival tables
+#
+# These drive the compatible-string-based survival logic in core_domain_access().
+# Extend these tables to add new binding types without touching the logic.
+#
+# RESMEM_ALWAYS_SURVIVE
+#   Compatible strings whose nodes survive unconditionally in any domain output.
+#   Use for nodes whose purpose is to communicate information to *any* consumer
+#   of the device tree (e.g. "hide this range from the default OS").
+#
+# RESMEM_SURVIVE_IF_CLAIMED
+#   Compatible strings whose nodes survive only when the target domain's
+#   reserved-memory property explicitly lists their phandle.  Use for
+#   domain-owned carveouts that have no OS-side device reference.
+#
+# Both tables are checked before the reference-gating scan.  Nodes that match
+# neither table fall through to normal reference-gating (memory-region from a
+# device node, caught by step 1a).
+#
+# Last-resort fallback: add lopper,no-ref-required to any individual node to
+# force survival regardless of compatible string or reference.  The property is
+# consumed and stripped here; it is never emitted to the output DTS.
+# ---------------------------------------------------------------------------
+
+RESMEM_ALWAYS_SURVIVE = {
+    "openamp,domain-memory-v1",   # SDT spec: hide range from default OS
+}
+
+RESMEM_SURVIVE_IF_CLAIMED = {
+    "openamp,xlnx,mem-carveout",  # vendor: coprocessor/RPU carveout
+}
+
 def is_compat( node, compat_string_to_test ):
     if re.search( "access-domain,domain-v1", compat_string_to_test):
         return core_domain_access
@@ -309,45 +342,104 @@ def core_domain_access( tgt_node, sdt, options ):
                 sdt.tree.ref_all( anode, True )
                 direct_node_refs.append( anode )
 
-    # 2b) reserved-memory node references
+    # 2b) reserved-memory survival pre-pass
     #
-    # NOTE: The code below is currently disabled. It would keep reserved-memory
-    # nodes around simply because they are listed in the domain's reserved-memory
-    # property. However, the correct semantic is that reserved-memory nodes should
-    # only survive if something OUTSIDE of /domains/ actually references them
-    # (e.g., a device node with memory-region = <&cma_pool>).
+    # ALL /reserved-memory children survive unconditionally.
     #
-    # The domain's reserved-memory property is metadata declaring which regions
-    # are assigned to the domain, but that alone is not sufficient to keep them -
-    # there must be an actual consumer in the output tree.
+    # Why: every node in /reserved-memory at this point is either an original
+    # SDT node (hardware/firmware truth) or was merged from a top-level YAML
+    # declaration (an explicit, global system statement by the user).  Neither
+    # category is domain-specific — they represent platform-wide reservations
+    # (PLM space, TF-A, carveouts, etc.) that every OS output should see.
     #
-    # Set this to True if ALL reserved-memory nodes listed in a domain's
-    # reserved-memory property should be kept, regardless of external references.
-    keep_all_domain_reserved_memory = False
-
-    if keep_all_domain_reserved_memory:
+    # The original concern that motivated filtering here was cross-domain
+    # contamination: RPU carveouts bleeding into the Linux DTS.  However,
+    # investigation of the YAML expansion path (reserved_memory_expand in
+    # yaml_to_dts_expansion.py) shows that it operates only on nodes that
+    # ALREADY EXIST in /reserved-memory — it resolves names to phandles and
+    # fixes up reg properties, but never synthesises new nodes from domain
+    # subnodes.  There is therefore no mechanism today by which a carveout
+    # declared inside one domain's YAML spec ends up in /reserved-memory
+    # without the user having also declared it at the top level.  Every node
+    # in /reserved-memory is a global declaration by construction.
+    #
+    # If domain-embedded synthesis is added in the future (nodes created
+    # directly from /domains/*/reserved-memory/ children and injected into
+    # the global /reserved-memory), a clean filter trigger is available
+    # without tagging at origin: walk /domains at step-2 time, collect the
+    # names of structural children under each domain's reserved-memory subnode,
+    # and apply compatible-driven rules only to nodes whose names appear in
+    # that set.  Everything else passes through as today.
+    #
+    # The compatible checks below are ADVISORY ONLY — survival is already
+    # decided.  They exist to:
+    #   - log informational context for well-known compatible strings
+    #   - warn when a survive-if-claimed node is present but the target domain
+    #     has not listed it in its reserved-memory property (possible
+    #     misconfiguration: the user may have forgotten to claim ownership)
+    #
+    # lopper,no-ref-required is still consumed and stripped so it never
+    # appears in the output DTS, for forward compatibility.
+    #
+    # RESMEM_ALWAYS_SURVIVE and RESMEM_SURVIVE_IF_CLAIMED are defined at
+    # module level so new compatible strings can be added without touching
+    # this logic.
+    try:
+        # Collect phandles the target domain explicitly claims
+        domain_claimed_phandles = set()
         try:
             resmem_prop = domain_node['reserved-memory'].value
             if resmem_prop and resmem_prop != ['']:
-                # Also refcount the /reserved-memory parent node itself
-                try:
-                    resmem_parent = sdt.tree['/reserved-memory']
-                    if resmem_parent:
-                        resmem_parent.ref = 1
-                        _info(f"domain_access: refcounting reserved-memory parent: {resmem_parent.abs_path}")
-                except Exception as e:
-                    _warning(f"domain_access: could not find /reserved-memory node: {e}")
+                domain_claimed_phandles = {ph for ph in resmem_prop if isinstance(ph, int)}
+        except:
+            pass
 
-                for ph in resmem_prop:
-                    if isinstance(ph, int):
-                        resmem_node = sdt.tree.pnode(ph)
-                        if resmem_node:
-                            resmem_node.ref = 1
-                            _info(f"domain_access: refcounting reserved-memory: {resmem_node.abs_path}")
-                        else:
-                            _warning(f"domain_access: could not find reserved-memory node for phandle {ph}")
-        except Exception as e:
-            _warning(f"domain_access: exception in reserved-memory refcounting: {e}")
+        resmem_parent = sdt.tree['/reserved-memory']
+        if resmem_parent:
+            for child in resmem_parent.subnodes(children_only=True):
+
+                # All nodes survive — set ref unconditionally.
+                child.ref = 1
+
+                # --- lopper,no-ref-required: consume and strip ---
+                # propval() cannot distinguish absent from present-but-empty
+                # boolean properties; use __props__ membership instead.
+                if "lopper,no-ref-required" in child.__props__:
+                    try:
+                        child.delete("lopper,no-ref-required")
+                    except Exception:
+                        pass  # already stripped on a previous call
+                    _info(f"domain_access: {child.abs_path} has lopper,no-ref-required "
+                          f"(stripped; node survives as all /reserved-memory nodes do)")
+                    continue
+
+                compat = child.propval("compatible")
+
+                # --- always-survive compatibles: log for traceability ---
+                if any(c in RESMEM_ALWAYS_SURVIVE for c in compat):
+                    _info(f"domain_access: {child.abs_path} survives "
+                          f"(always-survive compatible: {compat})")
+                    continue
+
+                # --- survive-if-claimed compatibles: advisory warning if unclaimed ---
+                if any(c in RESMEM_SURVIVE_IF_CLAIMED for c in compat):
+                    ph = child.propval("phandle")
+                    claimed = ph and ph[0] in domain_claimed_phandles
+                    if claimed:
+                        _info(f"domain_access: {child.abs_path} survives "
+                              f"(claimed by domain, compatible: {compat})")
+                    else:
+                        _warning(f"domain_access: {child.abs_path} has compatible "
+                                 f"{compat} but is not listed in "
+                                 f"{domain_node.abs_path} reserved-memory property — "
+                                 f"verify this is intentional")
+                    continue
+
+            # Keep the parent alive so the subtree is not dropped by filter #1.
+            resmem_parent.ref = 1
+
+    except Exception as e:
+        _warning(f"domain_access: exception in reserved-memory survival pre-pass: {e}")
 
     # 2c) domain subnode phandle references
     #
@@ -361,11 +453,23 @@ def core_domain_access( tgt_node, sdt, options ):
     # infrastructure (#xxx-cells) to identify which positions in a property
     # are actual phandle slots, so address/size cells in properties like
     # 'memory' or 'reg' are never mistaken for phandle references.
+    #
+    # IMPORTANT: use ref_node.ref = 1 (not ref_all(ref_node, True)) here.
+    # ref_all(node, True) calls resolve_all_refs() which is fully recursive —
+    # it follows all phandle refs from the target node transitively, marking
+    # every reachable node and its entire subtree. This causes cross-domain
+    # contamination: a domain-to-domain.remote = <&openamp_r5> reference would
+    # transitively pull in the RPU domain's carveouts (via its reserved-memory
+    # property) and mark them as surviving in the Linux output, even though no
+    # Linux device consumes them.
+    #
+    # ref_node.ref = 1 marks only the directly-referenced node, consistent with
+    # how step 1a already handles indirect references.
     try:
         for subnode in domain_node.subnodes(children_only=True):
             for prop in subnode:
                 for ref_node in prop.resolve_phandles():
-                    sdt.tree.ref_all(ref_node, True)
+                    ref_node.ref = 1
                     _info(f"domain_access: refcounting domain subnode phandle: {ref_node.abs_path}")
     except Exception as e:
         _warning(f"domain_access: exception in domain subnode refcounting: {e}")
@@ -430,13 +534,15 @@ def core_domain_access( tgt_node, sdt, options ):
             nodes_to_filter.append( anode.parent )
 
     # 4b) Add /reserved-memory to filter list if domain references reserved-memory
-    # This enables pruning of unreferenced reserved-memory children
+    # This enables pruning of unreferenced reserved-memory children.
+    # Mark the parent node ref=1 so it survives the simple-bus filter in step 5.
     try:
         resmem_prop = domain_node['reserved-memory'].value
         if resmem_prop and resmem_prop != ['']:
             try:
                 resmem_parent = sdt.tree['/reserved-memory']
                 if resmem_parent and resmem_parent not in nodes_to_filter:
+                    resmem_parent.ref = 1
                     nodes_to_filter.append(resmem_parent)
                     _info(f"core_domain_access: adding /reserved-memory to filter list for pruning")
             except:
@@ -485,7 +591,6 @@ def core_domain_access( tgt_node, sdt, options ):
         _info( f"core_domain_access ({n}): filtering on:\n------{code}\n-------\n" )
 
         sdt.tree.filter( n + "/", LopperAction.DELETE, code, None, verbose )
-
 
     # 6) memory node processing
     try:

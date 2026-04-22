@@ -1,0 +1,37 @@
+# Linux domain for reserved-memory survival rule testing
+# Target: /domains/APU_Linux
+#
+# Expected results after domain_access filtering:
+#   memory_r5@0         SURVIVES  (openamp,domain-memory-v1, unconditional)
+#   no_ref_region@3ef0  SURVIVES  (lopper,no-ref-required)
+#   cma_pool@10000000   SURVIVES  (memory-region ref from ethernet0)
+#   unused_cma@20000000 PRUNED    (shared-dma-pool, no ref)
+#   rpu0vdev0vring0/1   PRUNED    (mem-carveout, not claimed by this domain)
+#   unclaimed_rpu@3ee0  PRUNED    (mem-carveout, not claimed by any domain)
+
+compatible: openamp,domain-v1
+
+domains:
+  APU_Linux:
+    compatible: access-domain,domain-v1
+
+    memory:
+      - start: 0x0
+        size: 0x80000000
+
+    # List only the CMA pool this domain owns. This triggers step 4b in
+    # domain_access so /reserved-memory children are subject to pruning.
+    # Nodes not referenced here (or via memory-region from an access device)
+    # will be pruned from the Linux output.
+    reserved-memory:
+      - cma_pool@10000000
+
+    cpus:
+      - cluster: cpus_a72
+        cpumask: 0x1
+        mode:
+          secure: false
+
+    access:
+      - dev: ethernet@ff0c0000
+        label: gem0
