@@ -5610,9 +5610,15 @@ class LopperTree:
             start_node = self[node_prefix]
             node_list = start_node.subnodes()
         except:
-            start_node = None
-            node_list = []
-            lopper.log._error( f"no nodes found that match prefix {node_prefix}" )
+            # try stripping trailing slash in case caller passed "path/"
+            try:
+                alt_prefix = str(node_prefix).rstrip("/") or "/"
+                start_node = self[alt_prefix]
+                node_list = start_node.subnodes()
+            except:
+                start_node = None
+                node_list = []
+                lopper.log._error( f"no nodes found that match prefix {node_prefix}" )
 
         lopper.log._debug( "filter: node list:", level=lopper.log.TRACE )
         for nn in node_list:
