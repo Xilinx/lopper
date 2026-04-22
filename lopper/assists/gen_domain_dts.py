@@ -1612,6 +1612,29 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                             parts = name.split("@")
                             new_name = f"axi-{parts[0]}-subsystem@{parts[1]}"
                             node.name = new_name
+                        #AXI-ETHERNET-LITE
+                        if any(v in node["compatible"].value for v in ("xlnx,axi-ethernetlite-3.0", "xlnx,xps-ethernetlite-1.00.a")):
+                            node["compatible"].value = ["xlnx,xps-ethernetlite-3.00.a"]
+                            for subnode in node.children():
+                                node.delete(subnode)
+                            emacnode = LopperNode()
+                            emacnode["compatible"] = ["xlnx,xps-ethernetlite-3.00.a-mac"]
+                            if node.propval('interrupt-parent') != ['']:
+                                emacnode["interrupt-parent"] = node["interrupt-parent"]
+                            if node.propval('interrupts') != ['']:
+                                emacnode["interrupts"] = node["interrupts"].value
+                            mac_prop = LopperProp(name="local-mac-address")
+                            mac_prop.value = node["local-mac-address"].value
+                            mac_prop.binary = True
+                            emacnode + mac_prop
+                            if node.propval('xlnx,rx-ping-pong') != [''] and node.propval('xlnx,rx-ping-pong', list)[0] == 1:
+                                emacnode + LopperProp("xlnx,rx-ping-pong")
+                            if node.propval('xlnx,tx-ping-pong') != [''] and node.propval('xlnx,tx-ping-pong', list)[0] == 1:
+                                emacnode + LopperProp("xlnx,tx-ping-pong")
+                            emacnode["status"] = "okay"
+                            emacnode.name = "axi-ethernet-lite-mac"
+                            emacnode.label_set(f"{node.label}_mac")
+                            node.add(emacnode)
                         # UARTNS550
                         if "xlnx,axi-uart16550-2.0" in node["compatible"].value:
                             node["compatible"].value = ["ns16550"]

@@ -373,6 +373,12 @@ xlnx,axi-ethernet-1.00.a:
     - xlnx,rxcsum
     - xlnx,txcsum
 
+xlnx,axi-ethernetlite-3.0:
+  required:
+    - compatible
+    - reg
+    - status
+
 xlnx,gem-controller:
   required:
     - compatible
