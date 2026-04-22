@@ -351,15 +351,19 @@ def core_domain_access( tgt_node, sdt, options ):
 
     # 2c) domain subnode phandle references
     #
-    # Scan all properties in ALL subnodes of the domain for phandle references.
-    # Any integer value that resolves to an existing node via pnode() is a valid
-    # phandle reference and should be refcounted. This keeps carveouts, elfload,
-    # mbox, and other phandle-referenced nodes alive for later processing by
-    # assists like openamp. This is intentionally broad to catch any nested
-    # structure (domain-to-domain, resource groups, etc.) that references
-    # external nodes.
+    # Scan all properties in actual child subnodes of the domain for phandle
+    # references. Any integer value that resolves to an existing node via
+    # pnode() is a valid phandle reference and should be refcounted. This keeps
+    # carveouts, elfload, mbox, and other phandle-referenced nodes alive for
+    # later processing by assists like openamp.
+    #
+    # NOTE: we use children_only=True to avoid scanning the domain node itself.
+    # LopperNode.subnodes() includes self by default, and scanning the domain
+    # node's own properties (e.g. memory, access) would cause false-positive
+    # phandle matches: memory address integers can collide with phandle values,
+    # pulling in unrelated nodes (e.g. /axi and all its children) via ref_all.
     try:
-        for subnode in domain_node.subnodes():
+        for subnode in domain_node.subnodes(children_only=True):
             for prop in subnode:
                 prop_val = prop.value
                 if prop_val and prop_val != ['']:
