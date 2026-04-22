@@ -233,16 +233,24 @@ def core_domain_access( tgt_node, sdt, options ):
                 #       processing, pass it by absolute path.
                 tgt_node = sdt.tree[sdt.target_domain]
             except Exception as e:
-                tree = sdt.tree['/'].print( as_string=True )
-                _error( f"domain_access: target domain {sdt.target_domain} cannot be found in input:\n{tree}", True )
+                try:
+                    domains_dump = sdt.tree['/domains'].print( as_string=True )
+                except Exception:
+                    domains_dump = "(no /domains node found)"
+                _error( f"domain_access: target domain {sdt.target_domain} cannot be found in input.\n"
+                        f"Available domains:\n{domains_dump}", True )
 
         else:
             if command_line_target:
                 try:
                     tgt_node = sdt.tree[command_line_target]
                 except Exception as e:
-                    tree_dump = sdt.tree['/'].print( as_string=True )
-                    _error( f"domain_access: target domain '{command_line_target}' cannot be found in input:\n{tree_dump}", True )
+                    try:
+                        domains_dump = sdt.tree['/domains'].print( as_string=True )
+                    except Exception:
+                        domains_dump = "(no /domains node found)"
+                    _error( f"domain_access: target domain '{command_line_target}' cannot be found in input.\n"
+                            f"Available domains:\n{domains_dump}", True )
             else:
                 try:
                     tgt_node = sdt.tree["/domains/default"]
