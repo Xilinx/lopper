@@ -4469,6 +4469,15 @@ class LopperTree:
                 lopper.log._warning( f"{output} is not a writable {e}" )
                 return
 
+        # Re-resolve all properties before output so that any tree transformations
+        # (e.g., node deletions by assists) are reflected in property string values.
+        # Without this, cached string_val entries for properties like address-map may
+        # still reference deleted nodes, causing stale phandle records in the output.
+        if self.strict:
+            for n in self:
+                for p in n:
+                    p.resolve()
+
         self["/"].print( output )
 
     def resolve( self, check=False ):
