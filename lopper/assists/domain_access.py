@@ -649,6 +649,22 @@ def core_domain_access( tgt_node, sdt, options ):
     except:
         domain_memory_chunks = []
 
+    # Deduplicate memory chunks. When multiple YAML input files each describe
+    # the same domain's memory, the YAML merge concatenates both lists, resulting
+    # in identical (start, size) entries. We can only detect this here where we
+    # have DT context (root_ac + root_sc) to know the chunk boundary. Identical
+    # tuples are always redundant; warn and remove them.
+    seen_chunks = []
+    deduped_chunks = []
+    for chunk in domain_memory_chunks:
+        key = tuple(chunk)
+        if key not in seen_chunks:
+            seen_chunks.append(key)
+            deduped_chunks.append(chunk)
+        else:
+            _warning( f"domain_access: duplicate memory region detected and skipped: {[hex(x) for x in chunk]}" )
+    domain_memory_chunks = deduped_chunks
+
     modified_memory_nodes = []
     for domain_memory_entry in domain_memory_chunks:
         # NOTE: if the domain either does not have a memory field described OR the
