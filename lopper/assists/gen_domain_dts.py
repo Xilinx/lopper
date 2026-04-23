@@ -1432,6 +1432,7 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
     """
     is_axi_intc_present = None
     is_axi_timer_present = None
+    is_iomodule_present = None
     for node in root_sub_nodes:
         if node.propval('xlnx,ip-name') != ['']:
             val = node.propval('xlnx,ip-name', list)[0]
@@ -1439,29 +1440,37 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                 is_axi_intc_present = node
             elif val == "axi_timer":
                 is_axi_timer_present = node
+            elif val == "iomodule":
+                is_iomodule_present = node
 
     err_no_intc = "\nERROR: Zephyr OS requires the presence of at least one interrupt controller. Please ensure that the axi_intc is included in the design, with fast interrupts disabled.\r"
     err_no_timer = "\nERROR: Zephyr OS requires at least one timer controller with interrupts enabled for its scheduler. Please include the axi_timer in your hardware design and ensure its interrupts are properly connected.\r"
     warn_intc_has_fast = "\nWARNING: Zephyr does not support fast interrupts; they will be handled as standard interrupts. Therefore, enabling FAST interrupts in the AXI INTC core will not improve interrupt latency. Additionally, fast interrupts are not supported in QEMU.\r"
     err_timer_nointr = "\nERROR: Zephyr OS requires at least one timer with interrupts enabled to manage its scheduler effectively. Please ensure that the interrupt pins for the timer are correctly connected in your hardware design and rebuild with the updated configuration.\r"
-    if not is_axi_intc_present and not is_axi_timer_present:
-        print(err_no_intc)
-        print(err_no_timer)
-        sys.exit(1)
-    elif not is_axi_intc_present:
-        print(err_no_intc)
-        sys.exit(1)
-    elif is_axi_intc_present:
-        if is_axi_intc_present.propval('xlnx,has-fast') != ['']:
-            val = is_axi_intc_present.propval('xlnx,has-fast', list)[0]
+    if is_iomodule_present:
+        if is_iomodule_present.propval('xlnx,intc-has-fast') != ['']:
+            val = is_iomodule_present.propval('xlnx,intc-has-fast', list)[0]
             if val != 0 or val != 0x0:
                 print(warn_intc_has_fast)
-    if not is_axi_timer_present:
-        print(err_no_timer)
-        sys.exit(1)
-    elif is_axi_timer_present and is_axi_timer_present.propval('interrupts') == ['']:
-        print(err_timer_nointr)
-        sys.exit(1)
+    else:
+        if not is_axi_intc_present and not is_axi_timer_present:
+            print(err_no_intc)
+            print(err_no_timer)
+            sys.exit(1)
+        elif not is_axi_intc_present:
+            print(err_no_intc)
+            sys.exit(1)
+        elif is_axi_intc_present:
+            if is_axi_intc_present.propval('xlnx,has-fast') != ['']:
+                val = is_axi_intc_present.propval('xlnx,has-fast', list)[0]
+                if val != 0 or val != 0x0:
+                    print(warn_intc_has_fast)
+        if not is_axi_timer_present:
+            print(err_no_timer)
+            sys.exit(1)
+        elif is_axi_timer_present and is_axi_timer_present.propval('interrupts') == ['']:
+            print(err_timer_nointr)
+            sys.exit(1)
 
     memnode_list = sdt.tree.nodes('/memory@.*')
     for mem_node in memnode_list:
@@ -1672,8 +1681,8 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
 	select CLOCK_CONTROL_FIXED_RATE_CLOCK
 	select CONSOLE
 	select SERIAL
-	select UART_CONSOLE if (UART_NS16550 || UART_XLNX_UARTLITE)
-	select UART_INTERRUPT_DRIVEN if (UART_NS16550 || UART_XLNX_UARTLITE)
+	select UART_CONSOLE if (UART_NS16550 || UART_XLNX_UARTLITE  || UART_XLNX_IOMODULE)
+	select UART_INTERRUPT_DRIVEN if (UART_NS16550 || UART_XLNX_UARTLITE  || UART_XLNX_IOMODULE)
 	imply UART_NS16550 if DT_HAS_NS16550_ENABLED
 	imply UART_XLNX_UARTLITE if DT_HAS_UARTLITE_ENABLED
 	imply GPIO if DT_HAS_XLNX_XPS_GPIO_1_00_A_ENABLED
@@ -1684,6 +1693,9 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
 	select XLNX_INTC_USE_SIE if XLNX_INTC
 	select XLNX_INTC_USE_CIE if XLNX_INTC
 	select XLNX_INTC_USE_IVR if XLNX_INTC
+        imply MFD if DT_HAS_XLNX_IOMODULE_ENABLED
+        imply XLNX_IOMODULE_INTC if DT_HAS_XLNX_IOMODULE_INTC_ENABLED
+        imply XLNX_IOMODULE_PIT if DT_HAS_XLNX_IOMODULE_PIT_ENABLED
 '''
 
     max_mem_size = 0
@@ -1727,11 +1739,178 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                             if val == "axi_intc":
                                 num_intr = node.propval('xlnx,num-intr-inputs', list)[0]
                                 num_intr += 12
+                            else:
+                                num_intr = 32
                         is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
                         result = _apply_pl_peripheral_transforms(node, schema,
                             rename_timer="amd,xps-timer-1.00.a", stdout_baud=stdout_baud)
                         if result is not None:
                             is_supported_periph = result
+                        if "xlnx,iomodule-3.1" in node["compatible"].value:
+                            node["compatible"].value = ["xlnx,iomodule"]
+                            node['reg'] = node['reg']
+                            # PIT: validate xlnx,pit-prescaler (missing, empty, or no zero cell).
+                            pit_prescaler = (
+                                [int(x) for x in node.propval("xlnx,pit-prescaler", list)]
+                                if node.props("xlnx,pit-prescaler") != []
+                                else []
+                            )
+                            if not pit_prescaler or 0 not in pit_prescaler:
+                                print(
+                                    "\nERROR: IOModule: xlnx,pit-prescaler missing, empty, or has no 0 cell "
+                                    "(Zephyr requires at least one PIT with prescaler 0)\n"
+                                )
+                                sys.exit(1)
+
+                            pit_size = (
+                                [int(x) for x in node.propval("xlnx,pit-size", list)]
+                                if node.props("xlnx,pit-size") != []
+                                else []
+                            )
+                            pit_readable = (
+                                [int(x) for x in node.propval("xlnx,pit-readable", list)]
+                                if node.props("xlnx,pit-readable") != []
+                                else []
+                            )
+
+                            match_cpu = get_cpu_node(sdt, options)
+                            cpu_ic = next(
+                                (c for c in match_cpu.child_nodes.values() if c.name == "interrupt-controller"),
+                                None,
+                            )
+                            if cpu_ic is None:
+                                for c in match_cpu.child_nodes.values():
+                                    icc = c.propval("compatible", list) or []
+                                    if any(isinstance(x, str) and "riscv,cpu-intc" in x for x in icc):
+                                        cpu_ic = c
+                                        break
+                            if cpu_ic:
+                                iph = cpu_ic.phandle_or_create()
+                                if node.props("interrupt-parent") != []:
+                                    node["interrupt-parent"].value = [iph]
+                                else:
+                                    node + LopperProp(name="interrupt-parent", value=[iph])
+                                if node.props("interrupts") != []:
+                                    node["interrupts"].value = [11]
+                                else:
+                                    node + LopperProp(name="interrupts", value=[11])
+
+                            iomodule_intc_node = LopperNode()
+                            iomodule_intc_node + LopperProp(name="compatible", value=["xlnx,iomodule-intc"])
+                            iomodule_intc_node + LopperProp("interrupt-controller")
+                            iomodule_intc_node + LopperProp(name="#interrupt-cells", value=[2])
+                            if node.props("xlnx,intc-level-edge") != []:
+                                iomodule_intc_node + LopperProp(
+                                    name="xlnx,intc-level-edge",
+                                    value=node["xlnx,intc-level-edge"].value,
+                                )
+                            if node.props("xlnx,intc-positive") != []:
+                                iomodule_intc_node + LopperProp(
+                                    name="xlnx,intc-positive",
+                                    value=node["xlnx,intc-positive"].value,
+                                )
+                            iomodule_intc_node.name = "iomodule-interrupt-controller"
+                            iomodule_intc_node.label_set("iomodule_intc")
+                            node.add(iomodule_intc_node)
+
+                            uart_node = LopperNode()
+                            uart_node.name = "serial"
+                            uart_node + LopperProp(name="compatible", value=["xlnx,iomodule-uart"])
+                            # IOModule IP C_UART_BAUDRATE VHDL default is 9600; override from DT when present.
+                            baud = 9600
+                            if node.props("xlnx,uart-baudrate") != []:
+                                baud = node.propval("xlnx,uart-baudrate", list)[0]
+                            uart_node + LopperProp(name="current-speed", value=[baud])
+                            uart_node + LopperProp(name="xlnx,uart-baudrate", value=[baud])
+                            data_bits = 8
+                            if node.props("xlnx,uart-data-bits") != []:
+                                data_bits = node.propval("xlnx,uart-data-bits", list)[0]
+                            uart_node + LopperProp(name="xlnx,uart-data-bits", value=[data_bits])
+                            uart_node.label_set("iomodule_uart")
+                            uart_node + LopperProp(name="status", value=["okay"])
+                            node.add(uart_node)
+
+                            # ---- PIT: create timer nodes (prescaler == 0 only; first enabled) ----
+                            # IOModule C_FREQ VHDL default is 100000000 Hz; DT xlnx,clock-freq or CPU clock may override.
+                            clk_hz = 100000000
+                            if node.props("xlnx,clock-freq") != []:
+                                clk_hz = int(node.propval("xlnx,clock-freq", list)[0])
+                            else:
+                                try:
+                                    _cpu = get_cpu_node(sdt, options)
+                                    if _cpu.props("clock-frequency") != []:
+                                        clk_hz = int(_cpu.propval("clock-frequency", list)[0])
+                                except Exception:
+                                    pass
+
+                            zero_prescaler_indices = [i for i, p in enumerate(pit_prescaler) if p == 0]
+                            pit_enabled_assigned = False
+                            for idx in zero_prescaler_indices:
+                                pit = LopperNode()
+                                pit.name = f"timer{idx}"
+                                pit.label_set(f"iomodule_pit{idx}")
+                                pit + LopperProp(name="compatible", value=["xlnx,iomodule-pit"])
+                                pit + LopperProp(name="xlnx,pit-timer-id", value=[idx])
+                                size_val = pit_size[idx] if idx < len(pit_size) else 32
+                                pit + LopperProp(name="xlnx,pit-size", value=[size_val])
+                                pit + LopperProp(name="xlnx,pit-prescaler", value=[pit_prescaler[idx]])
+                                readable_val = pit_readable[idx] if idx < len(pit_readable) else 1
+                                if readable_val:
+                                    pit + LopperProp("xlnx,pit-readable")
+                                pit + LopperProp(name="xlnx,clock-freq", value=[clk_hz])
+                                if pit_enabled_assigned:
+                                    pit + LopperProp(name="status", value=["disabled"])
+                                else:
+                                    pit_enabled_assigned = True
+                                node.add(pit)
+                                _php = pit.phandle_or_create()
+                                if pit.props("phandle") == []:
+                                    pit + LopperProp(name="phandle", value=_php)
+
+                            # ---- /aliases: serial0 -> UART ----
+                            try:
+                                sdt.tree.sync()
+                            except Exception:
+                                pass
+
+                            uart_path = getattr(uart_node, "abs_path", None)
+                            if not uart_path:
+                                uart_path = f"{node.abs_path}/serial"
+
+                            serial_alias = "serial0"
+                            alias_node = sdt.tree["/aliases"]
+                            if alias_node.props(serial_alias) != []:
+                                alias_node[serial_alias].value = [uart_path]
+                            else:
+                                alias_node + LopperProp(name=serial_alias, value=[uart_path])
+                            valid_alias_proplist.append("serial")
+
+                            # ---- /chosen ----
+                            chosen_node = sdt.tree["/chosen"]
+                            _use_p = (
+                                int(node.propval("xlnx,uart-use-parity", list)[0])
+                                if node.props("xlnx,uart-use-parity") != []
+                                else 0
+                            )
+                            if _use_p == 0:
+                                parity_c = "n"
+                            else:
+                                _odd = (
+                                    int(node.propval("xlnx,uart-odd-parity", list)[0])
+                                    if node.props("xlnx,uart-odd-parity") != []
+                                    else 0
+                                )
+                                parity_c = "o" if _odd else "e"
+                            stdout_s = f"{serial_alias}:{baud}{parity_c}{int(data_bits)}"
+                            if chosen_node.props("stdout-path") != []:
+                                chosen_node["stdout-path"].value = [stdout_s]
+                            else:
+                                chosen_node + LopperProp(name="stdout-path", value=[stdout_s])
+                            for _cn in ("zephyr,console", "zephyr,shell-uart"):
+                                if chosen_node.props(_cn) != []:
+                                    chosen_node[_cn].value = [serial_alias]
+                                else:
+                                    chosen_node + LopperProp(name=_cn, value=[serial_alias])
                         #AXI-ETHERNET-LITE
                         if any(v in node["compatible"].value for v in ("xlnx,axi-ethernetlite-3.0", "xlnx,xps-ethernetlite-1.00.a")):
                             node["compatible"].value = ["xlnx,xps-ethernetlite-3.00.a"]
