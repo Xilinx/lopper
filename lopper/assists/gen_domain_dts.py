@@ -750,20 +750,42 @@ def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
                                 for cell in intr_list[i:i+3] + [0xa0]]
             elif node.propval('interrupts') != ['']:
                 intr_list = node["interrupts"].value
-                intr_list.append("0xa0")            
+                intr_parent_cells = None
+                try:
+                    ip_val = node.propval('interrupt-parent')
+                    if ip_val != ['']:
+                        ip_node = sdt.tree.pnode(ip_val[0])
+                        if ip_node is None:
+                            # Dangling phandle (e.g. imux deleted) - repoint to GIC
+                            for gic_candidate in sdt.tree['/'].subnodes():
+                                if gic_candidate.propval('compatible') != ['']:
+                                    if any('arm,gic' in c for c in gic_candidate.propval('compatible', list)):
+                                        node['interrupt-parent'].value = [gic_candidate.phandle]
+                                        break
+                        elif ip_node.propval('#interrupt-cells') != ['']:
+                            intr_parent_cells = ip_node.propval('#interrupt-cells', list)[0]
+                except Exception:
+                    pass
+                if intr_parent_cells is not None and intr_parent_cells <= 2:
+                    pass
+                elif len(intr_list) >= 3 and len(intr_list) % 3 == 0:
+                    node["interrupts"].value = [cell for i in range(0, len(intr_list), 3)
+                                    for cell in intr_list[i:i+3] + [0xa0]]
 
             if compatible == "cpus,cluster":
                 node.name = "cpus" 
 
-            # Collect all the wwdt nodes
+            # Collect all the wwdt nodes (PS WWDT and PL timebase WDT)
             if any(version in node["compatible"].value for version in ("xlnx,versal-wwdt-1.0", "xlnx,versal-wwdt")):
+                wwdt_nodes.append(node)
+            if any(version in node["compatible"].value for version in ("xlnx,axi-timebase-wdt-3.0", "xlnx,xps-timebase-wdt-1.00.a")):
                 wwdt_nodes.append(node)
             if "amd,versal2-ufs" in node["compatible"].value:
                 ufs_nodes.append(node)
             if "xlnx,zynqmp-rtc" in node["compatible"].value:
                 rtc_nodes.append(node)
 
-    xlnx_remove_unsupported_nodes(tgt_node, sdt)
+    xlnx_remove_unsupported_nodes(tgt_node, sdt, machine)
 
     # Zephyr Watchdog samples/tests expects watchdog0 alias.
     # Add watchdog0 alias by referring it to the first occurence of the wwdt node
@@ -785,15 +807,89 @@ def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
             compatible = node.propval('compatible', list)[0]
             if compatible == "arm,armv8-timer" and 'psv_cortexr5' in machine:
                 sdt.tree.delete(node)
-            if compatible == "xlnx,ttcps" and 'psv_cortexr5' not in machine:
-                sdt.tree.delete(node)
         if node.name == 'reserved-memory' and 'r52' in machine:
             node.delete('ranges')
             node + LopperProp(name='ranges')
 
     return True
 
-def xlnx_remove_unsupported_nodes(tgt_node, sdt):
+def _apply_pl_peripheral_transforms(node, schema, rename_timer=None, stdout_baud=None):
+    """Apply PL-specific peripheral transformations shared between PS+PL and pure-PL paths.
+
+    Args:
+        rename_timer: If set, rename AXI Timer compatible to this value (MicroBlaze only).
+        stdout_baud: Fallback baud rate for UARTNS550 current-speed.
+
+    Returns:
+        Updated is_supported_periph list if compatible changed, else None.
+    """
+    compatible_changed = False
+
+    if rename_timer and "xlnx,xps-timer-1.00.a" in node["compatible"].value:
+        node["compatible"].value = [rename_timer]
+
+    if "xlnx,eth-dma" in node["compatible"].value:
+        node["compatible"].value = ["xlnx,eth-dma"]
+        if node.props("dma-channels") == []:
+            node + LopperProp("dma-channels")
+            node["dma-channels"].value = [2]
+
+    if any(v in node["compatible"].value for v in ("xlnx,xps-spi-2.00.a", "xlnx,axi-quad-spi-3.2")):
+        if node.propval('#address-cells') != ['1']:
+            node['#address-cells'] = 1
+        if node.propval('#size-cells') != ['0']:
+            node['#size-cells'] = 0
+        node["compatible"] = "xlnx,xps-spi-2.00.a"
+        compatible_changed = True
+
+    if any(v in node["compatible"].value for v in ("ns16550", "xlnx,axi-uart16550-2.0")):
+        if node.propval('current-speed') == ['']:
+            node["current-speed"] = LopperProp("current-speed")
+            if node.propval('xlnx,baudrate') != ['']:
+                node["current-speed"].value = node["xlnx,baudrate"].value
+            elif stdout_baud:
+                node["current-speed"].value = stdout_baud
+            else:
+                node["current-speed"].value = 9600
+
+    if "xlnx,axi-ethernet-1.00.a" in node["compatible"].value:
+        node["compatible"].value = ["xlnx,axi-ethernet-1.00.a"]
+        subnodes = node.subnodes()
+        for subnode in subnodes:
+            node.delete(subnode)
+        emacnode = LopperNode()
+        eth_schema = [value for key, value in schema.items() if key == "xlnx,axi-ethernet-1.00.a"]
+        if eth_schema:
+            eth_required = list(eth_schema[0]["required"])
+            eth_required.reverse()
+            for prop in eth_required:
+                if prop == "compatible":
+                    emacnode[prop] = ["xlnx,axi-ethernet-1.00.a"]
+                elif prop in ("reg", "status"):
+                    continue
+                else:
+                    if node.propval(prop) != ['']:
+                        emacnode[prop] = node[prop]
+            emacnode.name = "ethernet-mac"
+            emacnode.label_set("axi_ethernet")
+            node.add(emacnode)
+            for prop in eth_required:
+                if prop not in ["compatible", "reg", "status"] and node.props(prop) != []:
+                    node.delete(prop)
+            node["compatible"].value = ["xlnx,axi-ethernet-subsystem-7.2"]
+            node.label_set("axi_enet")
+            name = node.name
+            parts = name.split("@")
+            if len(parts) == 2:
+                node.name = f"axi-ethernet-subsystem@{parts[1]}"
+        compatible_changed = True
+
+    if compatible_changed:
+        return [value for key, value in schema.items() if key in node["compatible"].value]
+    return None
+
+
+def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
     root_node = sdt.tree['/']
     root_sub_nodes = root_node.subnodes()
     valid_alias_proplist = []
@@ -818,8 +914,6 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                             num_intr += 12
 
                     is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
-                    if "xlnx,xps-timer-1.00.a" in node["compatible"].value:
-                        node["compatible"].value = ["amd,xps-timer-1.00.a"]
                     # UARTNS550
                     if "xlnx,axi-uart16550-2.0" in node["compatible"].value:
                         node["compatible"].value = ["ns16550"]
@@ -942,18 +1036,38 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                         node["compatible"] = "xlnx,versal-8.9a"
                     # TTCPS
                     if "cdns,ttc" in node["compatible"].value:
-                        node["compatible"] = "xlnx,ttcps"
-                        if node.propval('interrupt-names') == ['']:
-                            ttc_irq_names = ["irq_0", "irq_1", "irq_2"]
-                            node["interrupt-names"] = LopperProp("interrupt-names")
-                            node["interrupt-names"].value = ttc_irq_names
-                            node.add(node["interrupt-names"])
-                        clk_freq = node.propval('xlnx,clock-freq')
-                        # Round to nearest MHz (optional but clean)
-                        rounded_clk = int(round(clk_freq[0] / 1000000.0)) * 1000000
-                        node["clock-frequency"] = LopperProp("clock-frequency")
-                        node["clock-frequency"].value = rounded_clk
-                        node.add(node["clock-frequency"])
+                        if 'psv_cortexr5' in machine:
+                            node["compatible"] = "xlnx,ttcps"
+                            if node.propval('interrupt-names') == ['']:
+                                ttc_irq_names = ["irq_0", "irq_1", "irq_2"]
+                                node["interrupt-names"] = LopperProp("interrupt-names")
+                                node["interrupt-names"].value = ttc_irq_names
+                                node.add(node["interrupt-names"])
+                            clk_freq = node.propval('xlnx,clock-freq')
+                            # Round to nearest MHz (optional but clean)
+                            rounded_clk = int(round(clk_freq[0] / 1000000.0)) * 1000000
+                            node["clock-frequency"] = LopperProp("clock-frequency")
+                            node["clock-frequency"].value = rounded_clk
+                            node.add(node["clock-frequency"])
+                        else:
+                            for i in range(3):
+                                new_node = LopperNode()
+                                new_node["compatible"] = "xlnx,ttc-counter"
+                                new_node["clock-frequency"] = LopperProp("clock-frequency")
+                                new_node["clock-frequency"].value = node["xlnx,clock-freq"].value
+                                new_node.add(new_node["clock-frequency"])
+                                new_node["reg"] = node["reg"]
+                                new_node.label_set(f"{node.label}_timer{i}")
+                                new_node["interrupt-parent"] = node["interrupt-parent"]
+                                new_node.name = f"counter{i}@{node['reg'][1]:x}"
+                                new_node["timer-id"] = LopperProp("timer-id")
+                                new_node["timer-id"].value = i
+                                new_node["interrupts"] = LopperProp("interrupts")
+                                new_node["interrupts"].value = node["interrupts"].value[i * 4 : (i + 1) * 4]
+                                new_node["timer-width"] = node["timer-width"]
+                                new_node.parent = node.parent
+                                node.parent.add(new_node)
+                            sdt.tree.delete(node)
                     # CANFD
                     if "xlnx,canfd-2.0" in node["compatible"].value:
                         node["compatible"] = "xlnx,canfd-2.0"
@@ -1070,14 +1184,41 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                         node.add(mac_node)
                         node["compatible"].value = ["xlnx,gem-controller"]
                         is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
+                    if node.parent and 'amba_pl' in node.parent.name:
+                        result = _apply_pl_peripheral_transforms(node, schema)
+                        if result is not None:
+                            is_supported_periph = result
                     if is_supported_periph:
                         required_prop = is_supported_periph[0]["required"]
                         prop_list = list(node.__props__.keys())
                         valid_alias_proplist.append(node.name)
+                        pl_node = node.parent and node.parent.propval('interrupt-parent') == ['']
+                        if pl_node:
+                            for preserve_prop in ('interrupts', 'interrupt-parent'):
+                                if preserve_prop not in required_prop and node.propval(preserve_prop) != ['']:
+                                    required_prop = required_prop + [preserve_prop]
+                        is_timer = "xlnx,xps-timer-1.00.a" in node["compatible"].value
+                        if is_timer:
+                            if 'clocks' in required_prop:
+                                required_prop.remove('clocks')
+                            for p in ('clock-frequency', 'xlnx,count-width'):
+                                if p not in required_prop and node.propval(p) != ['']:
+                                    required_prop = required_prop + [p]
                         # Create fixed clock nodes
                         if 'clocks' in required_prop:
                             if any(clock_prop := (re.search(r'xlnx,.*-clk-freq-hz$', prop)) for prop in prop_list):
                                 clk_freq = node[clock_prop.group()].value
+                            elif node.propval('clock-frequency') != ['']:
+                                clk_freq = node.propval('clock-frequency')[0]
+                            elif node.propval('clocks') != ['']:
+                                clk_freq = 0
+                                try:
+                                    first_clk_ph = node.propval('clocks')[0]
+                                    clk_node = sdt.tree.pnode(first_clk_ph)
+                                    if clk_node and clk_node.propval('clock-frequency') != ['']:
+                                        clk_freq = clk_node.propval('clock-frequency')[0]
+                                except Exception:
+                                    pass
                             else:
                                 # If there is no clk-freq property use 0MHZ as default this prevent
                                 # build failure if any of the ip does not have this property.
@@ -1107,18 +1248,29 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt):
                             if prop not in required_prop:
                                 node.delete(prop)
                     else:
-                        if node.name not in ("axi", "soc") and node not in memnode_list and not xlnx_openamp_keep_node(False, True, node, sdt.tree):
+                        if node.name not in ("axi", "soc", "amba_pl") and node not in memnode_list and not xlnx_openamp_keep_node(False, True, node, sdt.tree):
                             sdt.tree.delete(node)
+
+    for node in memnode_list:
+        if node.propval('ranges') != ['']:
+            node.delete('ranges')
+
+    for node in root_sub_nodes:
+        if node.name == "amba_pl":
+            has_periph = any(
+                child.propval('reg') != [''] and 'interrupt-controller' not in child.__props__
+                for child in node.subnodes()
+            )
+            if not has_periph:
+                sdt.tree.delete(node)
+            break
 
     alias_node = sdt.tree['/aliases']
     alias_prop_list = list(alias_node.__props__.keys())
     for prop in alias_prop_list:
         val = sdt.tree['/aliases'].propval(prop, list)[0]
-        pl_node_ref = None
-        if "amba_pl" in val:
-            pl_node_ref = True
         val = val.rsplit('/', 1)[-1]
-        if val not in valid_alias_proplist or pl_node_ref:
+        if val not in valid_alias_proplist:
             sdt.tree['/aliases'].delete(prop)
 
     max_mem_size = 0
@@ -1576,43 +1728,34 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                                 num_intr = node.propval('xlnx,num-intr-inputs', list)[0]
                                 num_intr += 12
                         is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
-                        if "xlnx,xps-timer-1.00.a" in node["compatible"].value:
-                            node["compatible"].value = ["amd,xps-timer-1.00.a"]
-                        #AXI-ETHERNET-DMA
-                        if "xlnx,eth-dma" in node["compatible"].value:
-                            node["compatible"].value = ["xlnx,eth-dma"]
-                            if node.props("dma-channels") == []:
-                                node + LopperProp("dma-channels")
-                                node["dma-channels"].value = [2]
-                        #AXI-ETHERNET
-                        if "xlnx,axi-ethernet-1.00.a" in node["compatible"].value:
-                            node["compatible"].value = ["xlnx,axi-ethernet-1.00.a"]
-                            subnodes = node.subnodes()
-                            for subnode in subnodes:
+                        result = _apply_pl_peripheral_transforms(node, schema,
+                            rename_timer="amd,xps-timer-1.00.a", stdout_baud=stdout_baud)
+                        if result is not None:
+                            is_supported_periph = result
+                        #AXI-ETHERNET-LITE
+                        if any(v in node["compatible"].value for v in ("xlnx,axi-ethernetlite-3.0", "xlnx,xps-ethernetlite-1.00.a")):
+                            node["compatible"].value = ["xlnx,xps-ethernetlite-3.00.a"]
+                            for subnode in node.children():
                                 node.delete(subnode)
                             emacnode = LopperNode()
-                            required_prop = [value for key,value in schema.items() if key in node["compatible"].value][0]["required"]
-                            required_prop.reverse()
-                            for prop in required_prop:
-                                if prop == "compatible":
-                                    emacnode[prop] = ["xlnx,axi-ethernet-1.00.a"]
-                                elif prop == "reg" or prop == "status":
-                                    continue
-                                else:
-                                    emacnode[prop] = node[prop]
-                            emacnode.name = "ethernet-mac"
-                            emacnode.label_set("axi_ethernet")
+                            emacnode["compatible"] = ["xlnx,xps-ethernetlite-3.00.a-mac"]
+                            if node.propval('interrupt-parent') != ['']:
+                                emacnode["interrupt-parent"] = node["interrupt-parent"]
+                            if node.propval('interrupts') != ['']:
+                                emacnode["interrupts"] = node["interrupts"].value
+                            mac_prop = LopperProp(name="local-mac-address")
+                            mac_prop.value = node["local-mac-address"].value
+                            mac_prop.binary = True
+                            emacnode + mac_prop
+                            if node.propval('xlnx,rx-ping-pong') != [''] and node.propval('xlnx,rx-ping-pong', list)[0] == 1:
+                                emacnode + LopperProp("xlnx,rx-ping-pong")
+                            if node.propval('xlnx,tx-ping-pong') != [''] and node.propval('xlnx,tx-ping-pong', list)[0] == 1:
+                                emacnode + LopperProp("xlnx,tx-ping-pong")
+                            emacnode["status"] = "okay"
+                            emacnode.name = "axi-ethernet-lite-mac"
+                            emacnode.label_set(f"{node.label}_mac")
                             node.add(emacnode)
-                            for prop in required_prop:
-                                if prop not in ["compatible", "reg", "status"] and node.props(prop) != []:
-                                    node.delete(prop)
-                            node["compatible"].value = ["xlnx,axi-ethernet-subsystem-7.2"]
-                            node.label_set("axi_enet")
-                            name = node.name
-                            parts = name.split("@")
-                            new_name = f"axi-{parts[0]}-subsystem@{parts[1]}"
-                            node.name = new_name
-                        # UARTNS550
+                        # UARTNS550: compatible rename + clock-frequency + reg-shift
                         if "xlnx,axi-uart16550-2.0" in node["compatible"].value:
                             node["compatible"].value = ["ns16550"]
                             if node.propval('clock-frequency') == [''] and node.propval('xlnx,clock-freq') != ['']:
@@ -1621,14 +1764,6 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                             if node.propval('reg-shift') != ['2']:
                                node["reg-shift"] = LopperProp("reg-shift")
                                node["reg-shift"].value = 2
-                            if node.propval('current-speed') == ['']:
-                               node["current-speed"] = LopperProp("current-speed")
-                               if node.propval('xlnx,baudrate') != ['']:
-                                   node["current-speed"].value = node["xlnx,baudrate"].value
-                               elif stdout_baud:
-                                   node["current-speed"].value = stdout_baud
-                               else:
-                                   node["current-speed"].value = 9600
                         # MDM RISCV DEBUG UARTLITE
                         if "xlnx,mdm-riscv-1.0" in node["compatible"].value:
                             node["compatible"].value = ["xlnx,xps-uartlite-1.00a"]
@@ -1668,13 +1803,6 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                                     new_node['#gpio-cells'] = 2
                                     new_node.label_set(node.label)
                                     node.add(new_node)
-                        #AXI-SPI
-                        if any(version in node["compatible"].value for version in ("xlnx,xps-spi-2.00.a", "xlnx,axi-quad-spi-3.2")):
-                            if node.propval('#address-cells') != ['1']:
-                                node['#address-cells'] = 1
-                            if node.propval('#size-cells') != ['0']:
-                                node['#size-cells'] = 0
-                            node["compatible"] = "xlnx,xps-spi-2.00.a"
                         # Collect all the axi-timebase-wdt nodes
                         if any(version in node["compatible"].value for version in ("xlnx,axi-timebase-wdt-3.0", "xlnx,xps-timebase-wdt-1.00.a")):
                             axi_wdt_nodes.append(node)
