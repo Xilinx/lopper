@@ -137,6 +137,7 @@ def domain_access(node, new_access=None):
         else:
             return []
 
+    access_prop_string = None
     try:
         if isinstance(access_prop.value, list):
             access_prop_string = ','.join(access_prop.value)
@@ -148,6 +149,8 @@ def domain_access(node, new_access=None):
 
     if new_access is None:
         # If no new access is provided, return the current access value
+        if not access_prop_string:
+            return []
         access_chunks = json.loads(access_prop_string)
         return access_chunks
     else:
@@ -619,7 +622,11 @@ def access_expand( tree, subnode, verbose = 0 ):
     if type(access_props[0].value) == list:
         if not access_props[0].value[0]:
             return
-        access_prop_string = access_props[0].value.join()
+        # If the list contains integers, this is a phandle-based access property,
+        # not JSON-encoded. This function only processes JSON-encoded access.
+        if isinstance(access_props[0].value[0], int):
+            return
+        access_prop_string = ','.join(access_props[0].value)
     else:
         access_prop_string = access_props[0].value
 

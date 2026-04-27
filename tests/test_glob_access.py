@@ -18,7 +18,8 @@ import os
 import json
 import pytest
 from lopper.assists.yaml_to_dts_expansion import (
-    is_glob_pattern, glob_to_regex, domain_parent, infer_parent_domain
+    is_glob_pattern, glob_to_regex, domain_parent, infer_parent_domain,
+    domain_access, access_expand
 )
 
 
@@ -468,3 +469,105 @@ domains:
             "serial@ff010000 should be in APU_Linux"
         assert "canff060000" in linux_access, \
             "can@ff060000 should be in APU_Linux"
+
+
+class TestDomainAccessFunction:
+    """Regression tests for bugs in domain_access() and access_expand().
+
+    These tests exercise the bug fixes in yaml_to_dts_expansion.py:
+    - Bug 1: access_prop_string was not initialized before the try block,
+      causing NameError if the except path was taken.
+    - Bug 2: Early return was missing when access_prop_string is None after
+      the try/except, causing TypeError on json.loads(None).
+    - Bug 3: access_expand() called .join() on a list object (AttributeError);
+      should use ','.join(list).
+    - Bug 4: access_expand() tried to JSON-parse integer phandle lists, causing
+      TypeError; phandle-based access should be skipped.
+    """
+
+    def _make_node_with_json_access(self, json_val):
+        """Return a minimal LopperNode with an access property set to json_val."""
+        from lopper.tree import LopperNode, LopperProp
+        node = LopperNode(-1, "/domains/test_domain")
+        prop = LopperProp("access", -1, node)
+        prop.pclass = "json"
+        prop.__dict__["value"] = json_val
+        node + prop
+        return node
+
+    def _make_node_with_int_access(self, int_list):
+        """Return a minimal LopperNode with an integer-list access property."""
+        from lopper.tree import LopperNode, LopperProp
+        node = LopperNode(-1, "/domains/test_domain")
+        prop = LopperProp("access", -1, node)
+        prop.__dict__["value"] = int_list
+        node + prop
+        return node
+
+    def test_domain_access_json_string_returns_list(self):
+        """domain_access() on a JSON string access property returns parsed list."""
+        payload = [{"dev": "serial@ff000000"}, {"dev": "can@ff060000"}]
+        node = self._make_node_with_json_access(json.dumps(payload))
+        result = domain_access(node)
+        assert result == payload
+
+    def test_domain_access_json_list_value_returns_list(self):
+        """domain_access() handles value stored as a Python list of strings."""
+        payload = [{"dev": "serial@ff000000"}]
+        # LopperProp sometimes stores a single JSON blob in a list
+        node = self._make_node_with_json_access([json.dumps(payload)])
+        result = domain_access(node)
+        assert result == payload
+
+    def test_domain_access_no_access_property_returns_empty(self):
+        """domain_access() returns [] when node has no access property."""
+        from lopper.tree import LopperNode
+        node = LopperNode(-1, "/domains/empty")
+        result = domain_access(node)
+        assert result == []
+
+    def test_domain_access_integer_list_returns_empty(self):
+        """domain_access() returns [] without NameError when value is a phandle int list.
+
+        Regression for Bug 1/2: access_prop_string was not initialized before
+        the try block.  When value is a list of integers, ','.join([int,...])
+        raises TypeError inside the try block, leaving access_prop_string
+        unset.  Before the fix this caused NameError; after the fix it returns [].
+        """
+        from lopper.tree import LopperNode, LopperProp
+        node = LopperNode(-1, "/domains/bad_access")
+        prop = LopperProp("access", -1, node)
+        # A phandle-based access list: list of integers, not JSON strings.
+        # ','.join([0x100, 0x0]) raises TypeError in the try block.
+        prop.__dict__["value"] = [0x100, 0x0, 0x200, 0x0]
+        node + prop
+        # Must not raise NameError (pre-fix) — should return []
+        result = domain_access(node)
+        assert result == []
+
+    def test_access_expand_skips_integer_phandle_list(self):
+        """access_expand() returns early for integer phandle access lists.
+
+        Regression for Bug 4: passing an integer list to json.loads() raised
+        TypeError because integers are not JSON strings.
+        """
+        from lopper.tree import LopperNode, LopperProp, LopperTree
+        tree = LopperTree()
+        node = self._make_node_with_int_access([0x100, 0x0, 0x200, 0x0])
+        node.tree = tree
+        # Must not raise TypeError
+        access_expand(tree, node)
+
+    def test_access_expand_processes_json_string_list(self):
+        """access_expand() processes a JSON-encoded access list stored as [str].
+
+        Regression for Bug 3: the original code called access_props[0].value.join()
+        which is AttributeError on a list; the fix uses ','.join(list).
+        """
+        from lopper.tree import LopperNode, LopperProp, LopperTree
+        payload = [{"dev": "serial@ff000000"}]
+        tree = LopperTree()
+        node = self._make_node_with_json_access([json.dumps(payload)])
+        node.tree = tree
+        # Must not raise AttributeError — should process without crashing
+        access_expand(tree, node)

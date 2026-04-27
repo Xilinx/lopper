@@ -1,0 +1,121 @@
+/dts-v1/;
+
+/*
+ * Test system device tree for reserved-memory survival rule testing.
+ *
+ * Exercises each survival path in the domain_access pre-pass:
+ *
+ *  memory_r5@0          openamp,domain-memory-v1    always survives
+ *  rpu0vdev0vring0/1    openamp,xlnx,mem-carveout   survives if claimed by target domain
+ *  unclaimed_rpu@3ee0   openamp,xlnx,mem-carveout   pruned (never claimed by any domain)
+ *  no_ref_region@3ef0   shared-dma-pool + lopper,no-ref-required   survives, property stripped
+ *  cma_pool@10000000    shared-dma-pool              survives via memory-region ref (ethernet0)
+ *  unused_cma@20000000  shared-dma-pool              pruned (no memory-region ref)
+ */
+
+/ {
+	compatible = "xlnx,zynqmp";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	model = "Test SDT for reserved-memory survival rules";
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpus_a72: cpus-a72@0 {
+			compatible = "cpus,cluster";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			cpu@0 {
+				compatible = "arm,cortex-a72";
+				device_type = "cpu";
+				reg = <0>;
+			};
+		};
+
+		cpus_r5: cpus-r5@0 {
+			compatible = "cpus,cluster";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			cpu@0 {
+				compatible = "arm,cortex-r5";
+				device_type = "cpu";
+				reg = <0>;
+			};
+		};
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x80000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* ALWAYS SURVIVE: openamp,domain-memory-v1 -- no device reference needed */
+		domain_mem: memory_r5@0 {
+			compatible = "openamp,domain-memory-v1";
+			reg = <0x0 0x0 0x0 0x8000000>;
+		};
+
+		/* SURVIVE IF CLAIMED: openamp,xlnx,mem-carveout -- RPU domain claims these */
+		rpu_vring0: rpu0vdev0vring0@3ed00000 {
+			compatible = "openamp,xlnx,mem-carveout";
+			reg = <0x0 0x3ed00000 0x0 0x4000>;
+			no-map;
+		};
+
+		rpu_vring1: rpu0vdev0vring1@3ed04000 {
+			compatible = "openamp,xlnx,mem-carveout";
+			reg = <0x0 0x3ed04000 0x0 0x4000>;
+			no-map;
+		};
+
+		/* PRUNED: openamp,xlnx,mem-carveout -- no domain claims this */
+		unclaimed_carveout: unclaimed_rpu@3ee00000 {
+			compatible = "openamp,xlnx,mem-carveout";
+			reg = <0x0 0x3ee00000 0x0 0x10000>;
+			no-map;
+		};
+
+		/* SURVIVE (lopper,no-ref-required): forces survival; property stripped from output */
+		no_ref_node: no_ref_region@3ef00000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x3ef00000 0x0 0x10000>;
+			no-map;
+			lopper,no-ref-required;
+		};
+
+		/* SURVIVE (reference-gated): ethernet0 holds memory-region */
+		cma_ref: cma_pool@10000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x10000000 0x0 0x10000000>;
+		};
+
+		/* PRUNED (reference-gated): no device holds memory-region to this */
+		pruned_cma: unused_cma@20000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x20000000 0x0 0x10000000>;
+		};
+	};
+
+	axi: axi {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		ethernet0: ethernet@ff0c0000 {
+			compatible = "cdns,gem";
+			reg = <0x0 0xff0c0000 0x0 0x1000>;
+			/* Keeps cma_pool alive via reference-gating */
+			memory-region = <&cma_ref>;
+		};
+	};
+};
