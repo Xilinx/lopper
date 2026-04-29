@@ -314,7 +314,7 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                 if "okay" in node.propval('status', list)[0]:
                     node.propval('status', list)[0] = "disabled"
             if linux_dt and node.name == "pcie@fd0e0000":
-		# It needs to be disabled when pcie-mode is EndPoint
+                # It needs to be disabled when pcie-mode is EndPoint
                 mode = node.propval('xlnx,pcie-mode')
                 if mode == ['Endpoint , Device']:
                     if "okay" in node.propval('status', list)[0]:
@@ -453,6 +453,8 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
             driver_proplist = driver_proplist + schema.get('required',[])
             if "xlnx,zynqmp-ipi-mailbox.yaml" in yaml_prune:
                 ipi_schema = schema
+
+    mapped_children_nodes = []
     for node in root_sub_nodes:
         if linux_dt:
             if node.propval('xlnx,ip-name') != ['']:
@@ -476,6 +478,11 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                         continue
                 elif linux_dt and "xlnx,versal-ddrmc" in node.propval('compatible', list):
                     # ddr controller is not mapped to APU and there is a special handling in SDT to make its status okay.
+                    continue
+                elif linux_dt and (node.parent is not None and ((node.parent in mapped_nodelist) or (node.parent in mapped_children_nodes))):
+                    # Add the unmapped nodes which are children of mapped nodes to the final device-tree. This is required to keep the hierarchy
+                    # of the device-tree intact and also to keep the nodes which are required for the mapped nodes to function properly.
+                    mapped_children_nodes.append(node)
                     continue
                 elif xlnx_openamp_keep_node(linux_dt, zephyr_dt, node, sdt.tree):
                     continue
@@ -750,13 +757,35 @@ def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
                                 for cell in intr_list[i:i+3] + [0xa0]]
             elif node.propval('interrupts') != ['']:
                 intr_list = node["interrupts"].value
-                intr_list.append("0xa0")            
+                intr_parent_cells = None
+                try:
+                    ip_val = node.propval('interrupt-parent')
+                    if ip_val != ['']:
+                        ip_node = sdt.tree.pnode(ip_val[0])
+                        if ip_node is None:
+                            # Dangling phandle (e.g. imux deleted) - repoint to GIC
+                            for gic_candidate in sdt.tree['/'].subnodes():
+                                if gic_candidate.propval('compatible') != ['']:
+                                    if any('arm,gic' in c for c in gic_candidate.propval('compatible', list)):
+                                        node['interrupt-parent'].value = [gic_candidate.phandle]
+                                        break
+                        elif ip_node.propval('#interrupt-cells') != ['']:
+                            intr_parent_cells = ip_node.propval('#interrupt-cells', list)[0]
+                except Exception:
+                    pass
+                if intr_parent_cells is not None and intr_parent_cells <= 2:
+                    pass
+                elif len(intr_list) >= 3 and len(intr_list) % 3 == 0:
+                    node["interrupts"].value = [cell for i in range(0, len(intr_list), 3)
+                                    for cell in intr_list[i:i+3] + [0xa0]]
 
             if compatible == "cpus,cluster":
                 node.name = "cpus" 
 
-            # Collect all the wwdt nodes
+            # Collect all the wwdt nodes (PS WWDT and PL timebase WDT)
             if any(version in node["compatible"].value for version in ("xlnx,versal-wwdt-1.0", "xlnx,versal-wwdt")):
+                wwdt_nodes.append(node)
+            if any(version in node["compatible"].value for version in ("xlnx,axi-timebase-wdt-3.0", "xlnx,xps-timebase-wdt-1.00.a")):
                 wwdt_nodes.append(node)
             if "amd,versal2-ufs" in node["compatible"].value:
                 ufs_nodes.append(node)
@@ -791,6 +820,82 @@ def xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine):
 
     return True
 
+def _apply_pl_peripheral_transforms(node, schema, rename_timer=None, stdout_baud=None):
+    """Apply PL-specific peripheral transformations shared between PS+PL and pure-PL paths.
+
+    Args:
+        rename_timer: If set, rename AXI Timer compatible to this value (MicroBlaze only).
+        stdout_baud: Fallback baud rate for UARTNS550 current-speed.
+
+    Returns:
+        Updated is_supported_periph list if compatible changed, else None.
+    """
+    compatible_changed = False
+
+    if rename_timer and "xlnx,xps-timer-1.00.a" in node["compatible"].value:
+        node["compatible"].value = [rename_timer]
+
+    if "xlnx,eth-dma" in node["compatible"].value:
+        node["compatible"].value = ["xlnx,eth-dma"]
+        if node.props("dma-channels") == []:
+            node + LopperProp("dma-channels")
+            node["dma-channels"].value = [2]
+
+    if any(v in node["compatible"].value for v in ("xlnx,xps-spi-2.00.a", "xlnx,axi-quad-spi-3.2")):
+        if node.propval('#address-cells') != ['1']:
+            node['#address-cells'] = 1
+        if node.propval('#size-cells') != ['0']:
+            node['#size-cells'] = 0
+        node["compatible"] = "xlnx,xps-spi-2.00.a"
+        compatible_changed = True
+
+    if any(v in node["compatible"].value for v in ("ns16550", "xlnx,axi-uart16550-2.0")):
+        if node.propval('current-speed') == ['']:
+            node["current-speed"] = LopperProp("current-speed")
+            if node.propval('xlnx,baudrate') != ['']:
+                node["current-speed"].value = node["xlnx,baudrate"].value
+            elif stdout_baud:
+                node["current-speed"].value = stdout_baud
+            else:
+                node["current-speed"].value = 9600
+
+    if "xlnx,axi-ethernet-1.00.a" in node["compatible"].value:
+        node["compatible"].value = ["xlnx,axi-ethernet-1.00.a"]
+        subnodes = node.subnodes()
+        for subnode in subnodes:
+            node.delete(subnode)
+        emacnode = LopperNode()
+        eth_schema = [value for key, value in schema.items() if key == "xlnx,axi-ethernet-1.00.a"]
+        if eth_schema:
+            eth_required = list(eth_schema[0]["required"])
+            eth_required.reverse()
+            for prop in eth_required:
+                if prop == "compatible":
+                    emacnode[prop] = ["xlnx,axi-ethernet-1.00.a"]
+                elif prop in ("reg", "status"):
+                    continue
+                else:
+                    if node.propval(prop) != ['']:
+                        emacnode[prop] = node[prop]
+            emacnode.name = "ethernet-mac"
+            emacnode.label_set("axi_ethernet")
+            node.add(emacnode)
+            for prop in eth_required:
+                if prop not in ["compatible", "reg", "status"] and node.props(prop) != []:
+                    node.delete(prop)
+            node["compatible"].value = ["xlnx,axi-ethernet-subsystem-7.2"]
+            node.label_set("axi_enet")
+            name = node.name
+            parts = name.split("@")
+            if len(parts) == 2:
+                node.name = f"axi-ethernet-subsystem@{parts[1]}"
+        compatible_changed = True
+
+    if compatible_changed:
+        return [value for key, value in schema.items() if key in node["compatible"].value]
+    return None
+
+
 def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
     root_node = sdt.tree['/']
     root_sub_nodes = root_node.subnodes()
@@ -816,8 +921,6 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
                             num_intr += 12
 
                     is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
-                    if "xlnx,xps-timer-1.00.a" in node["compatible"].value:
-                        node["compatible"].value = ["amd,xps-timer-1.00.a"]
                     # UARTNS550
                     if "xlnx,axi-uart16550-2.0" in node["compatible"].value:
                         node["compatible"].value = ["ns16550"]
@@ -1088,14 +1191,41 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
                         node.add(mac_node)
                         node["compatible"].value = ["xlnx,gem-controller"]
                         is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
+                    if node.parent and 'amba_pl' in node.parent.name:
+                        result = _apply_pl_peripheral_transforms(node, schema)
+                        if result is not None:
+                            is_supported_periph = result
                     if is_supported_periph:
                         required_prop = is_supported_periph[0]["required"]
                         prop_list = list(node.__props__.keys())
                         valid_alias_proplist.append(node.name)
+                        pl_node = node.parent and node.parent.propval('interrupt-parent') == ['']
+                        if pl_node:
+                            for preserve_prop in ('interrupts', 'interrupt-parent'):
+                                if preserve_prop not in required_prop and node.propval(preserve_prop) != ['']:
+                                    required_prop = required_prop + [preserve_prop]
+                        is_timer = "xlnx,xps-timer-1.00.a" in node["compatible"].value
+                        if is_timer:
+                            if 'clocks' in required_prop:
+                                required_prop.remove('clocks')
+                            for p in ('clock-frequency', 'xlnx,count-width'):
+                                if p not in required_prop and node.propval(p) != ['']:
+                                    required_prop = required_prop + [p]
                         # Create fixed clock nodes
                         if 'clocks' in required_prop:
                             if any(clock_prop := (re.search(r'xlnx,.*-clk-freq-hz$', prop)) for prop in prop_list):
                                 clk_freq = node[clock_prop.group()].value
+                            elif node.propval('clock-frequency') != ['']:
+                                clk_freq = node.propval('clock-frequency')[0]
+                            elif node.propval('clocks') != ['']:
+                                clk_freq = 0
+                                try:
+                                    first_clk_ph = node.propval('clocks')[0]
+                                    clk_node = sdt.tree.pnode(first_clk_ph)
+                                    if clk_node and clk_node.propval('clock-frequency') != ['']:
+                                        clk_freq = clk_node.propval('clock-frequency')[0]
+                                except Exception:
+                                    pass
                             else:
                                 # If there is no clk-freq property use 0MHZ as default this prevent
                                 # build failure if any of the ip does not have this property.
@@ -1125,18 +1255,29 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
                             if prop not in required_prop:
                                 node.delete(prop)
                     else:
-                        if node.name not in ("axi", "soc") and node not in memnode_list and not xlnx_openamp_keep_node(False, True, node, sdt.tree):
+                        if node.name not in ("axi", "soc", "amba_pl") and node not in memnode_list and not xlnx_openamp_keep_node(False, True, node, sdt.tree):
                             sdt.tree.delete(node)
+
+    for node in memnode_list:
+        if node.propval('ranges') != ['']:
+            node.delete('ranges')
+
+    for node in root_sub_nodes:
+        if node.name == "amba_pl":
+            has_periph = any(
+                child.propval('reg') != [''] and 'interrupt-controller' not in child.__props__
+                for child in node.subnodes()
+            )
+            if not has_periph:
+                sdt.tree.delete(node)
+            break
 
     alias_node = sdt.tree['/aliases']
     alias_prop_list = list(alias_node.__props__.keys())
     for prop in alias_prop_list:
         val = sdt.tree['/aliases'].propval(prop, list)[0]
-        pl_node_ref = None
-        if "amba_pl" in val:
-            pl_node_ref = True
         val = val.rsplit('/', 1)[-1]
-        if val not in valid_alias_proplist or pl_node_ref:
+        if val not in valid_alias_proplist:
             sdt.tree['/aliases'].delete(prop)
 
     max_mem_size = 0
@@ -1298,6 +1439,7 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
     """
     is_axi_intc_present = None
     is_axi_timer_present = None
+    is_iomodule_present = None
     for node in root_sub_nodes:
         if node.propval('xlnx,ip-name') != ['']:
             val = node.propval('xlnx,ip-name', list)[0]
@@ -1305,29 +1447,37 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                 is_axi_intc_present = node
             elif val == "axi_timer":
                 is_axi_timer_present = node
+            elif val == "iomodule":
+                is_iomodule_present = node
 
     err_no_intc = "\nERROR: Zephyr OS requires the presence of at least one interrupt controller. Please ensure that the axi_intc is included in the design, with fast interrupts disabled.\r"
     err_no_timer = "\nERROR: Zephyr OS requires at least one timer controller with interrupts enabled for its scheduler. Please include the axi_timer in your hardware design and ensure its interrupts are properly connected.\r"
     warn_intc_has_fast = "\nWARNING: Zephyr does not support fast interrupts; they will be handled as standard interrupts. Therefore, enabling FAST interrupts in the AXI INTC core will not improve interrupt latency. Additionally, fast interrupts are not supported in QEMU.\r"
     err_timer_nointr = "\nERROR: Zephyr OS requires at least one timer with interrupts enabled to manage its scheduler effectively. Please ensure that the interrupt pins for the timer are correctly connected in your hardware design and rebuild with the updated configuration.\r"
-    if not is_axi_intc_present and not is_axi_timer_present:
-        print(err_no_intc)
-        print(err_no_timer)
-        sys.exit(1)
-    elif not is_axi_intc_present:
-        print(err_no_intc)
-        sys.exit(1)
-    elif is_axi_intc_present:
-        if is_axi_intc_present.propval('xlnx,has-fast') != ['']:
-            val = is_axi_intc_present.propval('xlnx,has-fast', list)[0]
+    if is_iomodule_present:
+        if is_iomodule_present.propval('xlnx,intc-has-fast') != ['']:
+            val = is_iomodule_present.propval('xlnx,intc-has-fast', list)[0]
             if val != 0 or val != 0x0:
                 print(warn_intc_has_fast)
-    if not is_axi_timer_present:
-        print(err_no_timer)
-        sys.exit(1)
-    elif is_axi_timer_present and is_axi_timer_present.propval('interrupts') == ['']:
-        print(err_timer_nointr)
-        sys.exit(1)
+    else:
+        if not is_axi_intc_present and not is_axi_timer_present:
+            print(err_no_intc)
+            print(err_no_timer)
+            sys.exit(1)
+        elif not is_axi_intc_present:
+            print(err_no_intc)
+            sys.exit(1)
+        elif is_axi_intc_present:
+            if is_axi_intc_present.propval('xlnx,has-fast') != ['']:
+                val = is_axi_intc_present.propval('xlnx,has-fast', list)[0]
+                if val != 0 or val != 0x0:
+                    print(warn_intc_has_fast)
+        if not is_axi_timer_present:
+            print(err_no_timer)
+            sys.exit(1)
+        elif is_axi_timer_present and is_axi_timer_present.propval('interrupts') == ['']:
+            print(err_timer_nointr)
+            sys.exit(1)
 
     memnode_list = sdt.tree.nodes('/memory@.*')
     for mem_node in memnode_list:
@@ -1538,8 +1688,8 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
 	select CLOCK_CONTROL_FIXED_RATE_CLOCK
 	select CONSOLE
 	select SERIAL
-	select UART_CONSOLE if (UART_NS16550 || UART_XLNX_UARTLITE)
-	select UART_INTERRUPT_DRIVEN if (UART_NS16550 || UART_XLNX_UARTLITE)
+	select UART_CONSOLE if (UART_NS16550 || UART_XLNX_UARTLITE  || UART_XLNX_IOMODULE)
+	select UART_INTERRUPT_DRIVEN if (UART_NS16550 || UART_XLNX_UARTLITE  || UART_XLNX_IOMODULE)
 	imply UART_NS16550 if DT_HAS_NS16550_ENABLED
 	imply UART_XLNX_UARTLITE if DT_HAS_UARTLITE_ENABLED
 	imply GPIO if DT_HAS_XLNX_XPS_GPIO_1_00_A_ENABLED
@@ -1550,6 +1700,9 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
 	select XLNX_INTC_USE_SIE if XLNX_INTC
 	select XLNX_INTC_USE_CIE if XLNX_INTC
 	select XLNX_INTC_USE_IVR if XLNX_INTC
+        imply MFD if DT_HAS_XLNX_IOMODULE_ENABLED
+        imply XLNX_IOMODULE_INTC if DT_HAS_XLNX_IOMODULE_INTC_ENABLED
+        imply XLNX_IOMODULE_PIT if DT_HAS_XLNX_IOMODULE_PIT_ENABLED
 '''
 
     max_mem_size = 0
@@ -1593,43 +1746,178 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                             if val == "axi_intc":
                                 num_intr = node.propval('xlnx,num-intr-inputs', list)[0]
                                 num_intr += 12
+                            else:
+                                num_intr = 32
                         is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
-                        if "xlnx,xps-timer-1.00.a" in node["compatible"].value:
-                            node["compatible"].value = ["amd,xps-timer-1.00.a"]
-                        #AXI-ETHERNET-DMA
-                        if "xlnx,eth-dma" in node["compatible"].value:
-                            node["compatible"].value = ["xlnx,eth-dma"]
-                            if node.props("dma-channels") == []:
-                                node + LopperProp("dma-channels")
-                                node["dma-channels"].value = [2]
-                        #AXI-ETHERNET
-                        if "xlnx,axi-ethernet-1.00.a" in node["compatible"].value:
-                            node["compatible"].value = ["xlnx,axi-ethernet-1.00.a"]
-                            subnodes = node.subnodes()
-                            for subnode in subnodes:
-                                node.delete(subnode)
-                            emacnode = LopperNode()
-                            required_prop = [value for key,value in schema.items() if key in node["compatible"].value][0]["required"]
-                            required_prop.reverse()
-                            for prop in required_prop:
-                                if prop == "compatible":
-                                    emacnode[prop] = ["xlnx,axi-ethernet-1.00.a"]
-                                elif prop == "reg" or prop == "status":
-                                    continue
+                        result = _apply_pl_peripheral_transforms(node, schema,
+                            rename_timer="amd,xps-timer-1.00.a", stdout_baud=stdout_baud)
+                        if result is not None:
+                            is_supported_periph = result
+                        if "xlnx,iomodule-3.1" in node["compatible"].value:
+                            node["compatible"].value = ["xlnx,iomodule"]
+                            node['reg'] = node['reg']
+                            # PIT: validate xlnx,pit-prescaler (missing, empty, or no zero cell).
+                            pit_prescaler = (
+                                [int(x) for x in node.propval("xlnx,pit-prescaler", list)]
+                                if node.props("xlnx,pit-prescaler") != []
+                                else []
+                            )
+                            if not pit_prescaler or 0 not in pit_prescaler:
+                                print(
+                                    "\nERROR: IOModule: xlnx,pit-prescaler missing, empty, or has no 0 cell "
+                                    "(Zephyr requires at least one PIT with prescaler 0)\n"
+                                )
+                                sys.exit(1)
+
+                            pit_size = (
+                                [int(x) for x in node.propval("xlnx,pit-size", list)]
+                                if node.props("xlnx,pit-size") != []
+                                else []
+                            )
+                            pit_readable = (
+                                [int(x) for x in node.propval("xlnx,pit-readable", list)]
+                                if node.props("xlnx,pit-readable") != []
+                                else []
+                            )
+
+                            match_cpu = get_cpu_node(sdt, options)
+                            cpu_ic = next(
+                                (c for c in match_cpu.child_nodes.values() if c.name == "interrupt-controller"),
+                                None,
+                            )
+                            if cpu_ic is None:
+                                for c in match_cpu.child_nodes.values():
+                                    icc = c.propval("compatible", list) or []
+                                    if any(isinstance(x, str) and "riscv,cpu-intc" in x for x in icc):
+                                        cpu_ic = c
+                                        break
+                            if cpu_ic:
+                                iph = cpu_ic.phandle_or_create()
+                                if node.props("interrupt-parent") != []:
+                                    node["interrupt-parent"].value = [iph]
                                 else:
-                                    emacnode[prop] = node[prop]
-                            emacnode.name = "ethernet-mac"
-                            emacnode.label_set("axi_ethernet")
-                            node.add(emacnode)
-                            for prop in required_prop:
-                                if prop not in ["compatible", "reg", "status"] and node.props(prop) != []:
-                                    node.delete(prop)
-                            node["compatible"].value = ["xlnx,axi-ethernet-subsystem-7.2"]
-                            node.label_set("axi_enet")
-                            name = node.name
-                            parts = name.split("@")
-                            new_name = f"axi-{parts[0]}-subsystem@{parts[1]}"
-                            node.name = new_name
+                                    node + LopperProp(name="interrupt-parent", value=[iph])
+                                if node.props("interrupts") != []:
+                                    node["interrupts"].value = [11]
+                                else:
+                                    node + LopperProp(name="interrupts", value=[11])
+
+                            iomodule_intc_node = LopperNode()
+                            iomodule_intc_node + LopperProp(name="compatible", value=["xlnx,iomodule-intc"])
+                            iomodule_intc_node + LopperProp("interrupt-controller")
+                            iomodule_intc_node + LopperProp(name="#interrupt-cells", value=[2])
+                            if node.props("xlnx,intc-level-edge") != []:
+                                iomodule_intc_node + LopperProp(
+                                    name="xlnx,intc-level-edge",
+                                    value=node["xlnx,intc-level-edge"].value,
+                                )
+                            if node.props("xlnx,intc-positive") != []:
+                                iomodule_intc_node + LopperProp(
+                                    name="xlnx,intc-positive",
+                                    value=node["xlnx,intc-positive"].value,
+                                )
+                            iomodule_intc_node.name = "iomodule-interrupt-controller"
+                            iomodule_intc_node.label_set("iomodule_intc")
+                            node.add(iomodule_intc_node)
+
+                            uart_node = LopperNode()
+                            uart_node.name = "serial"
+                            uart_node + LopperProp(name="compatible", value=["xlnx,iomodule-uart"])
+                            # IOModule IP C_UART_BAUDRATE VHDL default is 9600; override from DT when present.
+                            baud = 9600
+                            if node.props("xlnx,uart-baudrate") != []:
+                                baud = node.propval("xlnx,uart-baudrate", list)[0]
+                            uart_node + LopperProp(name="current-speed", value=[baud])
+                            uart_node + LopperProp(name="xlnx,uart-baudrate", value=[baud])
+                            data_bits = 8
+                            if node.props("xlnx,uart-data-bits") != []:
+                                data_bits = node.propval("xlnx,uart-data-bits", list)[0]
+                            uart_node + LopperProp(name="xlnx,uart-data-bits", value=[data_bits])
+                            uart_node.label_set("iomodule_uart")
+                            uart_node + LopperProp(name="status", value=["okay"])
+                            node.add(uart_node)
+
+                            # ---- PIT: create timer nodes (prescaler == 0 only; first enabled) ----
+                            # IOModule C_FREQ VHDL default is 100000000 Hz; DT xlnx,clock-freq or CPU clock may override.
+                            clk_hz = 100000000
+                            if node.props("xlnx,clock-freq") != []:
+                                clk_hz = int(node.propval("xlnx,clock-freq", list)[0])
+                            else:
+                                try:
+                                    _cpu = get_cpu_node(sdt, options)
+                                    if _cpu.props("clock-frequency") != []:
+                                        clk_hz = int(_cpu.propval("clock-frequency", list)[0])
+                                except Exception:
+                                    pass
+
+                            zero_prescaler_indices = [i for i, p in enumerate(pit_prescaler) if p == 0]
+                            pit_enabled_assigned = False
+                            for idx in zero_prescaler_indices:
+                                pit = LopperNode()
+                                pit.name = f"timer{idx}"
+                                pit.label_set(f"iomodule_pit{idx}")
+                                pit + LopperProp(name="compatible", value=["xlnx,iomodule-pit"])
+                                pit + LopperProp(name="xlnx,pit-timer-id", value=[idx])
+                                size_val = pit_size[idx] if idx < len(pit_size) else 32
+                                pit + LopperProp(name="xlnx,pit-size", value=[size_val])
+                                pit + LopperProp(name="xlnx,pit-prescaler", value=[pit_prescaler[idx]])
+                                readable_val = pit_readable[idx] if idx < len(pit_readable) else 1
+                                if readable_val:
+                                    pit + LopperProp("xlnx,pit-readable")
+                                pit + LopperProp(name="xlnx,clock-freq", value=[clk_hz])
+                                if pit_enabled_assigned:
+                                    pit + LopperProp(name="status", value=["disabled"])
+                                else:
+                                    pit_enabled_assigned = True
+                                node.add(pit)
+                                _php = pit.phandle_or_create()
+                                if pit.props("phandle") == []:
+                                    pit + LopperProp(name="phandle", value=_php)
+
+                            # ---- /aliases: serial0 -> UART ----
+                            try:
+                                sdt.tree.sync()
+                            except Exception:
+                                pass
+
+                            uart_path = getattr(uart_node, "abs_path", None)
+                            if not uart_path:
+                                uart_path = f"{node.abs_path}/serial"
+
+                            serial_alias = "serial0"
+                            alias_node = sdt.tree["/aliases"]
+                            if alias_node.props(serial_alias) != []:
+                                alias_node[serial_alias].value = [uart_path]
+                            else:
+                                alias_node + LopperProp(name=serial_alias, value=[uart_path])
+                            valid_alias_proplist.append("serial")
+
+                            # ---- /chosen ----
+                            chosen_node = sdt.tree["/chosen"]
+                            _use_p = (
+                                int(node.propval("xlnx,uart-use-parity", list)[0])
+                                if node.props("xlnx,uart-use-parity") != []
+                                else 0
+                            )
+                            if _use_p == 0:
+                                parity_c = "n"
+                            else:
+                                _odd = (
+                                    int(node.propval("xlnx,uart-odd-parity", list)[0])
+                                    if node.props("xlnx,uart-odd-parity") != []
+                                    else 0
+                                )
+                                parity_c = "o" if _odd else "e"
+                            stdout_s = f"{serial_alias}:{baud}{parity_c}{int(data_bits)}"
+                            if chosen_node.props("stdout-path") != []:
+                                chosen_node["stdout-path"].value = [stdout_s]
+                            else:
+                                chosen_node + LopperProp(name="stdout-path", value=[stdout_s])
+                            for _cn in ("zephyr,console", "zephyr,shell-uart"):
+                                if chosen_node.props(_cn) != []:
+                                    chosen_node[_cn].value = [serial_alias]
+                                else:
+                                    chosen_node + LopperProp(name=_cn, value=[serial_alias])
                         #AXI-ETHERNET-LITE
                         if any(v in node["compatible"].value for v in ("xlnx,axi-ethernetlite-3.0", "xlnx,xps-ethernetlite-1.00.a")):
                             node["compatible"].value = ["xlnx,xps-ethernetlite-3.00.a"]
@@ -1653,7 +1941,7 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                             emacnode.name = "axi-ethernet-lite-mac"
                             emacnode.label_set(f"{node.label}_mac")
                             node.add(emacnode)
-                        # UARTNS550
+                        # UARTNS550: compatible rename + clock-frequency + reg-shift
                         if "xlnx,axi-uart16550-2.0" in node["compatible"].value:
                             node["compatible"].value = ["ns16550"]
                             if node.propval('clock-frequency') == [''] and node.propval('xlnx,clock-freq') != ['']:
@@ -1662,14 +1950,6 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                             if node.propval('reg-shift') != ['2']:
                                node["reg-shift"] = LopperProp("reg-shift")
                                node["reg-shift"].value = 2
-                            if node.propval('current-speed') == ['']:
-                               node["current-speed"] = LopperProp("current-speed")
-                               if node.propval('xlnx,baudrate') != ['']:
-                                   node["current-speed"].value = node["xlnx,baudrate"].value
-                               elif stdout_baud:
-                                   node["current-speed"].value = stdout_baud
-                               else:
-                                   node["current-speed"].value = 9600
                         # MDM RISCV DEBUG UARTLITE
                         if "xlnx,mdm-riscv-1.0" in node["compatible"].value:
                             node["compatible"].value = ["xlnx,xps-uartlite-1.00a"]
@@ -1709,13 +1989,6 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                                     new_node['#gpio-cells'] = 2
                                     new_node.label_set(node.label)
                                     node.add(new_node)
-                        #AXI-SPI
-                        if any(version in node["compatible"].value for version in ("xlnx,xps-spi-2.00.a", "xlnx,axi-quad-spi-3.2")):
-                            if node.propval('#address-cells') != ['1']:
-                                node['#address-cells'] = 1
-                            if node.propval('#size-cells') != ['0']:
-                                node['#size-cells'] = 0
-                            node["compatible"] = "xlnx,xps-spi-2.00.a"
                         # Collect all the axi-timebase-wdt nodes
                         if any(version in node["compatible"].value for version in ("xlnx,axi-timebase-wdt-3.0", "xlnx,xps-timebase-wdt-1.00.a")):
                             axi_wdt_nodes.append(node)
