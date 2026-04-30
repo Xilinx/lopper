@@ -476,7 +476,12 @@ def xlnx_generate_xparams(tgt_node, sdt, options):
             name = os.path.basename(os.path.dirname(yamlfile))
             schema = utils.load_yaml(yamlfile)
             compatlist = bm_config.compat_list(schema)
-            prop_list = schema['required']
+            prop_list = schema.get('required', [])
+            if schema.get('additionalProperties', {}):
+                if prop_list:
+                    prop_list.extend(schema.get('additionalProperties', {}))
+                else:
+                    prop_list = schema.get('additionalProperties', {})
             match = [compat for compat in compatlist if compat in match_cpunode.propval('compatible')]
             if match:
                 plat.buf(f"\n\n/*  CPU parameters definition */\n")
