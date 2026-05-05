@@ -1000,7 +1000,7 @@ class lopper_base:
 
             # Check for property definitions with phandles
             # Handle both single-line and multi-line properties
-            prop_match = re.match(r'^([a-zA-Z0-9_-]+)\s*=\s*(.*)', line)
+            prop_match = re.match(r'^([a-zA-Z0-9_,-]+)\s*=\s*(.*)', line)
             if prop_match and current_path:
                 prop_name = prop_match.group(1)
                 prop_value = prop_match.group(2)
