@@ -472,3 +472,201 @@ class TestOpenAMPPattern:
         tree["/"].print(buf)
         out = buf.getvalue()
         assert "cdns,ttc" in out, f"cdns,ttc not in base DTS output"
+
+
+# ---------------------------------------------------------------------------
+# Section 4: overlay_subtrees serialization/deserialization round-trip
+# ---------------------------------------------------------------------------
+
+class TestOverlaySubtreesRoundTrip:
+    """Verify that overlay_subtrees survive serialize → deserialize in-memory.
+
+    These tests exercise the JSON serialization format used for the DTS embed
+    mechanism without requiring dtc/libfdt — the serialize step embeds a
+    /__lopper-overlays__ node, the deserialize step reconstructs overlay_subtrees
+    from it and removes the internal node.
+    """
+
+    def _build_serialized_tree(self, tmp_path):
+        """Return a tree with /__lopper-overlays__ embedded."""
+        from lopper import _serialize_overlay_subtrees
+        yaml_file = tmp_path / "sdt.yaml"
+        yaml_file.write_text(OPENAMP_YAML)
+        tree = LopperYAML(str(yaml_file)).to_tree()
+        assert tree is not None
+        _serialize_overlay_subtrees(tree)
+        return tree
+
+    def test_serialize_adds_lopper_overlays_node(self, tmp_path):
+        """_serialize_overlay_subtrees must add /__lopper-overlays__ to the tree."""
+        tree = self._build_serialized_tree(tmp_path)
+        assert '/__lopper-overlays__' in tree.__nodes__, \
+            "/__lopper-overlays__ node missing after serialization"
+
+    def test_serialize_adds_condition_child(self, tmp_path):
+        """A child node for the 'linux' condition must exist."""
+        tree = self._build_serialized_tree(tmp_path)
+        assert '/__lopper-overlays__/linux' in tree.__nodes__, \
+            "/__lopper-overlays__/linux child missing"
+
+    def test_serialize_child_has_encoded_prop(self, tmp_path):
+        """The condition child must contain at least one property."""
+        tree = self._build_serialized_tree(tmp_path)
+        cond_node = tree['/__lopper-overlays__/linux']
+        assert len(cond_node.__props__) > 0, \
+            "/__lopper-overlays__/linux has no encoded properties"
+
+    def test_deserialize_removes_internal_node(self, tmp_path):
+        """After deserialization /__lopper-overlays__ must be gone."""
+        from lopper import _serialize_overlay_subtrees, _deserialize_overlay_subtrees
+        yaml_file = tmp_path / "sdt.yaml"
+        yaml_file.write_text(OPENAMP_YAML)
+        tree = LopperYAML(str(yaml_file)).to_tree()
+        _serialize_overlay_subtrees(tree)
+        # Simulate reload: drop the in-memory overlay_subtrees
+        tree._metadata.pop('overlay_subtrees', None)
+        _deserialize_overlay_subtrees(tree)
+        assert '/__lopper-overlays__' not in tree.__nodes__, \
+            "/__lopper-overlays__ still present after deserialization"
+
+    def test_deserialize_restores_linux_condition(self, tmp_path):
+        """overlay_subtrees must contain 'linux' after deserialize."""
+        from lopper import _serialize_overlay_subtrees, _deserialize_overlay_subtrees
+        yaml_file = tmp_path / "sdt.yaml"
+        yaml_file.write_text(OPENAMP_YAML)
+        tree = LopperYAML(str(yaml_file)).to_tree()
+        _serialize_overlay_subtrees(tree)
+        tree._metadata.pop('overlay_subtrees', None)
+        _deserialize_overlay_subtrees(tree)
+        ov = tree._metadata.get('overlay_subtrees', {})
+        assert 'linux' in ov, \
+            f"'linux' condition missing after deserialization: {list(ov.keys())}"
+        assert len(ov['linux']) > 0, "linux condition has no overlay nodes"
+
+    def test_deserialize_restores_uio_prop(self, tmp_path):
+        """The deserialized overlay node must carry the 'uio' compatible value."""
+        from lopper import _serialize_overlay_subtrees, _deserialize_overlay_subtrees
+        yaml_file = tmp_path / "sdt.yaml"
+        yaml_file.write_text(OPENAMP_YAML)
+        tree = LopperYAML(str(yaml_file)).to_tree()
+        _serialize_overlay_subtrees(tree)
+        tree._metadata.pop('overlay_subtrees', None)
+        _deserialize_overlay_subtrees(tree)
+        ov = tree._metadata['overlay_subtrees']['linux']
+        # Find the timer overlay node
+        timer_ov = None
+        for n in ov:
+            if 'timer' in n.abs_path:
+                timer_ov = n
+                break
+        assert timer_ov is not None, "timer overlay node not found after deserialize"
+        prop = timer_ov.__props__.get('compatible')
+        assert prop is not None, "compatible prop missing from deserialized overlay"
+        val = prop.value
+        val_list = val if isinstance(val, list) else [val]
+        assert "uio" in val_list, \
+            f"uio not found in deserialized compatible: {val_list}"
+
+    def test_overlay_tree_works_after_roundtrip(self, tmp_path):
+        """overlay_tree('linux') must produce uio binding after serialize/deserialize."""
+        from lopper import _serialize_overlay_subtrees, _deserialize_overlay_subtrees
+        yaml_file = tmp_path / "sdt.yaml"
+        yaml_file.write_text(OPENAMP_YAML)
+        tree = LopperYAML(str(yaml_file)).to_tree()
+        _serialize_overlay_subtrees(tree)
+        tree._metadata.pop('overlay_subtrees', None)
+        _deserialize_overlay_subtrees(tree)
+
+        lt = tree.overlay_tree('linux')
+        assert lt is not None, "overlay_tree('linux') returned None after roundtrip"
+        timer = lt["/axi/timer@f1e90000"]
+        assert timer is not None, "/axi/timer@f1e90000 not found in overlay tree"
+        val = timer.propval('compatible')
+        val_list = val if isinstance(val, list) else [val]
+        assert "uio" in val_list, \
+            f"uio not in compatible after roundtrip: {val_list}"
+
+    def test_dts_print_includes_lopper_overlays_for_pass2(self, tmp_path):
+        """After serialization /__lopper-overlays__ must appear in DTS output.
+
+        The node must be emitted so a second-pass lopper invocation can
+        deserialize it; _deserialize_overlay_subtrees() deletes it after
+        reconstruction so it never leaks into further output.
+        """
+        import io as _io
+        tree = self._build_serialized_tree(tmp_path)
+        buf = _io.StringIO()
+        for node in tree.__nodes__.values():
+            if node.abs_path == '/':
+                node.print(buf)
+                break
+        out = buf.getvalue()
+        assert "__lopper-overlays__" in out, \
+            "/__lopper-overlays__ missing from DTS output — second-pass deserialization will fail"
+
+    def test_dts_print_omits_lopper_overlays_after_deserialize(self, tmp_path):
+        """After deserialize, /__lopper-overlays__ must be absent from DTS output."""
+        import io as _io
+        from lopper import _serialize_overlay_subtrees, _deserialize_overlay_subtrees
+        yaml_file = tmp_path / "sdt.yaml"
+        yaml_file.write_text(OPENAMP_YAML)
+        tree = LopperYAML(str(yaml_file)).to_tree()
+        _serialize_overlay_subtrees(tree)
+        _deserialize_overlay_subtrees(tree)
+        buf = _io.StringIO()
+        for node in tree.__nodes__.values():
+            if node.abs_path == '/':
+                node.print(buf)
+                break
+        out = buf.getvalue()
+        assert "__lopper-overlays__" not in out, \
+            "/__lopper-overlays__ still in tree after deserialize — delete not working"
+
+
+# ---------------------------------------------------------------------------
+# Section 5: _props_to_delete delete-scheme via _merge_node_into_tree
+# ---------------------------------------------------------------------------
+
+class TestPropsToDeleteMergeScheme:
+    """Verify the delete merge-scheme removes properties during overlay merge."""
+
+    def test_delete_scheme_removes_prop(self):
+        """A prop in _props_to_delete must be absent after _merge_node_into_tree."""
+        from lopper.tree import _merge_node_into_tree, LopperNode, LopperProp
+
+        # Base tree with /foo node carrying prop 'x'
+        base = LopperTree()
+        base_node = LopperNode(-1, '/foo')
+        lp = LopperProp('x', -1, base_node, 'keep-me')
+        base_node.__props__['x'] = lp
+        base.add(base_node, dont_sync=True)
+
+        # Overlay node for same path, marking 'x' for deletion
+        ov_node = LopperNode(-1, '/foo')
+        ov_node.__dict__['_props_to_delete'] = {'x'}
+
+        _merge_node_into_tree(base, ov_node)
+
+        result_node = base['/foo']
+        assert 'x' not in result_node.__props__, \
+            "Property 'x' should have been deleted by the overlay merge scheme"
+
+    def test_delete_scheme_does_not_affect_other_props(self):
+        """Only the flagged prop is deleted; sibling props are untouched."""
+        from lopper.tree import _merge_node_into_tree, LopperNode, LopperProp
+
+        base = LopperTree()
+        base_node = LopperNode(-1, '/bar')
+        for name, val in [('x', 'delete-me'), ('y', 'keep-me')]:
+            lp = LopperProp(name, -1, base_node, val)
+            base_node.__props__[name] = lp
+        base.add(base_node, dont_sync=True)
+
+        ov_node = LopperNode(-1, '/bar')
+        ov_node.__dict__['_props_to_delete'] = {'x'}
+
+        _merge_node_into_tree(base, ov_node)
+
+        result_node = base['/bar']
+        assert 'x' not in result_node.__props__, "'x' should be deleted"
+        assert 'y' in result_node.__props__, "'y' should be preserved"

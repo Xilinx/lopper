@@ -194,6 +194,17 @@ def _resolve_overlay_fixups(tree, fixups_node):
                 pass
 
 
+# Lopper-internal nodes that must be skipped during DTS output.
+# Add any new internal node paths here rather than adding per-path checks.
+_LOPPER_INTERNAL_NODES = frozenset({
+    "/__lopper-phandles__",
+    # Note: /__lopper-overlays__ is NOT listed here. It must be emitted to the
+    # output DTS (so a second-pass invocation can deserialize it), and is
+    # explicitly deleted from the tree by _deserialize_overlay_subtrees() after
+    # reconstruction so it never appears in further output.
+})
+
+
 def _merge_node_into_tree(tree, ov_node):
     """Recursively merge an overlay node into a tree at ov_node.abs_path.
 
@@ -2831,8 +2842,8 @@ class LopperNode(object):
             if self.tree and self.tree.strict != strict:
                 resolve_props = True
 
-        if self.abs_path == "/__lopper-phandles__":
-            # this is an internal node, do not print
+        if self.abs_path in _LOPPER_INTERNAL_NODES:
+            # lopper-internal bookkeeping node — never emit to output
             return
         elif self.abs_path != "/":
             plabel = ""

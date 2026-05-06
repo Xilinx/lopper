@@ -98,6 +98,9 @@ def usage():
     print('    , --no-libfdt     don\'t use dtc/libfdt for parsing/compiling device trees' )
     print('  -f, --force         force overwrite output file(s)')
     print('    , --werror        treat warnings as errors' )
+    print('    , --emit-overlay-sidecar  write a <out>.overlays.yaml sigil YAML alongside the output DTS' )
+    print('    , --emit-overlay-dtso     write per-condition <out>.<cond>.dtso overlay files alongside the output DTS' )
+    print('    , --emit-embedded-overlays  re-embed /__lopper-overlays__ even when loaded from a prior DTS embed (use for >2-pass workflows)' )
     print('  -S, --save-temps    don\'t remove temporary files' )
     print('    , --cfgfile       specify a lopper configuration file to use (configparser format) ' )
     print('    , --cfgval        specify a configuration value to use (in configparser section format). Can be specified multiple times' )
@@ -138,6 +141,9 @@ def main():
     usage_flag = False
     schema = None
     memmap_file = None
+    cpumap_file = None
+    cpumap_expand = False
+    overlay_emit = set()
 
     try:
         opts, args = getopt.getopt(sys.argv[1:], "I:W:A:t:dfvdhi:o:a:SO:D:x:",
@@ -146,7 +152,9 @@ def main():
                                      "force","verbose","help","input=","output=","dryrun",
                                      "assist=","server", "auto", "permissive", 'symbols', "xlate=",
                                      "no-libfdt", "overlay", "cfgfile=", "cfgval=", "input-dirs",
-                                     "memmap="] )
+                                     "memmap=", "cpumap=", "cpumap-expand",
+                                     "emit-overlay-sidecar", "emit-overlay-dtso",
+                                     "emit-embedded-overlays"] )
     except getopt.GetoptError as err:
         _error(f"{err}")
         usage()
@@ -215,6 +223,16 @@ def main():
             warnings.append(a)
         elif o in ('--memmap'):
             memmap_file = a
+        elif o in ('--cpumap'):
+            cpumap_file = a
+        elif o in ('--cpumap-expand'):
+            cpumap_expand = True
+        elif o in ('--emit-overlay-sidecar'):
+            overlay_emit.add('sidecar')
+        elif o in ('--emit-overlay-dtso'):
+            overlay_emit.add('dtso')
+        elif o in ('--emit-embedded-overlays'):
+            overlay_emit.add('embedded')
         elif o in ('--version'):
             print( f"{LOPPER_VERSION}" )
             sys.exit(0)
@@ -451,6 +469,8 @@ def main():
     device_tree.warnings = warnings
     device_tree.schema = schema
     device_tree.memmap_file = memmap_file
+    device_tree.cpumap_file = cpumap_file
+    device_tree.overlay_emit = overlay_emit
 
     # Backwards compatibility: if lop-xlate-yaml.dts is explicitly passed,
     # remove it from the input list and enable auto-matching so %.yaml.lop

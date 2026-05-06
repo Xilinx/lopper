@@ -714,6 +714,23 @@ class lopper_base:
 
         return safe_name
 
+    @staticmethod
+    def path_to_prop_name( abs_path ):
+        """Encode a node abs_path as a legal DTS property name (reversible).
+
+        Used for keying overlay node data in /__lopper-overlays__ properties.
+        Inverse of prop_name_to_path().
+        """
+        return abs_path.lstrip('/').replace('@', '__at__').replace('/', '__sl__')
+
+    @staticmethod
+    def prop_name_to_path( prop_name ):
+        """Decode a /__lopper-overlays__ property name back to a node abs_path.
+
+        Inverse of path_to_prop_name().
+        """
+        return '/' + prop_name.replace('__sl__', '/').replace('__at__', '@')
+
 
     @staticmethod
     def encode_byte_array( values, byte_count_hint = 4 ):

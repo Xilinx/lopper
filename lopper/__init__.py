@@ -17,6 +17,7 @@ import contextlib
 from importlib.machinery import SourceFileLoader
 import tempfile
 from collections import OrderedDict
+import json
 
 from lopper.fmt import LopperFmt
 from lopper.fdt import LopperFDT
@@ -527,6 +528,253 @@ def extract_overlay_targets(overlay_file, include_paths="", tmpdir=None, save_te
     return _extract_overlay_targets_regex(overlay_file)
 
 
+def _serialize_overlay_node(ov_node):
+    """Encode one overlay LopperNode as a JSON-serialisable dict.
+
+    Format:
+      { "props": [[name, value], ...],
+        "delete": [prop_name, ...],
+        "children": [<recursive>, ...] }
+    """
+    props = []
+    for prop_name, prop in ov_node.__props__.items():
+        try:
+            val = prop.value
+        except Exception:
+            val = []
+        if not isinstance(val, list):
+            val = [val]
+        # Convert bytes objects so json.dumps can handle them
+        serialisable = []
+        for v in val:
+            if isinstance(v, (bytes, bytearray)):
+                serialisable.append(list(v))
+            else:
+                serialisable.append(v)
+        pclass = prop.pclass if isinstance(prop.pclass, str) else ""
+        props.append([prop_name, serialisable, pclass])
+
+    delete = list(ov_node.__dict__.get('_props_to_delete', set()))
+
+    children = []
+    for child in list(ov_node.child_nodes.values()):
+        children.append(_serialize_overlay_node(child))
+
+    return {"abs_path": ov_node.abs_path,
+            "props": props,
+            "delete": delete,
+            "children": children}
+
+
+def _deserialize_overlay_node(data, parent=None, tree=None):
+    """Reconstruct a LopperNode from the dict produced by _serialize_overlay_node."""
+    from lopper.tree import LopperNode, LopperProp
+    node = LopperNode(-1, data["abs_path"])
+    node.tree = tree
+
+    for prop_name, val, pclass in data.get("props", []):
+        lp = LopperProp(prop_name, -1, node, val)
+        if pclass:
+            lp.pclass = pclass
+        node.__props__[prop_name] = lp
+
+    to_delete = set(data.get("delete", []))
+    if to_delete:
+        node.__dict__['_props_to_delete'] = to_delete
+
+    for child_data in data.get("children", []):
+        child = _deserialize_overlay_node(child_data, parent=node, tree=tree)
+        node.child_nodes.append(child)
+
+    return node
+
+
+def _serialize_overlay_subtrees(tree, keep_embedded=False):
+    """Embed overlay_subtrees into tree as /__lopper-overlays__ before DTS output.
+
+    Each condition gets a child node; each overlay node within that condition
+    becomes a property whose name is the path-encoded abs_path and whose value
+    is a JSON string of the serialised node data.
+
+    keep_embedded: when True, re-embed even if the overlays were loaded from a
+    prior DTS embed.  Use this (via --emit-embedded-overlays) when more than
+    two passes are needed and the embed must survive each intermediate write.
+    """
+    from lopper.tree import LopperNode, LopperProp
+    overlay_subtrees = tree._metadata.get('overlay_subtrees', {})
+    if not overlay_subtrees:
+        return
+    # If overlays were loaded from a prior DTS embed they have already been
+    # consumed by this pass; do not re-embed so final output is clean —
+    # unless the caller explicitly requests persistence across extra passes.
+    if tree._metadata.get('_overlay_subtrees_from_embed') and not keep_embedded:
+        return
+
+    root_node = LopperNode(-1, '/__lopper-overlays__')
+    tree.add(root_node, dont_sync=True)
+
+    for condition_name, node_list in overlay_subtrees.items():
+        cond_node = LopperNode(-1, f'/__lopper-overlays__/{condition_name}')
+        tree.add(cond_node, dont_sync=True)
+
+        for ov_node in node_list:
+            prop_name = Lopper.path_to_prop_name(ov_node.abs_path)
+            encoded = json.dumps(_serialize_overlay_node(ov_node))
+            lp = LopperProp(prop_name, -1, cond_node, encoded)
+            cond_node.__props__[prop_name] = lp
+            # Resolve immediately so the prop has a valid ptype before print().
+            # _serialize runs after tree.resolve(), so new nodes need explicit
+            # resolution; without it they show as **unresolved** in DTS output.
+            lp.resolve(strict=False)
+
+
+def _deserialize_overlay_subtrees(tree):
+    """Reconstruct overlay_subtrees from /__lopper-overlays__ after DTS load.
+
+    After reconstruction the internal node is removed so it never appears
+    in subsequent output files.
+    """
+    if '/__lopper-overlays__' not in tree.__nodes__:
+        return
+
+    root_node = tree['/__lopper-overlays__']
+    overlay_subtrees = tree._metadata.setdefault('overlay_subtrees', {})
+
+    for cond_node in list(root_node.child_nodes.values()):
+        condition_name = cond_node.name
+        nodes_for_cond = overlay_subtrees.setdefault(condition_name, [])
+
+        for prop_name, lp in cond_node.__props__.items():
+            try:
+                data = json.loads(lp.value if isinstance(lp.value, str) else lp.value[0])
+            except Exception:
+                continue
+            abs_path = Lopper.prop_name_to_path(prop_name)
+            ov_node = _deserialize_overlay_node(data, tree=tree)
+            ov_node.__dict__['abs_path'] = abs_path
+            nodes_for_cond.append(ov_node)
+
+    # Remove the internal bookkeeping node from the tree so it never appears
+    # in subsequent output, and mark the source so _serialize_overlay_subtrees
+    # knows not to re-embed on write (overlays already consumed from DTS embed).
+    try:
+        tree.delete(root_node)
+    except Exception:
+        pass
+    tree._metadata['_overlay_subtrees_from_embed'] = True
+
+
+def _write_overlay_sidecar(tree, output_path):
+    """Distil overlay_subtrees back to a minimal sigil YAML file.
+
+    The sidecar is a valid lopper YAML input: users pass it with -i on a
+    subsequent invocation to restore overlay_subtrees.  The existing
+    LopperYAML.to_tree() sigil parser reloads it — no new deserialization.
+
+    Output path: <stem>.overlays.yaml (or <stem>.<ext>.overlays.yaml).
+    """
+    overlay_subtrees = tree._metadata.get('overlay_subtrees', {})
+    if not overlay_subtrees:
+        return
+
+    stem = Path(output_path).stem
+    parent = Path(output_path).parent
+    sidecar_path = str(parent / f"{stem}.overlays.yaml")
+
+    # Rebuild nested-dict sigil YAML from overlay nodes.
+    # Each overlay node's props become  property!condition: value  entries
+    # under the node's path hierarchy.
+    data = {}
+
+    def _set_nested(d, keys, value):
+        for k in keys[:-1]:
+            d = d.setdefault(k, {})
+        d[keys[-1]] = value
+
+    for condition_name, node_list in overlay_subtrees.items():
+        for ov_node in node_list:
+            # Reconstruct path components as nested-dict keys
+            parts = [p for p in ov_node.abs_path.split('/') if p]
+            for prop_name, lp in ov_node.__props__.items():
+                sigil_key = f"{prop_name}!{condition_name}"
+                val = lp.value
+                if isinstance(val, list) and len(val) == 1:
+                    val = val[0]
+                _set_nested(data, parts + [sigil_key], val)
+            for prop_name in ov_node.__dict__.get('_props_to_delete', set()):
+                sigil_key = f"{prop_name}!{condition_name}!delete"
+                _set_nested(data, parts + [sigil_key], None)
+
+    # Write the sidecar. Prepend a lopper-overlays: marker comment so the
+    # YAML classification logic routes this file through to_tree() as an
+    # sdt_file rather than a support_file on reload — without injecting a
+    # spurious tree node.
+    try:
+        import ruamel.yaml as _ruamel
+        import io as _io
+        _yaml_engine = _ruamel.YAML()
+        buf = _io.StringIO()
+        _yaml_engine.dump(data, buf)
+        yaml_body = buf.getvalue()
+    except Exception:
+        import yaml as _pyyaml
+        yaml_body = _pyyaml.dump(data, default_flow_style=False)
+    with open(sidecar_path, 'w') as f:
+        f.write("# lopper-overlays: generated sigil overlay sidecar\n")
+        f.write(yaml_body)
+    lopper.log._info(f"overlay sidecar written: {sidecar_path}")
+
+
+def _write_overlay_dtso_files(tree, output_path):
+    """Emit one .dtso overlay file per condition in overlay_subtrees (opt-in).
+
+    Each file is a standard DTS overlay that, when applied, reproduces the
+    conditional property overrides for that condition.  Merge schemes
+    (append/prepend/delete) are not representable in DTS overlays — the
+    output is always replace-mode.  This is documented inside the emitted file.
+
+    Output: <stem>.<condition>.dtso per condition.
+    """
+    overlay_subtrees = tree._metadata.get('overlay_subtrees', {})
+    if not overlay_subtrees:
+        return
+
+    stem = Path(output_path).stem
+    parent = Path(output_path).parent
+
+    for condition_name, node_list in overlay_subtrees.items():
+        dtso_path = str(parent / f"{stem}.{condition_name}.dtso")
+        lines = [
+            "// Auto-generated DTS overlay for condition: " + condition_name,
+            "// NOTE: merge schemes (append/prepend/delete) are not expressible in",
+            "// DTS overlays — all property overrides are replace-mode here.",
+            "/dts-v1/;",
+            "/plugin/;",
+            "",
+        ]
+        for ov_node in node_list:
+            # Emit a fragment using the node's label if available, else path
+            label = ov_node.label if hasattr(ov_node, 'label') and ov_node.label else None
+            ref = f"&{label}" if label else f"&{{  /* {ov_node.abs_path} */ }}"
+            lines.append(f"&{label or 'LABEL_UNKNOWN'} {{")
+            for prop_name, lp in ov_node.__props__.items():
+                val = lp.value
+                if isinstance(val, list) and len(val) == 1:
+                    val = val[0]
+                if isinstance(val, str):
+                    lines.append(f'\t{prop_name} = "{val}";')
+                elif isinstance(val, int):
+                    lines.append(f'\t{prop_name} = <{hex(val)}>;')
+                else:
+                    lines.append(f'\t/* {prop_name}: complex value, omitted */')
+            lines.append("};")
+            lines.append("")
+
+        with open(dtso_path, 'w') as f:
+            f.write('\n'.join(lines))
+        lopper.log._info(f"overlay dtso written: {dtso_path}")
+
+
 class LopperSDT:
     """The LopperSDT Class represents and manages the full system DTS file
 
@@ -574,6 +822,7 @@ class LopperSDT:
         self.werror = False
         self.tmpfiles = []
         self.schema = None
+        self.overlay_emit = set()
 
     def _compile_overlay_subtrees(self, overlay_dts_files, include_paths):
         """Compile each overlay DTS into a named node list for lazy merging.
@@ -790,7 +1039,8 @@ class LopperSDT:
                                     found = True
                                     sdt_files.append( ifile )
                                 if re.search( r"compatible: .*subsystem", line ) or \
-                                   re.search( r",domain-v1", line ):
+                                   re.search( r",domain-v1", line ) or \
+                                   re.search( r"lopper-overlays:", line ):
                                     sdt_files.append( ifile )
                                     found = True
 
@@ -882,6 +1132,7 @@ class LopperSDT:
                         # system device tree). No code after this needs to be concerned that
                         # this came from yaml.
                         sdt_extended_trees.append( json_tree )
+
 
                 fp = fpp.name
             else:
@@ -987,6 +1238,7 @@ class LopperSDT:
             self.tree.strict = not self.permissive
             self.tree.schema = self.schema
             self.tree.load( dct )
+            _deserialize_overlay_subtrees( self.tree )
 
             self.tree.__dbg__ = self.verbose
 
@@ -1136,6 +1388,7 @@ class LopperSDT:
                 self.tree.werror = self.werror
                 self.tree.strict = not self.permissive
                 self.tree.load( Lopper.export( self.FDT ) )
+                _deserialize_overlay_subtrees( self.tree )
 
                 # Do a check for common sanity issues here, invalid phandles, etc.
                 self.tree.resolve( check=True )
@@ -1407,6 +1660,11 @@ class LopperSDT:
 
             tree_to_write.strict = not self.permissive
             tree_to_write.resolve()
+            _serialize_overlay_subtrees(tree_to_write, keep_embedded='embedded' in self.overlay_emit)
+            if 'sidecar' in self.overlay_emit:
+                _write_overlay_sidecar(tree_to_write, output_filename)
+            if 'dtso' in self.overlay_emit:
+                _write_overlay_dtso_files(tree_to_write, output_filename)
             tree_to_write.print( output_filename )
 
         elif re.search( r"\.yaml$", output_filename ):

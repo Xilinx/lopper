@@ -148,6 +148,90 @@ of the same source YAML.
 
 ---
 
+## Multi-Pass Workflows
+
+In many build pipelines the YAML-to-DTS translation and the domain processing
+are separate lopper invocations.  By default, lopper automatically preserves
+sigil overlay data across exactly two passes:
+
+**Pass 1 — YAML translation:**
+```bash
+lopper -f --permissive --enhanced \
+    -i base.yaml -i overrides.yaml \
+    system-top.dts intermediate.dts
+```
+
+Lopper embeds the condition registry as a `/__lopper-overlays__` node inside
+`intermediate.dts`.  No extra files or flags are needed.
+
+**Pass 2 — domain processing:**
+```bash
+lopper -f --permissive \
+    intermediate.dts APU_Linux.dts \
+    -- domain_access -t /domains/APU_Linux
+```
+
+Lopper deserialises `/__lopper-overlays__` on load, making
+`overlay_tree('linux')` available to `domain_access`.  The node is removed
+before `APU_Linux.dts` is written so the final output is clean.
+
+### Preserving overlays across more than two passes
+
+For pipelines with additional intermediate steps, pass `--emit-embedded-overlays`
+to any non-final invocation to re-embed the overlay registry into that pass's
+output:
+
+```bash
+lopper -f --permissive --emit-embedded-overlays \
+    intermediate.dts intermediate2.dts \
+    -- some_transform
+
+lopper -f --permissive \
+    intermediate2.dts APU_Linux.dts \
+    -- domain_access -t /domains/APU_Linux
+```
+
+### Alternative: YAML sidecar
+
+`--emit-overlay-sidecar` writes `<out>.overlays.yaml` alongside the output DTS.
+Feed it with `-i` on subsequent passes.  Unlike the embedded node, the sidecar
+preserves merge schemes (`append`/`prepend`/`delete`) with full fidelity since
+it round-trips through the sigil parser:
+
+```bash
+# Pass 1: emit intermediate.dts + intermediate.overlays.yaml
+lopper -f --permissive --enhanced --emit-overlay-sidecar \
+    -i base.yaml -i overrides.yaml \
+    system-top.dts intermediate.dts
+
+# Pass 2: feed the sidecar explicitly
+lopper -f --permissive \
+    -i intermediate.overlays.yaml \
+    intermediate.dts APU_Linux.dts \
+    -- domain_access -t /domains/APU_Linux
+```
+
+### Alternative: per-condition DTS overlay files
+
+`--emit-overlay-dtso` writes one `<out>.<condition>.dtso` file per condition.
+These are standard DTS overlay files and can be inspected or fed with `-i`.
+Note that merge schemes are not representable in DTS overlays — the output is
+always replace-mode.
+
+### Summary of overlay emit options
+
+| Flag | Output | Merge schemes preserved | Notes |
+|------|--------|------------------------|-------|
+| *(default)* | `/__lopper-overlays__` in output DTS | Yes | Automatic two-pass; removed in final output |
+| `--emit-embedded-overlays` | `/__lopper-overlays__` in output DTS | Yes | Re-embeds on every pass; use for >2-pass pipelines |
+| `--emit-overlay-sidecar` | `<out>.overlays.yaml` | Yes | Full sigil fidelity; feed with `-i` |
+| `--emit-overlay-dtso` | `<out>.<cond>.dtso` per condition | No (replace only) | Human-readable; standard DTS overlay format |
+
+All emit options only affect DTS (`.dts`/`.dtsi`) output; YAML and JSON output
+formats are unaffected.
+
+---
+
 ## DTS Overlay Files
 
 DTS overlay files (containing `&label { ... }` syntax) are handled by the same
