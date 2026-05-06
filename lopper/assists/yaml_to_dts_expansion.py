@@ -1694,7 +1694,12 @@ def xlnx_timer_expand(tree, subnode, verbose = 0 ):
         if isinstance(timer_pval, str):
             timer_pval = [ timer_pval ]
         for label in timer_pval:
-            timer_node = [ n for n in tree["/axi"].subnodes(children_only=True, name="timer@*") if n.label == label ]
+            timer_node = []
+            if "/axi" in tree:
+                timer_node = [ n for n in tree["/axi"].subnodes(children_only=True, name="timer@*") if n.label == label ]
+            if timer_node == []:
+                # Versal2 and other SoCs place timers at root level, not under /axi
+                timer_node = [ n for n in tree["/"].subnodes(name="timer@*") if n.label == label ]
             if timer_node == []:
                 lopper.log._error("ERROR: xlnx_timer_expand requires timer label reference")
                 return False
