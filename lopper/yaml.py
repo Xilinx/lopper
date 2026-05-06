@@ -790,7 +790,7 @@ class LopperJSON():
                             if self.boolean_as_int:
                                 props[p] = [ 1 ]
                             else:
-                                props[p] = None
+                                props[p] = ['']
                         else:
                             if self.boolean_as_int:
                                 props[p] = [ 0 ]
