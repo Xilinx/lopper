@@ -202,6 +202,9 @@ class LopperProp():
 
         self.abs_path = ""
 
+        # Back-reference to the owning LopperNode (set by LopperNode when added)
+        self._node = None
+
         if value == None:
             self.value = []
         else:
@@ -251,6 +254,7 @@ class LopperProp():
         new_instance.ptype = self.ptype
         new_instance.binary = self.binary
         new_instance.phandle_resolution = self.phandle_resolution
+        new_instance._node = None  # don't copy the backref; caller sets it
 
         if self.__dbg__ > 1:
             lopper.log._debug( f"property deep copy done: {[self]} ({type(new_instance.value)})({new_instance.value})" )
@@ -727,7 +731,7 @@ class LopperProp():
 
         return ret_val
 
-    def phandle_map( self, tag_invalid = True ):
+    def phandle_map( self, tag_invalid = True, context_trees=None ):
         """Determines the phandle elements/params of a property
 
         Takes a property name and returns a list of lists, where phandles are
@@ -735,6 +739,8 @@ class LopperProp():
 
         Args:
             tag_invalid (bool): default True. Whether or not invalid phandles should be indicated with "invald"
+            context_trees (list, optional): Additional trees to search for phandle resolution.
+                                            Useful for cross-tree resolution (e.g., overlay referencing base).
 
         Returns:
             A list / map of values. Where 0 in the list means no phandle, and
@@ -907,7 +913,7 @@ class LopperProp():
                     if len(derefs) >= 2:
                         # step 1) lookup the node
                         if self.node and self.node.tree:
-                            node_deref = self.node.tree.deref( val )
+                            node_deref = self.node.tree.deref( val, context_trees=context_trees )
                         else:
                             # if we aren't in a tree, we really can't continue since
                             # whatever we do will be wrong, just return an empty
@@ -1049,7 +1055,7 @@ class LopperProp():
             for p in property_val_group:
                 if property_chunk_idx in phandle_index_list:
                     if self.node and self.node.tree:
-                        node_deref = self.node.tree.deref( p )
+                        node_deref = self.node.tree.deref( p, context_trees=context_trees )
                         # This second check is currently disabled as it impacts runtime
                         # significantly. If the pattern learning isn't sufficient, this
                         # can be re-enabled
@@ -1383,7 +1389,7 @@ class LopperProp():
 
         return ptype
 
-    def resolve( self, strict = None ):
+    def resolve( self, strict = None, sync_companions = True ):
         """resolve (calculate) property details
 
         Some attributes of a property are not known at initialization
@@ -1556,7 +1562,18 @@ class LopperProp():
                 formatted_records = []
                 phandle_record = []
                 if phandle_map:
+                    # Get companion property for syncing when records are dropped
+                    companion_val = None
+                    companion_prop = None
+                    if self.node:
+                        companion_name = lopper.base.lopper_base.phandle_property_companion(self.name)
+                        if companion_name and companion_name in self.node.__props__:
+                            companion_prop = self.node.__props__[companion_name]
+                            if isinstance(companion_prop.value, (list, tuple)):
+                                companion_val = list(companion_prop.value)
+
                     pval_index = 0
+                    kept_companion = []
                     # each entry in the phandle map list, is a "record" in the phandle
                     # list.
                     for rnum,record in enumerate(phandle_map):
@@ -1652,6 +1669,15 @@ class LopperProp():
                                     formatted_records.append( ",\n" )
                                 else:
                                     formatted_records.append( ";" )
+
+                            # Track kept companion entries
+                            if companion_val is not None and rnum < len(companion_val):
+                                kept_companion.append(companion_val[rnum])
+
+                    # Update companion property with kept entries
+                    # Only sync if sync_companions is True (default)
+                    if companion_prop is not None and sync_companions:
+                        companion_prop.value = kept_companion
                 else:
                     # no phandles
                     if resolver_type:
@@ -2268,9 +2294,12 @@ class LopperNode(object):
         if isinstance(val, LopperProp ):
             # we can try to assign
             self.__props__[key] = val
+            val._node = self
+            val.node = self
         else:
             np = LopperProp( key, -1, self, val, self.__dbg__ )
             self.__props__[key] = np
+            np._node = self
             self.__props__[key].resolve()
 
             # throw an exception, since this is not a valid
@@ -2471,6 +2500,85 @@ class LopperNode(object):
                     flat_list.append(sublist)
 
         return flat_list
+
+    def node_refs( self, search_tree=None, context_trees=None ):
+        """Find all properties in a tree that reference this node
+
+        Scans all properties in the search tree (or this node's tree if not
+        specified) and returns those that contain phandle references to this
+        node. This is the reverse of resolve_all_refs() - instead of finding
+        what this node references, it finds what references this node.
+
+        Args:
+            search_tree (LopperTree, optional): The tree to search for references.
+                                                If None, uses this node's tree.
+            context_trees (list, optional): Additional trees for phandle resolution.
+                                            If None, defaults to [self.tree] to enable
+                                            cross-tree reference detection (e.g., finding
+                                            base tree properties that reference overlay nodes).
+                                            Pass [] to disable cross-tree resolution.
+
+        Returns:
+            list of tuples: [(node, prop_name, companion_prop_name or None), ...]
+                           where companion_prop_name is the associated -names
+                           property if one exists (e.g., clock-names for clocks)
+        """
+        if search_tree is None:
+            if self.tree is None:
+                return []
+            search_tree = self.tree
+
+        if self.phandle is None or self.phandle <= 0:
+            return []
+
+        # Default context_trees to [self.tree] for cross-tree resolution
+        if context_trees is None:
+            context_trees = [self.tree] if self.tree else []
+
+        referencing_props = []
+
+        # Get the list of property names that can contain phandles
+        phandle_props = lopper.base.lopper_base.phandle_possible_properties()
+
+        for node in search_tree:
+            # Don't include self-references
+            if node.abs_path == self.abs_path:
+                continue
+
+            for prop in node:
+                # Skip internal/structural properties
+                if prop.name.startswith('lopper-') or prop.name == 'phandle':
+                    continue
+
+                # Only check properties that can contain phandles
+                if prop.name not in phandle_props:
+                    continue
+
+                # Use phandle_map() with context_trees to resolve phandles
+                # across trees. Non-zero entries are resolved nodes.
+                try:
+                    phandle_records = prop.phandle_map(context_trees=context_trees)
+                    if not phandle_records:
+                        continue
+
+                    # Check if any cell resolved to self
+                    found_ref = False
+                    for record in phandle_records:
+                        for cell in record:
+                            if cell != 0 and cell != "#invalid" and cell is self:
+                                found_ref = True
+                                break
+                        if found_ref:
+                            break
+
+                    if found_ref:
+                        companion = lopper.base.lopper_base.phandle_property_companion(prop.name)
+                        referencing_props.append((node, prop.name, companion))
+
+                except Exception:
+                    continue
+
+        return referencing_props
 
     def property_find(self, prop_name, inherit=True):
         """Find a property, optionally walking up the parent chain.
@@ -3509,6 +3617,7 @@ class LopperNode(object):
                     else:
                         self.__props__[prop] = LopperProp( prop, -1, self,
                                                            prop_val, self.__dbg__ )
+                        self.__props__[prop]._node = self
 
                         if dtype == LopperFmt.UINT8:
                             self.__props__[prop].binary = True
@@ -3519,7 +3628,8 @@ class LopperNode(object):
                         if node_source:
                             self._source = node_source
 
-                        self.__props__[prop].resolve( strict )
+                        # Don't sync companions during tree load - only at final output
+                        self.__props__[prop].resolve( strict, sync_companions=False )
                         self.__props__[prop].__modified__ = False
 
                         # if our node has a property of type label, we bubble it up to the node
@@ -3534,7 +3644,8 @@ class LopperNode(object):
                 # we had labels, some output strings in the properities may need to be
                 # update to reflect the new targets
                 for p in self.__props__:
-                    self.__props__[p].resolve( strict )
+                    # Don't sync companions during tree load - only at final output
+                    self.__props__[p].resolve( strict, sync_companions=False )
                     self.__props__[p].__modified__ = False
 
                 # now delete the lopper-prop-* property, we'll just run with
@@ -3551,6 +3662,7 @@ class LopperNode(object):
                 if saved_props[p].__pstate__ != "deleted":
                     self.__props__[p] = saved_props[p]
                     self.__props__[p].node = self
+                    self.__props__[p]._node = self
 
             if not self.type:
                 self.type = [ "" ]
@@ -4251,6 +4363,32 @@ class LopperTree:
         # store the parent tree, this is used for resolving
         # lables and phandles before printing
         self._external_trees.append(parent_tree)
+
+    def tree_refs( self, target_tree ):
+        """Find properties in this tree that reference nodes in target_tree
+
+        Scans all nodes in target_tree and uses each node's node_refs()
+        method to find properties in this tree that reference them. This is
+        useful for finding properties that will become invalid when target_tree
+        nodes are extracted into an overlay.
+
+        Args:
+            target_tree (LopperTree): The tree containing nodes that might
+                                      be referenced
+
+        Returns:
+            list of tuples: [(node, prop_name, companion_prop_name or None), ...]
+                           where companion_prop_name is the associated -names
+                           property if one exists (e.g., clock-names for clocks)
+        """
+        referencing_props = []
+
+        # For each node in target_tree, find properties in self that reference it
+        for target_node in target_tree:
+            refs = target_node.node_refs(self)
+            referencing_props.extend(refs)
+
+        return referencing_props
 
     def phandles( self ):
         """Utility function to get the active phandles in the tree
