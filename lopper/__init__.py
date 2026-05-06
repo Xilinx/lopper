@@ -205,6 +205,130 @@ def _extract_overlay_targets_regex(filepath):
     return targets
 
 
+def _unwrap_overlay_tree(ov_tree, base_tree):
+    """Unwrap a dtc plugin-compiled overlay tree into clean LopperNode objects.
+
+    dtc compiles &label{} overlays into:
+        /fragment@N  { target = <&label>; __overlay__ { props; children; }; }
+        /__fixups__  { label = "/fragment@N:target:0"; other = "..."; }
+
+    This function reverses that structure:
+    - Reads __fixups__ to map each fragment@N to its target label
+    - Looks up that label in base_tree to find the real abs_path
+    - Copies __overlay__ props/children onto a clean node at that path
+    - Resolves 0xffffffff phandle placeholders using __fixups__ byte-offsets
+
+    Returns a list of LopperNode objects ready for storage in overlay_subtrees.
+    Nodes whose target label cannot be resolved against base_tree are skipped
+    with a warning.
+    """
+    import copy
+
+    # --- step 1: read __fixups__ ---
+    # Map fragment path ("/fragment@0") -> target label ("mmi_dc")
+    # Map label -> list of fixup records ("node_path:prop_name:byte_offset")
+    fragment_to_label = {}   # "/fragment@0" -> "mmi_dc"
+    label_to_fixups   = {}   # "mmi_dc" -> ["/fragment@0/__overlay__:clocks:4", ...]
+
+    fixups_nodes = ov_tree.nodes('/__fixups__')
+    fixups_node  = fixups_nodes[0] if fixups_nodes else None
+
+    if fixups_node:
+        for prop in fixups_node.__props__.values():
+            label = prop.name
+            refs  = prop.value if isinstance(prop.value, list) else [prop.value]
+            for ref in refs:
+                if not isinstance(ref, str):
+                    continue
+                frag_path = ref.split(':')[0]   # "/fragment@0" or "/fragment@0/__overlay__/child"
+                # Target entry: path is exactly /fragment@N (no sub-path)
+                if frag_path.count('/') == 1 and ':target:' in ref:
+                    fragment_to_label[frag_path] = label
+                else:
+                    label_to_fixups.setdefault(label, []).append(ref)
+
+    # --- step 2: resolve label -> real phandle from base_tree ---
+    label_to_phandle = {}
+    for label in label_to_fixups:
+        nodes = base_tree.lnodes(label, exact=True)
+        if nodes and nodes[0].phandle and nodes[0].phandle > 0:
+            label_to_phandle[label] = nodes[0].phandle
+
+    # --- step 3: walk fragment@N nodes, build clean result nodes ---
+    result_nodes = []
+
+    for node in ov_tree:
+        if not node.name.startswith('fragment@'):
+            continue
+
+        frag_path = node.abs_path    # e.g. "/fragment@0"
+        label = fragment_to_label.get(frag_path)
+        if label is None:
+            continue
+
+        # Find target abs_path in base_tree
+        target_nodes = base_tree.lnodes(label, exact=True)
+        if not target_nodes:
+            lopper.log._warning(f"overlay: label '{label}' not found in base tree, skipping")
+            continue
+        target_abs_path = target_nodes[0].abs_path
+
+        # Find __overlay__ child
+        overlay_child = None
+        for child in node.child_nodes.values():
+            if child.name == '__overlay__':
+                overlay_child = child
+                break
+        if overlay_child is None:
+            continue
+
+        # Build a clean node at the target path; store the label so callers
+        # can emit &label fragments without re-querying the base tree.
+        clean_node = LopperNode(name=target_nodes[0].name)
+        clean_node.__dict__['abs_path'] = target_abs_path
+        clean_node.label = label
+
+        # Copy properties, resolving 0xffffffff placeholders
+        for prop in overlay_child.__props__.values():
+            new_prop = copy.deepcopy(prop)
+            new_prop.node = clean_node
+
+            val = new_prop.__dict__.get('value')
+            if isinstance(val, list) and 4294967295 in val:
+                val = list(val)
+                ov_node_prefix = frag_path + '/__overlay__'
+                for fix_label, fix_refs in label_to_fixups.items():
+                    ph = label_to_phandle.get(fix_label)
+                    if ph is None:
+                        continue
+                    for ref in fix_refs:
+                        try:
+                            ref_node, ref_prop, byte_off = ref.rsplit(':', 2)
+                            if ref_prop != prop.name:
+                                continue
+                            if not ref_node.startswith(ov_node_prefix):
+                                continue
+                            idx = int(byte_off) // 4
+                            if idx < len(val) and val[idx] == 4294967295:
+                                val[idx] = ph
+                        except Exception:
+                            pass
+                new_prop.__dict__['value'] = val
+
+            clean_node.__props__[prop.name] = new_prop
+
+        # Recursively copy child nodes from __overlay__
+        def _copy_children(src_node, dst_node):
+            for child in src_node.child_nodes.values():
+                child_copy = copy.deepcopy(child)
+                dst_node.add(child_copy)
+
+        _copy_children(overlay_child, clean_node)
+        result_nodes.append(clean_node)
+
+    return result_nodes
+
+
 def extract_overlay_targets_from_tree(overlay_tree):
     """Extract overlay targets by analyzing a compiled overlay tree.
 
@@ -450,6 +574,76 @@ class LopperSDT:
         self.werror = False
         self.tmpfiles = []
         self.schema = None
+
+    def _compile_overlay_subtrees(self, overlay_dts_files, include_paths):
+        """Compile each overlay DTS into a named node list for lazy merging.
+
+        Each overlay file is keyed by its filename without extension (e.g.
+        'my-overlay' for 'my-overlay.dtso').  Nodes are stored under that key
+        in self.tree._metadata['overlay_subtrees'] so callers can retrieve a
+        fully merged copy via self.tree.overlay_tree('my-overlay') without
+        modifying the base tree.
+
+        Args:
+           overlay_dts_files (list): paths to overlay DTS/DTSO files to compile
+           include_paths (list): include paths passed to dtc during compilation
+
+        Returns:
+           Nothing
+
+        """
+        if not overlay_dts_files or self.tree is None:
+            return
+
+        skip_paths = {'/', '__fixups__', '/__fixups__',
+                      '__local_fixups__', '/__local_fixups__',
+                      '__symbols__', '/__symbols__'}
+
+        for overlay_file in overlay_dts_files:
+            overlay_name = os.path.basename(overlay_file)
+            stem = os.path.splitext(overlay_name)[0]
+
+            lopper.log._info(f"Registering overlay '{stem}' from {overlay_name}")
+
+            ov_tree = compile_overlay_standalone(
+                overlay_file,
+                include_paths=include_paths,
+                tmpdir=self.tmpdir,
+                save_temps=self.save_temps
+            )
+
+            if ov_tree is None:
+                lopper.log._error(f"Could not compile overlay {overlay_name}")
+                sys.exit(1)
+
+            # Unwrap the dtc plugin structure (fragment@N/__overlay__) into
+            # clean nodes at their real target paths with phandles resolved
+            # against the base tree.  Assists see normal LopperNode objects;
+            # no knowledge of dtc's internal compilation format is needed.
+            nodes = _unwrap_overlay_tree(ov_tree, self.tree)
+            self.tree._metadata.setdefault('overlay_subtrees', {})[stem] = nodes
+
+            lopper.log._debug(f"Registered {len(nodes)} overlay nodes for '{stem}'")
+
+    def subtrees_sync(self):
+        """Populate subtrees dict from self.tree._metadata['child_trees']
+
+        Copies child trees (extracted, overlays) tracked on the main SDT tree
+        into the subtrees dict so they're accessible by name. This allows
+        assists and other code to access these trees via sdt.subtrees['name'].
+
+        Called after assists run or when subtrees dict access is needed.
+
+        Note: Operates on self.tree (the main SDT tree), not arbitrary trees.
+        """
+        if self.tree is None:
+            return
+
+        for child in self.tree._metadata.get('child_trees', []):
+            name = child._metadata.get('name')
+            if name and name not in self.subtrees:
+                self.subtrees[name] = child
+                lopper.log._debug( f"Synced subtree '{name}' from tree metadata" )
 
     def setup(self, sdt_file, input_files, include_paths, force=False, libfdt=True, config=None):
         """executes setup and initialization tasks for a system device tree
@@ -800,6 +994,11 @@ class LopperSDT:
             self.tree.resolve( check=True )
 
             self.tree.__symbols__ = self.symbols
+
+            # Compile each overlay file into a named node list so the base tree
+            # can produce a fully merged copy on demand via overlay_tree(name).
+            if overlay_dts_files:
+                self._compile_overlay_subtrees(overlay_dts_files, include_paths)
 
             # join any extended trees to the one we just created
             for t in sdt_extended_trees:

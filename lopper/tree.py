@@ -150,6 +150,102 @@ def chunks_variable(lst, chunk_sizes):
         yield chunk
         start = end
 
+def _resolve_overlay_fixups(tree, fixups_node):
+    """Patch 0xffffffff phandle placeholders left by dtc plugin compilation.
+
+    dtc compiles DTS overlay files with /plugin/ which cannot resolve label
+    references at compile time (the base tree is absent).  It instead writes
+    0xffffffff into every phandle slot and records the location of each slot in
+    the __fixups__ node as "node_path:prop_name:byte_offset" strings, keyed by
+    the label name that needs resolving.
+
+    This function walks those records, looks up each label in the already-merged
+    result tree to find its real phandle, and patches the slot in place.
+    """
+    for label, fixup_refs in fixups_node.__props__.items():
+        nodes = tree.lnodes(label, exact=True)
+        if not nodes:
+            continue
+        target_phandle = nodes[0].phandle
+        if not target_phandle or target_phandle < 0:
+            continue
+        refs = fixup_refs if isinstance(fixup_refs, list) else [fixup_refs]
+        for ref in refs:
+            try:
+                # format: "node_path:prop_name:byte_offset"
+                node_path, prop_name, byte_offset_str = ref.rsplit(':', 2)
+                byte_offset = int(byte_offset_str)
+                if node_path not in tree.__nodes__:
+                    continue
+                node = tree.__nodes__[node_path]
+                if prop_name not in node.__props__:
+                    continue
+                prop = node.__props__[prop_name]
+                val = list(prop.__dict__.get('value', []))
+                idx = byte_offset // 4
+                if idx < len(val):
+                    val[idx] = target_phandle
+                    prop.__dict__['value'] = val
+                    try:
+                        prop.resolve()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+
+def _merge_node_into_tree(tree, ov_node):
+    """Recursively merge an overlay node into a tree at ov_node.abs_path.
+
+    If the path exists in tree: replace that node's own props with the overlay
+    node's props (complete replacement at prop granularity), then recurse into
+    overlay children. Base children with no overlay counterpart are kept.
+
+    If the path does not exist: deep-copy the entire overlay subtree into tree.
+    """
+    import copy as _copy
+    try:
+        base_node = tree[ov_node.abs_path]
+    except (KeyError, Exception):
+        base_node = None
+
+    if base_node is None:
+        # copy.deepcopy on a LopperNode routes through LopperNode.__deepcopy__,
+        # which resets number=-1 and drops parent/tree backrefs — exactly right
+        # for a node being grafted into a different tree.  LopperNode.__call__()
+        # would also copy but leaves state='init' requiring a separate resolve().
+        new_node = _copy.deepcopy(ov_node)
+        tree.add(new_node, dont_sync=True)
+        # Resolve props so string_val is populated for DTS output
+        try:
+            new_node.resolve()
+        except Exception:
+            pass
+        return
+
+    # Replace / add props from overlay node into base node by writing directly
+    # into __props__.  LopperNode.merge() does something similar but routes
+    # through export()/load() which carries FDT round-trip overhead we don't
+    # need here — the result tree is an in-memory copy that never syncs to FDT.
+    # Tolerated duplication: if LopperNode.merge() is ever simplified, revisit.
+    for prop_name, prop in ov_node.__props__.items():
+        new_prop = _copy.deepcopy(prop)
+        base_node.__props__[prop_name] = new_prop
+        new_prop.node = base_node
+        try:
+            new_prop.resolve()
+        except Exception:
+            pass
+
+    # Apply deletions recorded by yaml.py for the 'delete' merge scheme
+    for prop_name in ov_node.__dict__.get('_props_to_delete', set()):
+        base_node.__props__.pop(prop_name, None)
+
+    # Recurse into overlay children; base children not in overlay pass through
+    for child in list(ov_node.child_nodes.values()):
+        _merge_node_into_tree(tree, child)
+
+
 # used in node_filter
 class LopperAction(Enum):
     """Enum class to define the actions available in Lopper's node_filter function
@@ -4032,7 +4128,15 @@ class LopperTree:
         self.phandle_resolution = True
         self.phandle_static_map = None
 
-        self._external_trees = []
+        # Unified tree metadata - tracks relationships between trees
+        self._metadata = {
+            'type': 'primary',           # 'primary' | 'extracted' | 'overlay' | 'domain'
+            'name': None,                # Name used as key in sdt.subtrees
+            'source': None,              # Path this tree was extracted/derived from
+            'parent': None,              # Tree this was extracted/derived from
+            'child_trees': [],           # Trees derived from this one
+            'external_trees': [],        # Trees to search during phandle resolution
+        }
 
         self.strict = True
         self.warnings = []
@@ -4055,6 +4159,143 @@ class LopperTree:
                    '__fdt_number__' : 0,
                    '__fdt_phandle__' : -1 }
         self.load( i_dct )
+
+    def __deepcopy__(self, memo):
+        """Deep copy a LopperTree.
+
+        Python's default deepcopy recurses through __dict__ via __reduce__,
+        which can hit recursion limits on large trees.  This override drives
+        the copy explicitly so the memo dict short-circuits cycles and keeps
+        the stack depth bounded.  Used by _build_overlay_tree() to clone the
+        base tree before merging overlay nodes into the copy.
+        """
+        import copy
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            result.__dict__[k] = copy.deepcopy(v, memo)
+        return result
+
+    @property
+    def _external_trees(self):
+        """Backward compatible property: return external_trees from metadata
+
+        This allows existing code that accesses self._external_trees to
+        continue working unchanged while we transition to unified metadata.
+
+        Returns:
+            list: Trees to search during phandle resolution
+        """
+        return self._metadata.get('external_trees', [])
+
+    @_external_trees.setter
+    def _external_trees(self, value):
+        """Backward compatible setter: set external_trees in metadata
+
+        Args:
+            value (list): Trees to set for phandle resolution
+        """
+        self._metadata['external_trees'] = value
+
+    def child_trees(self, tree_type=None):
+        """Return child trees, optionally filtered by type
+
+        Child trees are trees that were derived from this tree, such as
+        extracted nodes or overlays. They are tracked in the metadata
+        for reconstruction and verification purposes.
+
+        Args:
+            tree_type (str, optional): Filter by tree type. Valid values are
+                'extracted', 'overlay', 'domain'. If None, returns all child trees.
+
+        Returns:
+            list: List of LopperTree objects that are children of this tree
+        """
+        children = self._metadata.get('child_trees', [])
+        if tree_type:
+            return [t for t in children if t._metadata.get('type') == tree_type]
+        return children
+
+
+    def overlay_trees(self):
+        """Return all overlay trees
+
+        Overlay trees are trees that extend this tree via the overlay_of()
+        mechanism. They reference this tree for phandle resolution.
+
+        Returns:
+            list: List of LopperTree objects that are overlays of this tree
+        """
+        return self.child_trees('overlay')
+
+    def overlay_tree(self, name):
+        """Return a complete merged LopperTree for the named condition.
+
+        The result is built once (deep-copy of this tree with the named overlay
+        subtree merged in) and cached. Subsequent calls with the same name
+        return the cached tree. The base tree is never modified.
+
+        Args:
+            name: str — condition/overlay name (e.g. 'linux', 'zephyr', 'mmi_dc')
+
+        Returns:
+            LopperTree — an independent merged tree, or None if 'name' has no
+            registered overlay subtree.
+        """
+        if '_overlay_trees' not in self.__dict__:
+            self.__dict__['_overlay_trees'] = {}
+        if name not in self._overlay_trees:
+            subtrees = self._metadata.get('overlay_subtrees', {})
+            if name not in subtrees:
+                return None
+            self._overlay_trees[name] = self._build_overlay_tree(name)
+        return self._overlay_trees[name]
+
+    def _build_overlay_tree(self, name):
+        """Build a fully merged LopperTree for a named overlay condition.
+
+        Deep-copies the base tree, merges every node in
+        _metadata['overlay_subtrees'][name] into the copy using
+        _merge_node_into_tree(), resolves any dtc phandle placeholders, then
+        re-resolves the whole tree so string_val is current for DTS output.
+
+        Internal: callers should use overlay_tree(name) which wraps this with
+        lazy evaluation and caching.
+
+        Args:
+           name (str): overlay condition name (e.g. 'linux', 'my-overlay')
+
+        Returns:
+           LopperTree: a new, self-contained merged tree; base tree is unchanged
+
+        """
+        import copy
+        result = copy.deepcopy(self)
+        # Don't inherit cached overlay trees or staged overlay metadata
+        result.__dict__['_overlay_trees'] = {}
+        result._metadata.pop('overlay_subtrees', None)
+        result._metadata.pop('staged_overlays', None)
+
+        # LopperNode.__deepcopy__ intentionally clears .tree to None so that
+        # copied nodes don't accidentally mutate the source tree.  Re-wire
+        # every node in the result tree to point back to result so that
+        # prop.resolve() / tree.deref() work correctly on the copy.
+        for node in result.__nodes__.values():
+            node.tree = result
+
+        for ov_node in self._metadata.get('overlay_subtrees', {}).get(name, []):
+            _merge_node_into_tree(result, ov_node)
+
+        # Resolve phandle placeholders left by dtc plugin compilation.
+        # Plain YAML overlays have no fixups node so this is a no-op for them.
+        fixups_node = self._metadata.get('overlay_fixups', {}).get(name)
+        if fixups_node is not None:
+            _resolve_overlay_fixups(result, fixups_node)
+
+        # Re-resolve the whole tree so string_val is current for DTS output
+        result.resolve()
+        return result
 
     def __iter__(self):
         """magic method to support iteration
@@ -4133,6 +4374,13 @@ class LopperTree:
             self.__dict__[name] = value
             for n in self.__nodes__.values():
                 n.__dbg__ = value
+        elif name == "_external_trees":
+            # Route through the metadata for backward compat
+            if '_metadata' in self.__dict__:
+                self.__dict__['_metadata']['external_trees'] = value
+            else:
+                # During __init__, _metadata may not exist yet
+                self.__dict__[name] = value
         else:
             self.__dict__[name] = value
 
@@ -4501,61 +4749,41 @@ class LopperTree:
         return fragment
 
     def fragment_add_for_refs( self, overlay_tree ):
-        """Add overlay fragments for properties that reference the overlay
+        """Add overlay fragments for all cross-tree content needed by the overlay.
 
-        Scans this tree (the base tree) for properties that contain phandle
-        references to nodes in overlay_tree. For each such property, creates
-        an overlay fragment containing that property (and its companion -names
-        property if applicable) and adds it to the overlay tree.
+        Two sources of fragments are handled:
 
-        This ensures that when the overlay is applied, properties that reference
-        overlay nodes will have their complete values restored (rather than
-        having invalid phandle references stripped during output).
+        1. Phandle cross-references: scans this tree for properties containing
+           phandle references to nodes in overlay_tree.  For each such property,
+           creates a fragment with that property (and its companion -names property
+           if applicable).  This ensures properties referencing extracted PL nodes
+           remain valid when the overlay is applied.
 
-        Dangling Phandle Handling:
+        2. User overlay subtrees: walks self._metadata['overlay_subtrees'], which
+           holds clean LopperNode objects produced when lopper core compiled each
+           -i overlay file.  Each node's full set of overlay-specified props and
+           children is emitted as a &label fragment.
+
+        Dangling Phandle Handling (source 1):
             After nodes are extracted to an overlay, the base tree may contain
             properties with phandle references to those (now missing) nodes.
             This function does NOT remove those properties from the base tree.
             Instead, Lopper's write-time strict mode drops properties containing
-            invalid phandle references. The workflow is:
-
-            1. Fragment is created containing the referencing property
-            2. Base tree retains property with (now dangling) phandle
-            3. On write, Lopper drops properties with invalid phandles from base
-            4. Result: property exists only in overlay (via fragment)
-
-            When the overlay is applied, the fragment restores the property with
-            valid phandle references.
-
-        Filtering Behavior:
-            If overlay_of() is called with exclude_props that filter a fragment
-            property, the property is removed from the fragment. Since the base
-            tree's dangling reference is also dropped at write time, the property
-            is effectively discarded from both trees - this is intentional when
-            filtering is requested.
+            invalid phandle references, so the property ends up only in the
+            overlay fragment.
 
         Args:
             overlay_tree (LopperTree): The overlay tree to add fragments to.
                                        Modified in place.
 
         Returns:
-            list: List of fragment nodes that were added to overlay_tree.
-                  Empty list if no fragments were needed.
-
-        Example:
-            # After extracting /amba_pl to overlay:
-            # Find base tree props referencing overlay and add fragments
-            fragments = base_tree.fragment_add_for_refs(overlay_tree)
-            for frag in fragments:
-                print(f"Added fragment for {frag['target-path'].value[0]}")
+            list: Fragment nodes added to overlay_tree.
         """
-        # Find properties that reference the overlay
+        fragments_added = []
+
+        # --- source 1: phandle cross-references ---
         referencing = self.tree_refs(overlay_tree)
 
-        if not referencing:
-            return []
-
-        # Group by node to create one fragment per node
         node_props = {}
         for node, prop_name, companion in referencing:
             key = node.abs_path
@@ -4565,12 +4793,9 @@ class LopperTree:
             if companion:
                 node_props[key]['props'].add(companion)
 
-        # Create fragments and add to overlay
-        fragments_added = []
         for path, info in node_props.items():
             node = info['node']
             props = list(info['props'])
-
             try:
                 fragment = self.fragment_create(node, props)
                 if fragment:
@@ -4579,6 +4804,30 @@ class LopperTree:
                     lopper.log._info(f"Added overlay fragment for {node.label} with properties: {props}")
             except Exception as e:
                 lopper.log._warning(f"Failed to create overlay fragment for {node.abs_path}: {e}")
+
+        # --- source 2: user overlay subtrees (-i files) ---
+        subtrees = self._metadata.get('overlay_subtrees', {})
+        for stem, nodes in subtrees.items():
+            for ov_node in nodes:
+                if not ov_node.label:
+                    lopper.log._warning(f"overlay subtree node {ov_node.abs_path} has no label, skipping")
+                    continue
+
+                fragment_name = f"&{ov_node.label}"
+                fragment = LopperNode(name=fragment_name)
+                fragment.label = ""
+
+                for prop in ov_node.__props__.values():
+                    new_prop = copy.deepcopy(prop)
+                    new_prop.node = fragment
+                    fragment.__props__[prop.name] = new_prop
+
+                for child in ov_node.child_nodes.values():
+                    fragment.add(copy.deepcopy(child))
+
+                overlay_tree.add(fragment)
+                fragments_added.append(fragment)
+                lopper.log._info(f"Added user overlay fragment '&{ov_node.label}' from '{stem}'")
 
         return fragments_added
 
@@ -5023,6 +5272,7 @@ class LopperTree:
            node (int or LopperNode): the node to delete
            delete_fom_parent (bool): flag indicating if the node should be
                                      removed from the parent node.
+           force (bool): force deletion even if node is not resolved
 
         Returns:
            Boolean: True if deleted, False otherwise. KeyError if node is not found
@@ -5493,13 +5743,15 @@ class LopperTree:
         return matches
 
 
-    def deref( self, phandle_or_label_or_alias ):
+    def deref( self, phandle_or_label_or_alias, context_trees=None ):
         """Find a node by a phandle or label
 
         dereferences a phandle or label to find the target node.
 
         Args:
            phandle_or_label_or_alias (int or string)
+           context_trees (list, optional): Additional trees to search for resolution.
+                                           These are checked after self and _external_trees.
 
         Returns:
            LopperNode: the matching node if found, None otherwise
@@ -5508,7 +5760,9 @@ class LopperTree:
         try:
             tgn = None
             trees_to_check = [ self ] + self._external_trees
-            for t in [ self ] + self._external_trees:
+            if context_trees:
+                trees_to_check = trees_to_check + context_trees
+            for t in trees_to_check:
                 try:
                     if tgn:
                         break
