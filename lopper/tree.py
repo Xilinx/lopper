@@ -642,6 +642,32 @@ class LopperProp():
         else:
             lopper.log._debug( f"property merge: non json -> non json (clobber {clobber})" )
 
+            # If the existing property is an empty/flag DT property (ptype EMPTY) and
+            # the incoming value is from YAML bool_as_int encoding, handle DT boolean
+            # semantics: true ([1]) preserves the flag, false ([0]) removes it.
+            # If the incoming value is real data (multi-element or non-boolean), adopt
+            # it and update ptype so the property is no longer treated as a flag.
+            if self.ptype == LopperFmt.EMPTY:
+                v2 = other_prop.value
+                is_bool_true = v2 in ([1], [True], 1, True) or (isinstance(v2, list) and len(v2) == 1 and v2[0] in (1, True))
+                is_bool_false = v2 in ([0], [False], 0, False) or (isinstance(v2, list) and len(v2) == 1 and v2[0] in (0, False))
+                if is_bool_true:
+                    lopper.log._debug( f"property merge: preserving EMPTY property, incoming is boolean true" )
+                    return
+                if is_bool_false:
+                    lopper.log._debug( f"property merge: removing EMPTY property, incoming is boolean false" )
+                    if self.node and self.name in self.node.__props__:
+                        self.__pstate__ = "deleted"
+                        self.node.__props_pending_delete__[self.name] = self
+                        del self.node.__props__[self.name]
+                    return
+                # Incoming is real data (not a boolean encoding) — adopt it and
+                # update ptype so the property is no longer treated as a flag.
+                self.ptype = other_prop.ptype
+                self.__dict__["value"] = v2 if isinstance(v2, list) else [v2]
+                lopper.log._debug( f"property merge: EMPTY property replaced with real data from incoming" )
+                return
+
             # Non-JSON case handling
             value1 = self.value
             value2 = other_prop.value
