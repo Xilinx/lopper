@@ -221,6 +221,16 @@ def _merge_node_into_tree(tree, ov_node):
         base_node = None
 
     if base_node is None:
+        # Path lookup failed — the YAML may have placed the node under a bus
+        # (e.g. /axi/timer@f1e90000) but the SDT has it at a different location
+        # (e.g. /timer@f1e90000 on Versal2).  Search by node name as a fallback
+        # so conditional property overrides still reach the correct node.
+        node_name = ov_node.abs_path.rsplit('/', 1)[-1]
+        candidates = [ n for n in tree.__nodes__.values() if n.name == node_name ]
+        if len(candidates) == 1:
+            base_node = candidates[0]
+
+    if base_node is None:
         # copy.deepcopy on a LopperNode routes through LopperNode.__deepcopy__,
         # which resets number=-1 and drops parent/tree backrefs — exactly right
         # for a node being grafted into a different tree.  LopperNode.__call__()
