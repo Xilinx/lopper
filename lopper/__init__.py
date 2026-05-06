@@ -1021,6 +1021,22 @@ class LopperSDT:
 
                         self.tree = self.tree.add( node, merge=merge )
 
+                # When a YAML file contains sigil syntax (e.g. compatible!linux),
+                # to_tree() collects the conditional LopperNodes into
+                # t._metadata['overlay_subtrees'][condition_name].  Those nodes
+                # are not part of the base tree; they are kept separate so
+                # overlay_tree(name) can merge them on demand.  After joining
+                # the YAML nodes into the main DTS tree we must also copy this
+                # per-condition node registry onto the main tree, otherwise
+                # overlay_tree() won't find any overlays to apply.
+                if t._type == "yaml":
+                    yaml_cond_nodes = t._metadata.get('overlay_subtrees', {})
+                    main_cond_nodes = self.tree._metadata.setdefault('overlay_subtrees', {})
+                    for condition_name, overlay_nodes in yaml_cond_nodes.items():
+                        if condition_name not in main_cond_nodes:
+                            main_cond_nodes[condition_name] = []
+                        main_cond_nodes[condition_name].extend(overlay_nodes)
+
             fpp.close()
             self.tmpfiles.append( fpp.name )
 
