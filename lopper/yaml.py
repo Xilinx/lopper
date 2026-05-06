@@ -785,12 +785,10 @@ class LopperJSON():
                             if type(p2) == list or type(p2) == dict:
                                 use_json = True
                     elif type(props[p]) == bool:
-                        # don't encode false bool, and a true is just an empty list
+                        # boolean true always maps to an empty/flag DT property ([]);
+                        # bool_as_int only controls false encoding ([0] vs skip).
                         if props[p]:
-                            if self.boolean_as_int:
-                                props[p] = [ 1 ]
-                            else:
-                                props[p] = ['']
+                            props[p] = []
                         else:
                             if self.boolean_as_int:
                                 props[p] = [ 0 ]
@@ -860,10 +858,15 @@ class LopperJSON():
                         lp.resolve()
                     elif type(props[p]) == bool:
                         if not props[p]:
-                            _info( f"not encoding false boolean type: {clean_p}" )
-                            continue
-                        lp = LopperProp( clean_p, -1, ln, [] )
-                        lp.resolve()
+                            if self.boolean_as_int:
+                                lp = LopperProp( clean_p, -1, ln, [0] )
+                                lp.resolve()
+                            else:
+                                _info( f"not encoding false boolean type: {clean_p}" )
+                                continue
+                        else:
+                            lp = LopperProp( clean_p, -1, ln, [] )
+                            lp.resolve()
                     elif type(props[p]) == dict:
                         # we need to check if there are embedded dictionaries, and if so, expand them.
                         # since a dictionary doesn't map directly to device tree output.
