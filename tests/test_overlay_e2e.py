@@ -670,3 +670,159 @@ class TestPropsToDeleteMergeScheme:
         result_node = base['/bar']
         assert 'x' not in result_node.__props__, "'x' should be deleted"
         assert 'y' in result_node.__props__, "'y' should be preserved"
+
+
+# ---------------------------------------------------------------------------
+# Section 6: two-pass subprocess end-to-end
+#
+# Validates that overlay data embedded in the pass-1 DTS output is correctly
+# deserialized by a second lopper invocation so domain_access can activate
+# the right overlay tree via lopper,activate.
+# ---------------------------------------------------------------------------
+
+# Minimal system-top DTS used as the SDT base for two-pass tests.
+# The YAML sidecar (OPENAMP_YAML) carries the sigil data.
+TWOPASS_SYSTEM_TOP_DTS = """\
+/dts-v1/;
+
+/ {
+\t#address-cells = <0x2>;
+\t#size-cells = <0x2>;
+
+\taxi: axi {
+\t\t#address-cells = <0x2>;
+\t\t#size-cells = <0x2>;
+\t\tranges;
+
+\t\ttimer: timer@f1e90000 {
+\t\t\tcompatible = "cdns,ttc";
+\t\t\treg = <0x0 0xf1e90000 0x0 0x1000>;
+\t\t};
+\t};
+};
+"""
+
+# Sigil YAML that carries the conditional overlay and domain definitions.
+# This is fed with -i in pass 1 alongside the system-top DTS.
+TWOPASS_SIGIL_YAML = """\
+axi:
+  timer@f1e90000:
+    compatible!linux: uio
+
+domains:
+  APU_Linux:
+    compatible: openamp,domain-v1
+    lopper,activate: linux
+    cpus: 0
+  RPU1_BM:
+    compatible: openamp,domain-v1
+    cpus: 1
+"""
+
+
+@pytest.mark.skipif(
+    not os.path.exists("lopper.py"),
+    reason="lopper.py not found — must run from repo root"
+)
+class TestTwoPassSubprocess:
+    """Full two-pass lopper invocation test.
+
+    Pass 1: lopper translates system-top.dts + sigil YAML → intermediate.dts
+            (/__lopper-overlays__ embedded automatically).
+    Pass 2: lopper runs domain_access on intermediate.dts → APU_Linux.dts
+            (/__lopper-overlays__ deserialized; final output clean).
+    """
+
+    def _run(self, cmd):
+        import subprocess
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=os.getcwd())
+
+    def _setup_pass1(self, tmp_path):
+        sdt = tmp_path / "system-top.dts"
+        sdt.write_text(TWOPASS_SYSTEM_TOP_DTS)
+        yaml_file = tmp_path / "sigils.yaml"
+        yaml_file.write_text(TWOPASS_SIGIL_YAML)
+        intermediate = tmp_path / "intermediate.dts"
+
+        result = self._run([
+            "./lopper.py", "-f", "--permissive", "--enhanced",
+            "-i", str(yaml_file),
+            str(sdt), str(intermediate),
+        ])
+        return result, intermediate
+
+    def test_pass1_succeeds(self, tmp_path):
+        """Pass 1 must exit cleanly."""
+        result, _ = self._setup_pass1(tmp_path)
+        assert result.returncode == 0, \
+            f"Pass 1 failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+
+    def test_pass1_embeds_lopper_overlays(self, tmp_path):
+        """intermediate.dts must contain /__lopper-overlays__ for pass-2 consumption."""
+        result, intermediate = self._setup_pass1(tmp_path)
+        assert result.returncode == 0, f"Pass 1 failed: {result.stderr}"
+        content = intermediate.read_text()
+        assert "__lopper-overlays__" in content, \
+            "/__lopper-overlays__ missing from pass-1 output — pass 2 will have no overlay data"
+
+    def test_pass2_produces_uio_binding(self, tmp_path):
+        """Pass 2 domain_access for APU_Linux must activate the linux overlay.
+
+        The timer node's compatible must be 'uio' (from the sigil overlay),
+        not 'cdns,ttc' (the base value).
+        """
+        result, intermediate = self._setup_pass1(tmp_path)
+        assert result.returncode == 0, f"Pass 1 failed: {result.stderr}"
+
+        apu_out = tmp_path / "APU_Linux.dts"
+        result2 = self._run([
+            "./lopper.py", "-f", "--permissive",
+            str(intermediate), str(apu_out),
+            "--", "domain_access", "-t", "/domains/APU_Linux",
+        ])
+        assert result2.returncode == 0, \
+            f"Pass 2 failed:\nstdout: {result2.stdout}\nstderr: {result2.stderr}"
+
+        content = apu_out.read_text()
+        assert "uio" in content, \
+            f"uio binding missing from APU_Linux.dts — lopper,activate did not activate linux overlay\n{content[:2000]}"
+        assert "cdns,ttc" not in content, \
+            f"cdns,ttc still present in APU_Linux.dts — replace overlay not applied\n{content[:2000]}"
+
+    def test_pass2_output_has_no_lopper_overlays(self, tmp_path):
+        """Final APU_Linux.dts must not contain /__lopper-overlays__."""
+        result, intermediate = self._setup_pass1(tmp_path)
+        assert result.returncode == 0, f"Pass 1 failed: {result.stderr}"
+
+        apu_out = tmp_path / "APU_Linux.dts"
+        result2 = self._run([
+            "./lopper.py", "-f", "--permissive",
+            str(intermediate), str(apu_out),
+            "--", "domain_access", "-t", "/domains/APU_Linux",
+        ])
+        assert result2.returncode == 0, \
+            f"Pass 2 failed:\nstdout: {result2.stdout}\nstderr: {result2.stderr}"
+
+        content = apu_out.read_text()
+        assert "__lopper-overlays__" not in content, \
+            "/__lopper-overlays__ leaked into final output DTS"
+
+    def test_base_domain_has_cdns_binding(self, tmp_path):
+        """RPU1_BM (no lopper,activate) must retain the base cdns,ttc binding."""
+        result, intermediate = self._setup_pass1(tmp_path)
+        assert result.returncode == 0, f"Pass 1 failed: {result.stderr}"
+
+        rpu_out = tmp_path / "RPU1_BM.dts"
+        result2 = self._run([
+            "./lopper.py", "-f", "--permissive",
+            str(intermediate), str(rpu_out),
+            "--", "domain_access", "-t", "/domains/RPU1_BM",
+        ])
+        assert result2.returncode == 0, \
+            f"Pass 2 (RPU1_BM) failed:\nstdout: {result2.stdout}\nstderr: {result2.stderr}"
+
+        content = rpu_out.read_text()
+        assert "cdns,ttc" in content, \
+            f"cdns,ttc missing from RPU1_BM.dts — base tree was unexpectedly modified"
+        assert "uio" not in content, \
+            f"uio leaked into RPU1_BM.dts — linux overlay contaminated base domain"
