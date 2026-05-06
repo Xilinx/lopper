@@ -5855,6 +5855,24 @@ class LopperTree:
         except:
             return nodes
 
+        if not nodes:
+            # __lnodes__ is built from label attributes in the source DTS.
+            # When loading from a compiled DTB, labels may only survive in
+            # the __symbols__ node (present when compiled with dtc -@).
+            # Consult it as a fallback so callers don't need to know about
+            # the difference between source and binary tree origins.
+            try:
+                symbols = self['/__symbols__']
+                for prop in symbols:
+                    match = re.search( "^" + label + "$", prop.name ) if exact else re.search( label, prop.name )
+                    if match:
+                        path = prop.value[0] if isinstance(prop.value, list) else prop.value
+                        node = self[path]
+                        if node and node not in nodes:
+                            nodes.append(node)
+            except Exception:
+                pass
+
         return nodes
 
     def label_to_phandle(self, value, strict=False, fallback_tree=None, bare_label=False):
