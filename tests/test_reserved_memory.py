@@ -1042,13 +1042,13 @@ class TestYAMLBooleanFalseEncoding:
 
         ranges_prop = test_node.props("ranges")
         assert ranges_prop, "ranges property not found"
-        assert ranges_prop[0].value == [''], \
-            f"Expected [''] for boolean true with bool_as_int=False, got {ranges_prop[0].value!r}"
+        assert ranges_prop[0].value in ([], ['']), \
+            f"Expected empty flag value for boolean true, got {ranges_prop[0].value!r}"
 
         nomap_prop = test_node.props("no-map")
         assert nomap_prop, "no-map property not found"
-        assert nomap_prop[0].value == [''], \
-            f"Expected [''] for no-map boolean true, got {nomap_prop[0].value!r}"
+        assert nomap_prop[0].value in ([], ['']), \
+            f"Expected empty flag value for no-map boolean true, got {nomap_prop[0].value!r}"
 
     def test_bool_false_skips_property(self, tmp_path):
         """With bool_as_int=False, boolean false must not produce the property."""
@@ -1062,13 +1062,55 @@ class TestYAMLBooleanFalseEncoding:
         assert not nomap_prop, \
             "no-map property should not exist when boolean is false with bool_as_int=False"
 
-    def test_bool_true_with_bool_as_int_produces_one(self, tmp_path):
-        """With bool_as_int=True (default), boolean true produces [1]."""
+    def test_bool_true_with_bool_as_int_produces_empty(self, tmp_path):
+        """Boolean true always produces [''] regardless of bool_as_int setting.
+
+        bool_as_int only affects false encoding ([0] vs skip); true always
+        maps to an empty/flag DT property.
+        """
         yaml_content = "test-node:\n  ranges: true\n"
         tree = self._yaml_tree(tmp_path, yaml_content, boolean_as_int=True)
 
         test_node = tree["/test-node"]
         ranges_prop = test_node.props("ranges")
         assert ranges_prop, "ranges property not found"
-        assert ranges_prop[0].value == [1], \
-            f"Expected [1] for boolean true with bool_as_int=True, got {ranges_prop[0].value!r}"
+        assert ranges_prop[0].value in ([], ['']), \
+            f"Expected empty flag value for boolean true with bool_as_int=True, got {ranges_prop[0].value!r}"
+
+    def test_reserved_memory_ranges_true_no_existing_node_resolves_as_flag(self, tmp_path):
+        """Regression: serialize_json path must produce 'ranges;' not 'ranges = <0x1>;'.
+
+        When an SDT has no /reserved-memory node and the YAML introduces one
+        with 'ranges: true', the property goes through yaml.py's to_tree()
+        serialize_json path as a fresh LopperProp — bypassing the merge guard
+        in LopperProp.merge().  The bug was that the serialize_json pre-processing
+        loop left the Python bool True in place, which then became [1] inside
+        LopperProp.__setattr__, resolving to 'ranges = <0x1>;' in DTS output.
+        """
+        yaml_content = (
+            "reserved-memory:\n"
+            "  ranges: true\n"
+            "  \"#size-cells\": 2\n"
+            "  \"#address-cells\": 2\n"
+            "  cma@0:\n"
+            "    compatible: \"shared-dma-pool\"\n"
+            "    reusable: true\n"
+            "    size: 0x2DC6C00\n"
+        )
+        tree = self._yaml_tree(tmp_path, yaml_content, boolean_as_int=True)
+
+        resmem = tree["/reserved-memory"]
+        assert resmem is not None, "/reserved-memory node not found in tree"
+
+        ranges_prop = resmem.props("ranges")
+        assert ranges_prop, "'ranges' property not found under /reserved-memory"
+
+        prop = ranges_prop[0]
+        prop.resolve()
+        # Must be an empty/flag property — not [1] or [True]
+        assert prop.value in ([], ['']), \
+            f"ranges property value should be empty flag, got {prop.value!r}"
+        assert prop.string_val.strip() in ("ranges;", "ranges ;"), \
+            f"ranges resolved string should be 'ranges;', got {prop.string_val!r}"
+        assert "0x1" not in prop.string_val, \
+            f"ranges must not resolve to integer <0x1>; got {prop.string_val!r}"
