@@ -914,3 +914,161 @@ class TestReservedMemorySurvivalRules:
         assert "no_ref_region@3ef00000" in children, \
             "no_ref_region (lopper,no-ref-required) should survive in RPU output"
         dt.cleanup()
+
+
+class TestEmptyPropMergeBooleanBug:
+    """Regression tests for EMPTY property merge with boolean/real-data values.
+
+    Covers the bug where YAML 'ranges: true' (encoded as [1] via bool_as_int=True)
+    clobbered an EMPTY-typed 'ranges;' property during merge, producing
+    'ranges = <0x1>;' instead of 'ranges;' in the output.
+
+    Also covers:
+    - bool_as_int=False path: 'ranges: true' must produce [''] not None/[None]
+    - boolean false: EMPTY property should be removed when incoming is [0]
+    - real range data: EMPTY property should be replaced and ptype updated
+    """
+
+    def _make_empty_prop(self, name):
+        """Return a LopperProp with ptype EMPTY (simulating FDT zero-length load)."""
+        from lopper.fmt import LopperFmt
+        prop = LopperProp(name, value=[''])
+        prop.ptype = LopperFmt.EMPTY
+        return prop
+
+    def _make_prop(self, name, value, ptype=None):
+        """Return a LopperProp with the given value and optional ptype."""
+        from lopper.fmt import LopperFmt
+        prop = LopperProp(name, value=value)
+        if ptype is not None:
+            prop.ptype = ptype
+        return prop
+
+    def test_bool_true_int_preserves_empty_property(self):
+        """Merging [1] (bool_as_int=True encoding) into EMPTY prop preserves flag."""
+        from lopper.fmt import LopperFmt
+        base = self._make_empty_prop('ranges')
+        incoming = self._make_prop('ranges', [1])
+
+        base.merge(incoming, clobber=True)
+
+        assert base.value == [''], \
+            f"Expected [''] (flag preserved), got {base.value!r}"
+        assert base.ptype == LopperFmt.EMPTY, \
+            "ptype should remain EMPTY after boolean-true merge"
+
+    def test_bool_true_bare_preserves_empty_property(self):
+        """Merging bare True into EMPTY prop preserves flag."""
+        from lopper.fmt import LopperFmt
+        base = self._make_empty_prop('no-map')
+        incoming = self._make_prop('no-map', True)
+
+        base.merge(incoming, clobber=True)
+
+        assert base.value == [''], \
+            f"Expected [''] (flag preserved), got {base.value!r}"
+
+    def test_bool_false_int_removes_empty_property(self):
+        """Merging [0] into EMPTY prop removes the property from its node."""
+        from lopper.fmt import LopperFmt
+        node = LopperNode(-1, "/test")
+        tree = LopperTree()
+        tree.add(node)
+
+        base = self._make_empty_prop('no-map')
+        node + base
+
+        incoming = self._make_prop('no-map', [0])
+        base.merge(incoming, clobber=True)
+
+        assert 'no-map' not in node.__props__, \
+            "Property should be removed when incoming boolean is false"
+
+    def test_real_range_data_replaces_empty_and_updates_ptype(self):
+        """Merging real range values into EMPTY prop adopts value and fixes ptype."""
+        from lopper.fmt import LopperFmt
+        base = self._make_empty_prop('ranges')
+        incoming = self._make_prop('ranges', [0x0, 0x0, 0x40000000],
+                                   ptype=LopperFmt.UINT32)
+
+        base.merge(incoming, clobber=True)
+
+        assert base.value == [0x0, 0x0, 0x40000000], \
+            f"Expected real range values, got {base.value!r}"
+        assert base.ptype == LopperFmt.UINT32, \
+            "ptype should be updated to UINT32 when real data replaces EMPTY flag"
+
+    def test_empty_to_empty_merge_is_noop(self):
+        """Merging [''] (DTS flag) into EMPTY prop is a no-op."""
+        from lopper.fmt import LopperFmt
+        base = self._make_empty_prop('ranges')
+        incoming = self._make_empty_prop('ranges')
+
+        base.merge(incoming, clobber=True)
+
+        assert base.value == [''], \
+            f"Expected [''] unchanged, got {base.value!r}"
+        assert base.ptype == LopperFmt.EMPTY
+
+
+class TestYAMLBooleanFalseEncoding:
+    """Regression tests for yaml.py boolean encoding with bool_as_int=False.
+
+    When bool_as_int=False, 'flag: true' was producing None (then [None])
+    instead of [''] (the canonical EMPTY/flag representation). This caused
+    garbled output when such values reached resolve() or merge().
+    """
+
+    def _yaml_tree(self, tmp_path, yaml_content, boolean_as_int):
+        """Write yaml_content to a temp file, load with given boolean_as_int setting."""
+        from lopper.yaml import LopperYAML
+        yaml_file = str(tmp_path / "test.yaml")
+        with open(yaml_file, 'w') as f:
+            f.write(yaml_content)
+        yaml_obj = LopperYAML(yaml_file)
+        yaml_obj.boolean_as_int = boolean_as_int
+        # Re-load with the overridden setting so boolean_as_int takes effect
+        yaml_obj.dct = None
+        yaml_obj.load_yaml(yaml_file)
+        return yaml_obj.to_tree()
+
+    def test_bool_true_produces_empty_string_list(self, tmp_path):
+        """With bool_as_int=False, boolean true must produce [''] not [None]."""
+        yaml_content = "test-node:\n  ranges: true\n  no-map: true\n"
+        tree = self._yaml_tree(tmp_path, yaml_content, boolean_as_int=False)
+
+        test_node = tree["/test-node"]
+        assert test_node is not None, "/test-node not found"
+
+        ranges_prop = test_node.props("ranges")
+        assert ranges_prop, "ranges property not found"
+        assert ranges_prop[0].value == [''], \
+            f"Expected [''] for boolean true with bool_as_int=False, got {ranges_prop[0].value!r}"
+
+        nomap_prop = test_node.props("no-map")
+        assert nomap_prop, "no-map property not found"
+        assert nomap_prop[0].value == [''], \
+            f"Expected [''] for no-map boolean true, got {nomap_prop[0].value!r}"
+
+    def test_bool_false_skips_property(self, tmp_path):
+        """With bool_as_int=False, boolean false must not produce the property."""
+        yaml_content = "test-node:\n  no-map: false\n  other-prop: 42\n"
+        tree = self._yaml_tree(tmp_path, yaml_content, boolean_as_int=False)
+
+        test_node = tree["/test-node"]
+        assert test_node is not None, "/test-node not found"
+
+        nomap_prop = test_node.props("no-map")
+        assert not nomap_prop, \
+            "no-map property should not exist when boolean is false with bool_as_int=False"
+
+    def test_bool_true_with_bool_as_int_produces_one(self, tmp_path):
+        """With bool_as_int=True (default), boolean true produces [1]."""
+        yaml_content = "test-node:\n  ranges: true\n"
+        tree = self._yaml_tree(tmp_path, yaml_content, boolean_as_int=True)
+
+        test_node = tree["/test-node"]
+        ranges_prop = test_node.props("ranges")
+        assert ranges_prop, "ranges property not found"
+        assert ranges_prop[0].value == [1], \
+            f"Expected [1] for boolean true with bool_as_int=True, got {ranges_prop[0].value!r}"
