@@ -1022,9 +1022,10 @@ def openamp_remote_cpu_expand( tree, subnode, cluster_cpu, cluster_node, verbose
         if n.name == "domain-to-domain":
             n + LopperProp(name="cluster_cpu", value=cluster_cpu)
 
-    pd_prop_node = [ n for n in cluster_node.subnodes() if n.propval("power-domains") != [''] ]
-    if len(pd_prop_node) == 1:
-        subnode + LopperProp(name="rpu_pd_val", value=pd_prop_node[0].propval("power-domains"))
+    if cluster_node is not None:
+        pd_prop_node = [ n for n in cluster_node.subnodes() if n.propval("power-domains") != [''] ]
+        if len(pd_prop_node) == 1:
+            subnode + LopperProp(name="rpu_pd_val", value=pd_prop_node[0].propval("power-domains"))
 
     if cluster_node != None and "r5" in cluster_node.name:
         subnode + LopperProp(name="cpu_config_str", value="lockstep" if check_bit_set(subnode.propval("cpus")[2], 30) else "split")
@@ -1050,6 +1051,7 @@ def cpu_expand( tree, subnode, verbose = 0):
     verbose = 0
     cpus_list = []
     cluster_cpu = None
+    cluster_node = None
     for c in cpus[0]:
         # empty dict ? if so, skip
         if not c:
