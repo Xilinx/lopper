@@ -40,6 +40,76 @@ import logging
 _init( __name__ )
 _init( "yaml.py" )
 
+VALID_MERGE_SCHEMES = frozenset({"replace", "append", "prepend", "delete"})
+
+
+def _apply_scheme(new_val, existing_val, scheme):
+    """Compute a merged property value at parse time.
+
+    Args:
+        new_val:      value from the sigil-annotated YAML entry
+        existing_val: current value of the base property (may be None)
+        scheme:       "append", "prepend", "delete", "replace", or None
+
+    Returns:
+        Merged list value, or None for 'delete'.
+    """
+    nv = new_val if isinstance(new_val, list) else [new_val]
+    ev = (existing_val if isinstance(existing_val, list) else [existing_val]) if existing_val else []
+    if scheme == "append":
+        return ev + nv
+    if scheme == "prepend":
+        return nv + ev
+    if scheme == "delete":
+        return None
+    return nv  # replace or None scheme
+
+
+def _get_or_create_overlay_node(overlay_nodes, cond, base_node):
+    """Return the overlay LopperNode for cond/base_node path, creating it if absent."""
+    from lopper.tree import LopperNode as _LopperNode
+    for existing in overlay_nodes.get(cond, []):
+        if existing.abs_path == base_node.abs_path:
+            return existing
+    ov = _LopperNode(-1, base_node.name)
+    ov.abs_path = base_node.abs_path
+    overlay_nodes.setdefault(cond, []).append(ov)
+    return ov
+
+
+def _extract_sigils(key, known_overrides=None):
+    """Parse a sigil-annotated YAML key into (base_name, override_conditions, scheme).
+
+    Each '!segment' after the base name is classified independently:
+    - segment in VALID_MERGE_SCHEMES -> merge scheme (last wins if multiple)
+    - otherwise -> override/condition name
+
+    Order of segments does not matter. '!' is valid in YAML plain scalar keys
+    (only special as the first character) and is not valid in DT property/node
+    names, so there are no false positives.
+
+    Args:
+        key: raw YAML key string, e.g. "compatible!linux!replace"
+        known_overrides: optional set of known override names (for future validation)
+
+    Returns:
+        tuple: (base_name: str, override_conditions: list[str], scheme: str|None)
+    """
+    if '!' not in key:
+        return key, [], None
+    parts = key.split('!')
+    base_name, overrides, scheme = parts[0], [], None
+    for seg in parts[1:]:
+        if not seg:
+            continue
+        if seg in VALID_MERGE_SCHEMES:
+            if scheme is not None:
+                _warning(f"multiple scheme sigils on '{key}', using last: '{seg}'")
+            scheme = seg
+        else:
+            overrides.append(seg)
+    return base_name, overrides, scheme
+
 
 # Attempt to import Merger globally and use a flag for availability
 try:
@@ -659,15 +729,29 @@ class LopperJSON():
 
         excluded_props = [ "name", "fdt_name" ]
         serialize_json = True
+        overlay_nodes = {}  # {cond_name: [LopperNode, ...]}
 
         for node in PreOrderIter(self.anytree):
             if node.name == "root":
                 ln = lt["/"]
+                node_overrides = []
+                node_is_conditional = False
                 #ln = LopperNode( -1, None )
                 #ln.abs_path = "/"
             else:
-                ln = LopperNode( -1, node.name )
-                ln.abs_path = self.path( node )
+                clean_node_name, node_overrides, _ = _extract_sigils(node.name)
+                node_is_conditional = bool(node_overrides)
+
+                # rebuild abs_path using the clean name (strip sigils from each segment)
+                raw_path = self.path( node )
+                clean_path = "/".join(
+                    _extract_sigils(seg)[0] if seg else seg
+                    for seg in raw_path.split("/")
+                )
+                clean_path = clean_path if clean_path else "/"
+                ln = LopperNode( -1, clean_path )
+                ln.abs_path = clean_path
+                ln.name = clean_node_name
 
             if lopper.log._is_enabled(logging.INFO):
                 lt.__dbg__ = 4
@@ -675,12 +759,19 @@ class LopperJSON():
 
             ln._source = "yaml"
 
-            # add the node to the tree
-            lt = lt + ln
+            if node_is_conditional:
+                # conditional nodes are staged as overlays, not added to the base tree
+                pass
+            else:
+                # add the node to the tree
+                lt = lt + ln
 
             props = self.props( node )
             for p in props:
                 _debug( f" prop: {p} ({props[p]})" )
+
+                clean_p, prop_overrides, merge_scheme = _extract_sigils(p)
+                prop_is_conditional = bool(prop_overrides)
 
                 if serialize_json:
                     use_json = False
@@ -717,47 +808,107 @@ class LopperJSON():
                         x = props[p]
 
                     if not skip:
-                        if not p in excluded_props:
-                            lp = LopperProp( p, -1, ln, x )
+                        if not clean_p in excluded_props:
+                            lp = LopperProp( clean_p, -1, ln, x )
                             if use_json:
                                 lp.pclass = "json"
 
                             lp.resolve()
-                            # add the property to the node
-                            ln + lp
+
+                            if prop_is_conditional and not node_is_conditional:
+                                for cond in prop_overrides:
+                                    base_val = ln.__props__[clean_p].value if clean_p in ln.__props__ else []
+                                    final_val = _apply_scheme(lp.value, base_val, merge_scheme)
+                                    if final_val is None:
+                                        ov_node = _get_or_create_overlay_node(overlay_nodes, cond, ln)
+                                        ov_node.__dict__.setdefault('_props_to_delete', set()).add(clean_p)
+                                    else:
+                                        ov_node = _get_or_create_overlay_node(overlay_nodes, cond, ln)
+                                        ov_prop = LopperProp(clean_p, -1, ov_node, x if final_val == lp.value else (final_val if use_json else final_val))
+                                        if use_json:
+                                            ov_prop.pclass = "json"
+                                        ov_prop.__dict__['value'] = final_val
+                                        ov_prop.resolve()
+                                        ov_node + ov_prop
+                            else:
+                                # add the property to the node (including when node_is_conditional:
+                                # props are collected onto ln and the whole node is staged below).
+                                # If a merge_scheme is set with no condition, apply it immediately
+                                # against the existing prop value (scheme-only sigil).
+                                if merge_scheme and not prop_overrides and clean_p in ln.__props__:
+                                    existing = ln.__props__[clean_p]
+                                    ev = existing.__dict__.get('value', [])
+                                    merged = _apply_scheme(lp.value, ev, merge_scheme)
+                                    if merged is None:
+                                        ln - existing
+                                    else:
+                                        existing.__dict__['value'] = merged
+                                        existing.resolve()
+                                else:
+                                    ln + lp
 
                             # if this is a label property, bubble it up to the node
                             # Supports both lopper-label-* (generated) and simpler 'label:' syntax
-                            if re.search(r'lopper-label.*', p) or p == 'label':
+                            if re.search(r'lopper-label.*', clean_p) or clean_p == 'label':
                                 ln.label_set(lp.value[0] if isinstance(lp.value, list) else lp.value)
                 else:
                     if type(props[p]) == list:
                         # we need to check if there are embedded dictionaries, and if so, expand them.
                         # since a dictionary doesn't map directly to device tree output.
                         prop_list = self.prop_expand( props[p] )
-                        lp = LopperProp( p, -1, ln, prop_list )
+                        lp = LopperProp( clean_p, -1, ln, prop_list )
                         lp.resolve()
-                        ln + lp
                     elif type(props[p]) == bool:
-                        if props[p]:
-                            lp = LopperProp( p, -1, ln, [] )
-                            lp.resolve()
-                            # add the prop the node
-                            ln + lp
-                        else:
-                            _info( f"not encoding false boolean type: {p}" )
+                        if not props[p]:
+                            _info( f"not encoding false boolean type: {clean_p}" )
+                            continue
+                        lp = LopperProp( clean_p, -1, ln, [] )
+                        lp.resolve()
                     elif type(props[p]) == dict:
                         # we need to check if there are embedded dictionaries, and if so, expand them.
                         # since a dictionary doesn't map directly to device tree output.
                         prop_list = self.prop_expand( props[p] )
-                        lp = LopperProp( p, -1, ln, prop_list )
+                        lp = LopperProp( clean_p, -1, ln, prop_list )
                         lp.resolve()
-                        ln + lp
                     else:
-                        if not p in excluded_props:
-                            lp = LopperProp( p, -1, ln, props[p] )
-                            lp.resolve()
-                            ln + lp
+                        if clean_p in excluded_props:
+                            continue
+                        lp = LopperProp( clean_p, -1, ln, props[p] )
+                        lp.resolve()
+
+                    if prop_is_conditional and not node_is_conditional:
+                        for cond in prop_overrides:
+                            base_val = ln.__props__[clean_p].value if clean_p in ln.__props__ else []
+                            final_val = _apply_scheme(lp.value, base_val, merge_scheme)
+                            if final_val is None:
+                                ov_node = _get_or_create_overlay_node(overlay_nodes, cond, ln)
+                                ov_node.__dict__.setdefault('_props_to_delete', set()).add(clean_p)
+                            else:
+                                ov_node = _get_or_create_overlay_node(overlay_nodes, cond, ln)
+                                ov_prop = LopperProp(clean_p, -1, ov_node, final_val)
+                                ov_prop.__dict__['value'] = final_val
+                                ov_prop.resolve()
+                                ov_node + ov_prop
+                    elif merge_scheme and not prop_overrides and not node_is_conditional and clean_p in ln.__props__:
+                        existing = ln.__props__[clean_p]
+                        ev = existing.__dict__.get('value', [])
+                        merged = _apply_scheme(lp.value, ev, merge_scheme)
+                        if merged is None:
+                            ln - existing
+                        else:
+                            existing.__dict__['value'] = merged
+                            existing.resolve()
+                    else:
+                        ln + lp
+
+            # collect conditional nodes after all their properties have been gathered
+            if node_is_conditional:
+                for cond in node_overrides:
+                    overlay_nodes.setdefault(cond, []).append(ln)
+
+        # Register collected overlay subtrees on the tree
+        for cond_name, nodes in overlay_nodes.items():
+            lt._metadata.setdefault('overlay_subtrees', {})[cond_name] = nodes
 
         lt.resolve()
 
