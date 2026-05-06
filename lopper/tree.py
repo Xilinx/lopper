@@ -4346,7 +4346,22 @@ class LopperTree:
                                 node_string="node:" + node_string
                                 lopper.log._warning( node_string )
 
-    def overlay_of( self, parent_tree ):
+    def overlay_of( self, parent_tree, name=None, exclude_props=None, exclude_nodes=None ):
+        """Make this tree an overlay of parent_tree
+
+        Sets up this tree to be an overlay that extends parent_tree. The overlay
+        will use parent_tree for phandle resolution and will be registered as a
+        child tree of parent_tree for tracking purposes.
+
+        Args:
+            parent_tree (LopperTree): The base tree this overlays
+            name (str, optional): Name for tracking in sdt.subtrees. If None,
+                                  generates a name like 'overlay_1'
+            exclude_props (list, optional): List of property names to remove from
+                                           overlay (e.g., ['address-map', 'interrupt-map'])
+            exclude_nodes (list, optional): List of node paths/patterns to remove
+                                           from overlay
+        """
         # we are becoming an overlay_of the passed tree
         self._type = "dts_overlay"
 
@@ -4361,8 +4376,44 @@ class LopperTree:
             del n.__props__['phandle']
 
         # store the parent tree, this is used for resolving
-        # lables and phandles before printing
-        self._external_trees.append(parent_tree)
+        # labels and phandles before printing
+        self._metadata['external_trees'].append(parent_tree)
+
+        # Set metadata for this overlay
+        if name is None:
+            name = f"overlay_{len(parent_tree._metadata.get('child_trees', [])) + 1}"
+
+        self._metadata['type'] = 'overlay'
+        self._metadata['name'] = name
+        self._metadata['parent'] = parent_tree
+
+        # Register with parent (for tracking, NOT resolution)
+        if self not in parent_tree._metadata.get('child_trees', []):
+            parent_tree._metadata['child_trees'].append(self)
+            lopper.log._debug( f"Registered overlay '{name}' with parent tree" )
+
+        # Auto-generate fragments for base tree properties that reference overlay nodes
+        # This ensures cross-tree references remain valid when the overlay is applied
+        # Done BEFORE filtering so exclude_props/exclude_nodes can filter fragment content too
+        auto_fragments = parent_tree.fragment_add_for_refs(self)
+        self._metadata['auto_fragments'] = auto_fragments
+        if auto_fragments:
+            lopper.log._debug( f"Auto-generated {len(auto_fragments)} fragment(s) for cross-tree references" )
+
+        # Apply property filtering if requested (runs after fragment generation)
+        if exclude_props:
+            for node in self:
+                for prop_name in exclude_props:
+                    if prop_name in node.__props__:
+                        del node.__props__[prop_name]
+                        lopper.log._debug( f"Removed property '{prop_name}' from {node.abs_path}" )
+
+        # Apply node filtering if requested (runs after fragment generation)
+        if exclude_nodes:
+            for pattern in exclude_nodes:
+                for node in list(self.nodes(pattern)):
+                    self.delete(node)
+                    lopper.log._debug( f"Removed node {node.abs_path} matching pattern '{pattern}'" )
 
     def tree_refs( self, target_tree ):
         """Find properties in this tree that reference nodes in target_tree
@@ -4389,6 +4440,232 @@ class LopperTree:
             referencing_props.extend(refs)
 
         return referencing_props
+
+    def fragment_create( self, source_node, property_names, include_companions=True ):
+        """Create an overlay fragment node with only specified properties
+
+        Creates an overlay fragment (a node using &label syntax) containing
+        only the specified properties from the source node. This is used to
+        create partial overlays where only certain properties need to override
+        the base tree.
+
+        Args:
+            source_node (LopperNode): The node to extract properties from
+            property_names (list): List of property names to include
+            include_companions (bool): If True, automatically include companion
+                                       -names properties (e.g., clock-names
+                                       when clocks is specified)
+
+        Returns:
+            LopperNode: The created fragment node, or None if source_node has
+                        no label or no properties were found
+
+        Example:
+            # Create fragment: &mmi_dc { clocks = <...>; clock-names = "..."; };
+            fragment = tree.fragment_create(mmi_dc_node, ["clocks"])
+        """
+        if not source_node.label:
+            lopper.log._warning(f"Node {source_node.abs_path} has no label, cannot create overlay fragment")
+            return None
+
+        # Expand property list to include companions
+        all_props = set(property_names)
+        if include_companions:
+            for prop_name in property_names:
+                companion = lopper.base.lopper_base.phandle_property_companion(prop_name)
+                if companion:
+                    all_props.add(companion)
+
+        # Create fragment node with reference name
+        fragment_name = "&" + source_node.label
+        fragment = LopperNode(name=fragment_name)
+        fragment.label = ""  # Fragment itself doesn't need a label
+
+        props_added = 0
+        for prop_name in all_props:
+            try:
+                prop = source_node[prop_name]
+                if prop:
+                    # Use deepcopy which handles property copying correctly
+                    # (uses __dict__ assignment to avoid triggering resolution)
+                    new_prop = copy.deepcopy(prop)
+                    new_prop.node = fragment
+                    fragment.__props__[prop_name] = new_prop
+                    props_added += 1
+            except (KeyError, TypeError):
+                pass
+
+        if props_added == 0:
+            return None
+
+        return fragment
+
+    def fragment_add_for_refs( self, overlay_tree ):
+        """Add overlay fragments for properties that reference the overlay
+
+        Scans this tree (the base tree) for properties that contain phandle
+        references to nodes in overlay_tree. For each such property, creates
+        an overlay fragment containing that property (and its companion -names
+        property if applicable) and adds it to the overlay tree.
+
+        This ensures that when the overlay is applied, properties that reference
+        overlay nodes will have their complete values restored (rather than
+        having invalid phandle references stripped during output).
+
+        Dangling Phandle Handling:
+            After nodes are extracted to an overlay, the base tree may contain
+            properties with phandle references to those (now missing) nodes.
+            This function does NOT remove those properties from the base tree.
+            Instead, Lopper's write-time strict mode drops properties containing
+            invalid phandle references. The workflow is:
+
+            1. Fragment is created containing the referencing property
+            2. Base tree retains property with (now dangling) phandle
+            3. On write, Lopper drops properties with invalid phandles from base
+            4. Result: property exists only in overlay (via fragment)
+
+            When the overlay is applied, the fragment restores the property with
+            valid phandle references.
+
+        Filtering Behavior:
+            If overlay_of() is called with exclude_props that filter a fragment
+            property, the property is removed from the fragment. Since the base
+            tree's dangling reference is also dropped at write time, the property
+            is effectively discarded from both trees - this is intentional when
+            filtering is requested.
+
+        Args:
+            overlay_tree (LopperTree): The overlay tree to add fragments to.
+                                       Modified in place.
+
+        Returns:
+            list: List of fragment nodes that were added to overlay_tree.
+                  Empty list if no fragments were needed.
+
+        Example:
+            # After extracting /amba_pl to overlay:
+            # Find base tree props referencing overlay and add fragments
+            fragments = base_tree.fragment_add_for_refs(overlay_tree)
+            for frag in fragments:
+                print(f"Added fragment for {frag['target-path'].value[0]}")
+        """
+        # Find properties that reference the overlay
+        referencing = self.tree_refs(overlay_tree)
+
+        if not referencing:
+            return []
+
+        # Group by node to create one fragment per node
+        node_props = {}
+        for node, prop_name, companion in referencing:
+            key = node.abs_path
+            if key not in node_props:
+                node_props[key] = {'node': node, 'props': set()}
+            node_props[key]['props'].add(prop_name)
+            if companion:
+                node_props[key]['props'].add(companion)
+
+        # Create fragments and add to overlay
+        fragments_added = []
+        for path, info in node_props.items():
+            node = info['node']
+            props = list(info['props'])
+
+            try:
+                fragment = self.fragment_create(node, props)
+                if fragment:
+                    overlay_tree.add(fragment)
+                    fragments_added.append(fragment)
+                    lopper.log._info(f"Added overlay fragment for {node.label} with properties: {props}")
+            except Exception as e:
+                lopper.log._warning(f"Failed to create overlay fragment for {node.abs_path}: {e}")
+
+        return fragments_added
+
+    def tree_refs( self, target_tree ):
+        """Find properties in this tree that reference nodes in target_tree
+
+        Scans all nodes in target_tree and uses each node's node_refs()
+        method to find properties in this tree that reference them. This is
+        useful for finding properties that will become invalid when target_tree
+        nodes are extracted into an overlay.
+
+        Args:
+            target_tree (LopperTree): The tree containing nodes that might
+                                      be referenced
+
+        Returns:
+            list of tuples: [(node, prop_name, companion_prop_name or None), ...]
+                           where companion_prop_name is the associated -names
+                           property if one exists (e.g., clock-names for clocks)
+        """
+        referencing_props = []
+
+        # For each node in target_tree, find properties in self that reference it
+        for target_node in target_tree:
+            refs = target_node.node_refs(self)
+            referencing_props.extend(refs)
+
+        return referencing_props
+
+    def fragment_create( self, source_node, property_names, include_companions=True ):
+        """Create an overlay fragment node with only specified properties
+
+        Creates an overlay fragment (a node using &label syntax) containing
+        only the specified properties from the source node. This is used to
+        create partial overlays where only certain properties need to override
+        the base tree.
+
+        Args:
+            source_node (LopperNode): The node to extract properties from
+            property_names (list): List of property names to include
+            include_companions (bool): If True, automatically include companion
+                                       -names properties (e.g., clock-names
+                                       when clocks is specified)
+
+        Returns:
+            LopperNode: The created fragment node, or None if source_node has
+                        no label or no properties were found
+
+        Example:
+            # Create fragment: &mmi_dc { clocks = <...>; clock-names = "..."; };
+            fragment = tree.fragment_create(mmi_dc_node, ["clocks"])
+        """
+        if not source_node.label:
+            lopper.log._warning(f"Node {source_node.abs_path} has no label, cannot create overlay fragment")
+            return None
+
+        # Expand property list to include companions
+        all_props = set(property_names)
+        if include_companions:
+            for prop_name in property_names:
+                companion = lopper.base.lopper_base.phandle_property_companion(prop_name)
+                if companion:
+                    all_props.add(companion)
+
+        # Create fragment node with reference name
+        fragment_name = "&" + source_node.label
+        fragment = LopperNode(name=fragment_name)
+        fragment.label = ""  # Fragment itself doesn't need a label
+
+        props_added = 0
+        for prop_name in all_props:
+            try:
+                prop = source_node[prop_name]
+                if prop:
+                    # Use deepcopy which handles property copying correctly
+                    # (uses __dict__ assignment to avoid triggering resolution)
+                    new_prop = copy.deepcopy(prop)
+                    new_prop.node = fragment
+                    fragment.__props__[prop_name] = new_prop
+                    props_added += 1
+            except (KeyError, TypeError):
+                pass
+
+        if props_added == 0:
+            return None
+
+        return fragment
 
     def phandles( self ):
         """Utility function to get the active phandles in the tree
