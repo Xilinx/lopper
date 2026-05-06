@@ -11,6 +11,9 @@ Tests cover:
 - Conditional node staging (chosen!linux:, chosen!zephyr:)
 - overlay_tree() producing correct merged tree for each OS
 - Outputs for linux and zephyr are different in the expected ways
+- Sigils on real device nodes (not under /domains/) — the "openamp pattern"
+  where compatible!linux replaces a driver binding for one domain while
+  other domains see the base value unchanged
 """
 
 import io
@@ -324,3 +327,148 @@ class TestDTSOutputDiffers:
     def test_zephyr_dts_appended_bootargs(self, tmp_path):
         out = self._overlay_dts(tmp_path, "zephyr")
         assert "CONFIG_DEBUG=y" in out, "zephyr appended bootargs not in DTS output"
+
+
+# ---------------------------------------------------------------------------
+# Section 4: "OpenAMP pattern" — sigils on real device nodes, not /domains/
+#
+# A property override (e.g. compatible!linux) lives at the actual device node
+# in the tree (e.g. /axi/timer@f1e90000).  Domains select which overlay is
+# active via lopper,activate.  Domains without lopper,activate see the base
+# value.  This is the typical use case for per-OS driver-binding overrides.
+# ---------------------------------------------------------------------------
+
+# YAML representing a minimal multi-domain SDT where a device node carries
+# a sigil-annotated property:
+#
+#   /axi/timer@f1e90000:
+#     compatible: cdns,ttc          (base — all domains that don't activate linux)
+#     compatible!linux: uio         (linux overlay replaces it)
+#
+#   /domains/APU_Linux:
+#     lopper,activate: linux        → domain_access selects overlay_tree('linux')
+#
+#   /domains/RPU1_BM:
+#     (no lopper,activate)          → domain_access uses the base tree
+
+OPENAMP_YAML = """\
+axi:
+  timer@f1e90000:
+    compatible: cdns,ttc
+    compatible!linux: uio
+    reg: 0xf1e90000 0x1000
+
+domains:
+  APU_Linux:
+    compatible: openamp,domain-v1
+    lopper,activate: linux
+    cpus: 0
+  RPU1_BM:
+    compatible: openamp,domain-v1
+    cpus: 1
+"""
+
+
+@pytest.fixture(scope="module")
+def openamp_tree(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("openamp_sigil")
+    yaml_file = tmp / "sdt.yaml"
+    yaml_file.write_text(OPENAMP_YAML)
+    y = LopperYAML(str(yaml_file))
+    tree = y.to_tree()
+    assert tree is not None
+    return tree
+
+
+class TestOpenAMPPattern:
+    """Sigils on real device nodes, not /domains/ — per-domain driver binding."""
+
+    def _fresh_tree(self, tmp_path):
+        yaml_file = tmp_path / "sdt.yaml"
+        yaml_file.write_text(OPENAMP_YAML)
+        return LopperYAML(str(yaml_file)).to_tree()
+
+    def test_base_timer_compatible_is_cdns(self, openamp_tree):
+        """Base tree must have the vendor-neutral cdns,ttc binding."""
+        n = openamp_tree["/axi/timer@f1e90000"]
+        val = n.propval("compatible")
+        assert "cdns,ttc" in (val if isinstance(val, list) else [val]), \
+            f"expected cdns,ttc in base tree, got: {val}"
+
+    def test_linux_overlay_subtree_registered(self, openamp_tree):
+        """overlay_subtrees must have a 'linux' entry from the device-node sigil."""
+        subtrees = openamp_tree._metadata.get("overlay_subtrees", {})
+        assert "linux" in subtrees, \
+            f"linux missing from overlay_subtrees keys: {list(subtrees)}"
+
+    def test_linux_overlay_timer_path_in_subtree(self, openamp_tree):
+        """The overlay node for linux must refer to the timer path."""
+        subtrees = openamp_tree._metadata.get("overlay_subtrees", {})
+        linux_nodes = subtrees.get("linux", [])
+        paths = [n.abs_path for n in linux_nodes]
+        assert any("timer" in p for p in paths), \
+            f"timer not found in linux overlay_subtrees: {paths}"
+
+    def test_linux_overlay_tree_replaces_compatible(self, tmp_path):
+        """overlay_tree('linux') must expose uio, not cdns,ttc."""
+        tree = self._fresh_tree(tmp_path)
+        lt = tree.overlay_tree("linux")
+        assert lt is not None, "overlay_tree('linux') returned None"
+        n = lt["/axi/timer@f1e90000"]
+        val = n.propval("compatible")
+        val_list = val if isinstance(val, list) else [val]
+        assert "uio" in val_list, \
+            f"uio missing from linux overlay_tree compatible: {val}"
+        assert "cdns,ttc" not in val_list, \
+            f"cdns,ttc still present after linux replace: {val}"
+
+    def test_base_tree_timer_unchanged_after_overlay(self, tmp_path):
+        """Building overlay_tree('linux') must not mutate the base tree."""
+        tree = self._fresh_tree(tmp_path)
+        _ = tree.overlay_tree("linux")
+        n = tree["/axi/timer@f1e90000"]
+        val = n.propval("compatible")
+        assert "cdns,ttc" in (val if isinstance(val, list) else [val]), \
+            f"base tree was mutated: {val}"
+        assert "uio" not in (val if isinstance(val, list) else [val]), \
+            f"uio leaked into base tree: {val}"
+
+    def test_bm_domain_has_no_lopper_activate(self, openamp_tree):
+        """RPU1_BM must not carry lopper,activate — it uses the base tree."""
+        n = openamp_tree["/domains/RPU1_BM"]
+        val = n.propval("lopper,activate")
+        assert val in (None, [""], ""), \
+            f"RPU1_BM unexpectedly has lopper,activate: {val}"
+
+    def test_apu_domain_has_lopper_activate_linux(self, openamp_tree):
+        """APU_Linux must carry lopper,activate = linux."""
+        n = openamp_tree["/domains/APU_Linux"]
+        val = n.propval("lopper,activate")
+        assert "linux" in (val if isinstance(val, list) else [val]), \
+            f"APU_Linux lopper,activate wrong: {val}"
+
+    def test_linux_overlay_does_not_create_unknown_key(self, tmp_path):
+        """overlay_tree('nonexistent') must return None."""
+        tree = self._fresh_tree(tmp_path)
+        assert tree.overlay_tree("nonexistent") is None
+
+    def test_dts_output_linux_has_uio(self, tmp_path):
+        """DTS output for linux overlay must contain uio binding."""
+        import io
+        tree = self._fresh_tree(tmp_path)
+        lt = tree.overlay_tree("linux")
+        buf = io.StringIO()
+        lt["/"].print(buf)
+        out = buf.getvalue()
+        assert "uio" in out, f"uio not in linux DTS output"
+        assert "cdns,ttc" not in out, \
+            f"cdns,ttc still in linux DTS output (replace failed)"
+
+    def test_dts_output_base_has_cdns(self, tmp_path):
+        """DTS output for base tree must contain cdns,ttc binding."""
+        import io
+        tree = self._fresh_tree(tmp_path)
+        buf = io.StringIO()
+        tree["/"].print(buf)
+        out = buf.getvalue()
+        assert "cdns,ttc" in out, f"cdns,ttc not in base DTS output"
