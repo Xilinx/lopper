@@ -17,6 +17,7 @@ import contextlib
 from importlib.machinery import SourceFileLoader
 import tempfile
 from collections import OrderedDict
+import json
 
 from lopper.fmt import LopperFmt
 from lopper.fdt import LopperFDT
@@ -87,6 +88,693 @@ class LopperAssist:
         # holds specific key,value properties
         self.properties = properties_dict
 
+
+def is_overlay_file(filepath):
+    """Check if a DTS file contains overlay syntax (&label { }).
+
+    Overlay files modify existing nodes using label references like
+    &mmi_dc { status = "okay"; }. This function detects such patterns
+    to identify files that should be tracked for source tagging.
+
+    Args:
+        filepath: Path to the DTS/DTSI file to check
+
+    Returns:
+        bool: True if file contains overlay syntax, False otherwise
+    """
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read()
+            # Look for &label { pattern indicating overlay modification
+            # Must have & followed by identifier and opening brace
+            return bool(re.search(r'&\w+\s*\{', content))
+    except Exception:
+        return False
+
+
+def _extract_overlay_targets_regex(filepath):
+    """Extract overlay targets using a brace-counting parser (fallback method).
+
+    Used when compiled tree analysis is not possible (e.g., during early
+    setup before full SDT is loaded, or when dtc is unavailable).
+
+    Handles arbitrarily nested child nodes inside &label { } blocks by
+    counting braces rather than using a fixed-depth regex.
+
+    Args:
+        filepath: Path to the overlay DTS/DTSI file
+
+    Returns:
+        dict: Mapping of label names to a dict with keys:
+              'props'    - list of direct property names on the overlay target
+              'children' - list of direct child node names added by the overlay
+              Example: {'mmi_dc': {'props': ['status', 'clocks'],
+                                   'children': ['ports']}}
+    """
+    targets = {}
+
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read()
+
+        # Find the start of each &label { block using a simple scan
+        label_re = re.compile(r'&(\w+)\s*\{', re.DOTALL)
+        prop_re = re.compile(r'^([a-zA-Z][a-zA-Z0-9,._+#-]*)\s*[=;]')
+        child_re = re.compile(r'^([a-zA-Z][a-zA-Z0-9,._+#-]*)\s*\{')
+
+        for m in label_re.finditer(content):
+            label = m.group(1)
+            # Walk forward counting braces to find the matching closing brace
+            pos = m.end()   # just past the opening '{'
+            depth = 1
+            block_start = pos
+            block_end = pos
+            while pos < len(content) and depth > 0:
+                ch = content[pos]
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        block_end = pos
+                pos += 1
+
+            block = content[block_start:block_end]
+
+            # Parse direct properties and direct child nodes at depth=1
+            # We need to skip over nested blocks when looking for properties
+            props = []
+            children = []
+            inner_pos = 0
+            inner_depth = 0
+            line_buf = []
+            while inner_pos < len(block):
+                ch = block[inner_pos]
+                if ch == '{':
+                    if inner_depth == 0:
+                        # The text in line_buf is the child node name line
+                        child_line = ''.join(line_buf).strip()
+                        child_m = child_re.match(child_line)
+                        if child_m:
+                            children.append(child_m.group(1))
+                        line_buf = []
+                    inner_depth += 1
+                elif ch == '}':
+                    inner_depth -= 1
+                    line_buf = []
+                elif ch == '\n':
+                    if inner_depth == 0:
+                        line = ''.join(line_buf).strip()
+                        prop_m = prop_re.match(line)
+                        if prop_m:
+                            props.append(prop_m.group(1))
+                    line_buf = []
+                else:
+                    if inner_depth == 0:
+                        line_buf.append(ch)
+                inner_pos += 1
+
+            if label in targets:
+                targets[label]['props'].extend(props)
+                targets[label]['children'].extend(children)
+            else:
+                targets[label] = {'props': props, 'children': children}
+
+    except Exception as e:
+        lopper.log._warning(f"Failed to extract overlay targets from {filepath}: {e}")
+
+    return targets
+
+
+def _unwrap_overlay_tree(ov_tree, base_tree):
+    """Unwrap a dtc plugin-compiled overlay tree into clean LopperNode objects.
+
+    dtc compiles &label{} overlays into:
+        /fragment@N  { target = <&label>; __overlay__ { props; children; }; }
+        /__fixups__  { label = "/fragment@N:target:0"; other = "..."; }
+
+    This function reverses that structure:
+    - Reads __fixups__ to map each fragment@N to its target label
+    - Looks up that label in base_tree to find the real abs_path
+    - Copies __overlay__ props/children onto a clean node at that path
+    - Resolves 0xffffffff phandle placeholders using __fixups__ byte-offsets
+
+    Returns a list of LopperNode objects ready for storage in overlay_subtrees.
+    Nodes whose target label cannot be resolved against base_tree are skipped
+    with a warning.
+    """
+    import copy
+
+    # --- step 1: read __fixups__ ---
+    # Map fragment path ("/fragment@0") -> target label ("mmi_dc")
+    # Map label -> list of fixup records ("node_path:prop_name:byte_offset")
+    fragment_to_label = {}   # "/fragment@0" -> "mmi_dc"
+    label_to_fixups   = {}   # "mmi_dc" -> ["/fragment@0/__overlay__:clocks:4", ...]
+
+    fixups_nodes = ov_tree.nodes('/__fixups__')
+    fixups_node  = fixups_nodes[0] if fixups_nodes else None
+
+    if fixups_node:
+        for prop in fixups_node.__props__.values():
+            label = prop.name
+            refs  = prop.value if isinstance(prop.value, list) else [prop.value]
+            for ref in refs:
+                if not isinstance(ref, str):
+                    continue
+                frag_path = ref.split(':')[0]   # "/fragment@0" or "/fragment@0/__overlay__/child"
+                # Target entry: path is exactly /fragment@N (no sub-path)
+                if frag_path.count('/') == 1 and ':target:' in ref:
+                    fragment_to_label[frag_path] = label
+                else:
+                    label_to_fixups.setdefault(label, []).append(ref)
+
+    # --- step 2: resolve label -> real phandle from base_tree ---
+    label_to_phandle = {}
+    for label in label_to_fixups:
+        nodes = base_tree.lnodes(label, exact=True)
+        if nodes and nodes[0].phandle and nodes[0].phandle > 0:
+            label_to_phandle[label] = nodes[0].phandle
+
+    # --- step 3: walk fragment@N nodes, build clean result nodes ---
+    result_nodes = []
+
+    for node in ov_tree:
+        if not node.name.startswith('fragment@'):
+            continue
+
+        frag_path = node.abs_path    # e.g. "/fragment@0"
+        label = fragment_to_label.get(frag_path)
+        if label is None:
+            continue
+
+        # Find target abs_path in base_tree
+        target_nodes = base_tree.lnodes(label, exact=True)
+        if not target_nodes:
+            lopper.log._warning(f"overlay: label '{label}' not found in base tree, skipping")
+            continue
+        target_abs_path = target_nodes[0].abs_path
+
+        # Find __overlay__ child
+        overlay_child = None
+        for child in node.child_nodes.values():
+            if child.name == '__overlay__':
+                overlay_child = child
+                break
+        if overlay_child is None:
+            continue
+
+        # Build a clean node at the target path; store the label so callers
+        # can emit &label fragments without re-querying the base tree.
+        clean_node = LopperNode(name=target_nodes[0].name)
+        clean_node.__dict__['abs_path'] = target_abs_path
+        clean_node.label = label
+
+        # Copy properties, resolving 0xffffffff placeholders
+        for prop in overlay_child.__props__.values():
+            new_prop = copy.deepcopy(prop)
+            new_prop.node = clean_node
+
+            val = new_prop.__dict__.get('value')
+            if isinstance(val, list) and 4294967295 in val:
+                val = list(val)
+                ov_node_prefix = frag_path + '/__overlay__'
+                for fix_label, fix_refs in label_to_fixups.items():
+                    ph = label_to_phandle.get(fix_label)
+                    if ph is None:
+                        continue
+                    for ref in fix_refs:
+                        try:
+                            ref_node, ref_prop, byte_off = ref.rsplit(':', 2)
+                            if ref_prop != prop.name:
+                                continue
+                            if not ref_node.startswith(ov_node_prefix):
+                                continue
+                            idx = int(byte_off) // 4
+                            if idx < len(val) and val[idx] == 4294967295:
+                                val[idx] = ph
+                        except Exception:
+                            pass
+                new_prop.__dict__['value'] = val
+
+            clean_node.__props__[prop.name] = new_prop
+
+        # Recursively copy child nodes from __overlay__
+        def _copy_children(src_node, dst_node):
+            for child in src_node.child_nodes.values():
+                child_copy = copy.deepcopy(child)
+                dst_node.add(child_copy)
+
+        _copy_children(overlay_child, clean_node)
+        result_nodes.append(clean_node)
+
+    return result_nodes
+
+
+def extract_overlay_targets_from_tree(overlay_tree):
+    """Extract overlay targets by analyzing a compiled overlay tree.
+
+    A dtc plugin-compiled overlay has the structure:
+
+        fragment@N { target = <&label>; __overlay__ { props; child_nodes; }; };
+        __fixups__ { label = "/fragment@N:target:0"; other_label = "..."; };
+
+    __fixups__ maps every &label reference to its location. The target
+    label for fragment@N appears as the entry whose path contains ':target:'.
+    All other entries are phandle fixups inside the overlay body.
+
+    Args:
+        overlay_tree: A LopperTree loaded from a compiled overlay DTB
+
+    Returns:
+        dict: Mapping of label name to a dict with keys:
+              'props'    - list of direct property names on the overlay target
+              'children' - list of direct child node names added by the overlay
+              Example: {'mmi_dc': {'props': ['status', 'clocks'],
+                                   'children': ['ports']}}
+
+    Note:
+        The return value is a richer type than the regex fallback.
+        Callers that only need property names should iterate result[label]['props'].
+    """
+    targets = {}
+
+    try:
+        # Build fragment-path -> target-label mapping from __fixups__ node.
+        # __fixups__ property values are strings like "/fragment@0:target:0".
+        # The target label is the property name; the fragment path precedes the first ':'.
+        fragment_to_label = {}
+        fixups_node = overlay_tree.nodes('/__fixups__')
+        if fixups_node:
+            fixups_node = fixups_node[0] if isinstance(fixups_node, list) else fixups_node
+            for prop in fixups_node.__props__.values():
+                label = prop.name
+                # prop.value may be a string or list of strings
+                val = prop.value
+                if not isinstance(val, list):
+                    val = [val]
+                for path_str in val:
+                    if not isinstance(path_str, str):
+                        continue
+                    # path_str like "/fragment@0:target:0"
+                    # or "/fragment@0/__overlay__/child:some-prop:0"
+                    frag_path = path_str.split(':')[0]   # "/fragment@0"
+                    frag_name = frag_path.strip('/')      # "fragment@0"
+                    if frag_path.count('/') == 1 and ':target:' in path_str:
+                        fragment_to_label[frag_name] = label
+                        break
+
+        # Walk each top-level fragment@N node using the tree abstraction
+        for node in overlay_tree:
+            frag_name = node.name
+            if not frag_name.startswith('fragment@'):
+                continue
+            if frag_name not in fragment_to_label:
+                continue
+
+            label = fragment_to_label[frag_name]
+
+            # Find the __overlay__ child of this fragment.
+            # child_nodes keys are full paths; search by node name.
+            overlay_node = None
+            for child_path, child in node.child_nodes.items():
+                if child.name == '__overlay__':
+                    overlay_node = child
+                    break
+            if overlay_node is None:
+                continue
+
+            # Collect direct property names from __overlay__
+            props = list(overlay_node.__props__.keys())
+
+            # Collect direct child node names from __overlay__
+            children = [child.name for child in overlay_node.child_nodes.values()]
+
+            if label in targets:
+                targets[label]['props'].extend(props)
+                targets[label]['children'].extend(children)
+            else:
+                targets[label] = {'props': props, 'children': children}
+
+    except Exception as e:
+        lopper.log._warning(f"Failed to extract overlay targets from tree: {e}")
+
+    return targets
+
+
+def compile_overlay_standalone(overlay_file, include_paths="", tmpdir=None, save_temps=False):
+    """Compile an overlay file standalone using dtc's plugin support.
+
+    Uses dtc's native overlay compilation with /plugin/ directive.
+    The overlay is compiled standalone - dtc creates __fixups__ entries
+    for unresolved labels rather than requiring the base tree.
+
+    Args:
+        overlay_file: Path to the overlay DTS/DTSI file
+        include_paths: Include paths for preprocessing
+        tmpdir: Directory for temporary files. If None, a temporary directory
+                is created and cleaned up automatically unless save_temps is set.
+        save_temps: If True, compiled artifacts are kept on disk. If False
+                    (default), a temporary directory is created and deleted
+                    after the tree is loaded.
+
+    Returns:
+        LopperTree or None: Compiled tree if successful, None on failure
+    """
+    # Only overlay files can be compiled as plugins
+    if not is_overlay_file(overlay_file):
+        return None
+
+    def _compile(work_dir):
+        overlay_basename = os.path.basename(overlay_file)
+        plugin_file = os.path.join(work_dir, f"_plugin_{overlay_basename}")
+
+        with open(overlay_file, 'r') as f:
+            content = f.read()
+
+        # Add /dts-v1/ and /plugin/ if not present
+        has_dts_v1 = '/dts-v1/' in content
+        has_plugin = '/plugin/' in content
+
+        with open(plugin_file, 'w') as f:
+            if not has_dts_v1:
+                f.write('/dts-v1/;\n')
+            if not has_plugin:
+                f.write('/plugin/;\n\n')
+            f.write(content)
+
+        overlay_dir = os.path.dirname(overlay_file)
+        full_includes = f"{include_paths} {overlay_dir}".strip()
+
+        dtb_file, _ = Lopper.dt_compile(
+            plugin_file, [], full_includes,
+            force_overwrite=True, outdir=work_dir,
+            save_temps=save_temps, verbose=0, enhanced=False,
+            permissive=True, symbols=False
+        )
+
+        if dtb_file and os.path.exists(dtb_file):
+            overlay_tree = LopperTree()
+            fdt = Lopper.dt_to_fdt(dtb_file)
+            overlay_tree.load(Lopper.export(fdt))
+            return overlay_tree
+
+        return None
+
+    try:
+        if tmpdir is not None or save_temps:
+            # Caller-supplied dir, or save_temps: no automatic cleanup
+            work_dir = tmpdir if tmpdir is not None else tempfile.mkdtemp()
+            return _compile(work_dir)
+        else:
+            with tempfile.TemporaryDirectory() as work_dir:
+                return _compile(work_dir)
+
+    except Exception as e:
+        lopper.log._debug(f"Compiled overlay analysis failed for {overlay_file}: {e}")
+
+    return None
+
+
+def extract_overlay_targets(overlay_file, include_paths="", tmpdir=None, save_temps=False):
+    """Extract which nodes and properties an overlay file targets.
+
+    Uses dtc's native plugin compilation to compile the overlay standalone,
+    then analyzes the resulting tree. Falls back to brace-counting parser if
+    compilation fails.
+
+    Args:
+        overlay_file: Path to the overlay DTS/DTSI file
+        include_paths: Include paths for preprocessing (when compiling)
+        tmpdir: Temporary directory for compilation artifacts
+
+    Returns:
+        dict: Mapping of label names to a dict with keys:
+              'props'    - list of direct property names modified by the overlay
+              'children' - list of direct child node names added by the overlay
+              Example: {'mmi_dc': {'props': ['status', 'clocks'],
+                                   'children': ['ports']}}
+    """
+    overlay_tree = compile_overlay_standalone(
+        overlay_file, include_paths, tmpdir, save_temps
+    )
+    if overlay_tree:
+        targets = extract_overlay_targets_from_tree(overlay_tree)
+        if targets:
+            lopper.log._debug(f"Used compiled analysis for {overlay_file}")
+            return targets
+
+    # Fallback to regex parsing
+    lopper.log._debug(f"Using regex fallback for {overlay_file}")
+    return _extract_overlay_targets_regex(overlay_file)
+
+
+def _serialize_overlay_node(ov_node):
+    """Encode one overlay LopperNode as a JSON-serialisable dict.
+
+    Format:
+      { "props": [[name, value], ...],
+        "delete": [prop_name, ...],
+        "children": [<recursive>, ...] }
+    """
+    props = []
+    for prop_name, prop in ov_node.__props__.items():
+        try:
+            val = prop.value
+        except Exception:
+            val = []
+        if not isinstance(val, list):
+            val = [val]
+        # Convert bytes objects so json.dumps can handle them
+        serialisable = []
+        for v in val:
+            if isinstance(v, (bytes, bytearray)):
+                serialisable.append(list(v))
+            else:
+                serialisable.append(v)
+        pclass = prop.pclass if isinstance(prop.pclass, str) else ""
+        props.append([prop_name, serialisable, pclass])
+
+    delete = list(ov_node.__dict__.get('_props_to_delete', set()))
+
+    children = []
+    for child in list(ov_node.child_nodes.values()):
+        children.append(_serialize_overlay_node(child))
+
+    return {"abs_path": ov_node.abs_path,
+            "props": props,
+            "delete": delete,
+            "children": children}
+
+
+def _deserialize_overlay_node(data, parent=None, tree=None):
+    """Reconstruct a LopperNode from the dict produced by _serialize_overlay_node."""
+    from lopper.tree import LopperNode, LopperProp
+    node = LopperNode(-1, data["abs_path"])
+    node.tree = tree
+
+    for prop_name, val, pclass in data.get("props", []):
+        lp = LopperProp(prop_name, -1, node, val)
+        if pclass:
+            lp.pclass = pclass
+        node.__props__[prop_name] = lp
+
+    to_delete = set(data.get("delete", []))
+    if to_delete:
+        node.__dict__['_props_to_delete'] = to_delete
+
+    for child_data in data.get("children", []):
+        child = _deserialize_overlay_node(child_data, parent=node, tree=tree)
+        node.child_nodes.append(child)
+
+    return node
+
+
+def _serialize_overlay_subtrees(tree, keep_embedded=False):
+    """Embed overlay_subtrees into tree as /__lopper-overlays__ before DTS output.
+
+    Each condition gets a child node; each overlay node within that condition
+    becomes a property whose name is the path-encoded abs_path and whose value
+    is a JSON string of the serialised node data.
+
+    keep_embedded: when True, re-embed even if the overlays were loaded from a
+    prior DTS embed.  Use this (via --emit-embedded-overlays) when more than
+    two passes are needed and the embed must survive each intermediate write.
+    """
+    from lopper.tree import LopperNode, LopperProp
+    overlay_subtrees = tree._metadata.get('overlay_subtrees', {})
+    if not overlay_subtrees:
+        return
+    # If overlays were loaded from a prior DTS embed they have already been
+    # consumed by this pass; do not re-embed so final output is clean —
+    # unless the caller explicitly requests persistence across extra passes.
+    if tree._metadata.get('_overlay_subtrees_from_embed') and not keep_embedded:
+        return
+
+    root_node = LopperNode(-1, '/__lopper-overlays__')
+    tree.add(root_node, dont_sync=True)
+
+    for condition_name, node_list in overlay_subtrees.items():
+        cond_node = LopperNode(-1, f'/__lopper-overlays__/{condition_name}')
+        tree.add(cond_node, dont_sync=True)
+
+        for ov_node in node_list:
+            prop_name = Lopper.path_to_prop_name(ov_node.abs_path)
+            encoded = json.dumps(_serialize_overlay_node(ov_node))
+            lp = LopperProp(prop_name, -1, cond_node, encoded)
+            cond_node.__props__[prop_name] = lp
+            # Resolve immediately so the prop has a valid ptype before print().
+            # _serialize runs after tree.resolve(), so new nodes need explicit
+            # resolution; without it they show as **unresolved** in DTS output.
+            lp.resolve(strict=False)
+
+
+def _deserialize_overlay_subtrees(tree):
+    """Reconstruct overlay_subtrees from /__lopper-overlays__ after DTS load.
+
+    After reconstruction the internal node is removed so it never appears
+    in subsequent output files.
+    """
+    if '/__lopper-overlays__' not in tree.__nodes__:
+        return
+
+    root_node = tree['/__lopper-overlays__']
+    overlay_subtrees = tree._metadata.setdefault('overlay_subtrees', {})
+
+    for cond_node in list(root_node.child_nodes.values()):
+        condition_name = cond_node.name
+        nodes_for_cond = overlay_subtrees.setdefault(condition_name, [])
+
+        for prop_name, lp in cond_node.__props__.items():
+            try:
+                data = json.loads(lp.value if isinstance(lp.value, str) else lp.value[0])
+            except Exception:
+                continue
+            abs_path = Lopper.prop_name_to_path(prop_name)
+            ov_node = _deserialize_overlay_node(data, tree=tree)
+            ov_node.__dict__['abs_path'] = abs_path
+            nodes_for_cond.append(ov_node)
+
+    # Remove the internal bookkeeping node from the tree so it never appears
+    # in subsequent output, and mark the source so _serialize_overlay_subtrees
+    # knows not to re-embed on write (overlays already consumed from DTS embed).
+    try:
+        tree.delete(root_node)
+    except Exception:
+        pass
+    tree._metadata['_overlay_subtrees_from_embed'] = True
+
+
+def _write_overlay_sidecar(tree, output_path):
+    """Distil overlay_subtrees back to a minimal sigil YAML file.
+
+    The sidecar is a valid lopper YAML input: users pass it with -i on a
+    subsequent invocation to restore overlay_subtrees.  The existing
+    LopperYAML.to_tree() sigil parser reloads it — no new deserialization.
+
+    Output path: <stem>.overlays.yaml (or <stem>.<ext>.overlays.yaml).
+    """
+    overlay_subtrees = tree._metadata.get('overlay_subtrees', {})
+    if not overlay_subtrees:
+        return
+
+    stem = Path(output_path).stem
+    parent = Path(output_path).parent
+    sidecar_path = str(parent / f"{stem}.overlays.yaml")
+
+    # Rebuild nested-dict sigil YAML from overlay nodes.
+    # Each overlay node's props become  property!condition: value  entries
+    # under the node's path hierarchy.
+    data = {}
+
+    def _set_nested(d, keys, value):
+        for k in keys[:-1]:
+            d = d.setdefault(k, {})
+        d[keys[-1]] = value
+
+    for condition_name, node_list in overlay_subtrees.items():
+        for ov_node in node_list:
+            # Reconstruct path components as nested-dict keys
+            parts = [p for p in ov_node.abs_path.split('/') if p]
+            for prop_name, lp in ov_node.__props__.items():
+                sigil_key = f"{prop_name}!{condition_name}"
+                val = lp.value
+                if isinstance(val, list) and len(val) == 1:
+                    val = val[0]
+                _set_nested(data, parts + [sigil_key], val)
+            for prop_name in ov_node.__dict__.get('_props_to_delete', set()):
+                sigil_key = f"{prop_name}!{condition_name}!delete"
+                _set_nested(data, parts + [sigil_key], None)
+
+    # Write the sidecar. Prepend a lopper-overlays: marker comment so the
+    # YAML classification logic routes this file through to_tree() as an
+    # sdt_file rather than a support_file on reload — without injecting a
+    # spurious tree node.
+    try:
+        import ruamel.yaml as _ruamel
+        import io as _io
+        _yaml_engine = _ruamel.YAML()
+        buf = _io.StringIO()
+        _yaml_engine.dump(data, buf)
+        yaml_body = buf.getvalue()
+    except Exception:
+        import yaml as _pyyaml
+        yaml_body = _pyyaml.dump(data, default_flow_style=False)
+    with open(sidecar_path, 'w') as f:
+        f.write("# lopper-overlays: generated sigil overlay sidecar\n")
+        f.write(yaml_body)
+    lopper.log._info(f"overlay sidecar written: {sidecar_path}")
+
+
+def _write_overlay_dtso_files(tree, output_path):
+    """Emit one .dtso overlay file per condition in overlay_subtrees (opt-in).
+
+    Each file is a standard DTS overlay that, when applied, reproduces the
+    conditional property overrides for that condition.  Merge schemes
+    (append/prepend/delete) are not representable in DTS overlays — the
+    output is always replace-mode.  This is documented inside the emitted file.
+
+    Output: <stem>.<condition>.dtso per condition.
+    """
+    overlay_subtrees = tree._metadata.get('overlay_subtrees', {})
+    if not overlay_subtrees:
+        return
+
+    stem = Path(output_path).stem
+    parent = Path(output_path).parent
+
+    for condition_name, node_list in overlay_subtrees.items():
+        dtso_path = str(parent / f"{stem}.{condition_name}.dtso")
+        lines = [
+            "// Auto-generated DTS overlay for condition: " + condition_name,
+            "// NOTE: merge schemes (append/prepend/delete) are not expressible in",
+            "// DTS overlays — all property overrides are replace-mode here.",
+            "/dts-v1/;",
+            "/plugin/;",
+            "",
+        ]
+        for ov_node in node_list:
+            # Emit a fragment using the node's label if available, else path
+            label = ov_node.label if hasattr(ov_node, 'label') and ov_node.label else None
+            ref = f"&{label}" if label else f"&{{  /* {ov_node.abs_path} */ }}"
+            lines.append(f"&{label or 'LABEL_UNKNOWN'} {{")
+            for prop_name, lp in ov_node.__props__.items():
+                val = lp.value
+                if isinstance(val, list) and len(val) == 1:
+                    val = val[0]
+                if isinstance(val, str):
+                    lines.append(f'\t{prop_name} = "{val}";')
+                elif isinstance(val, int):
+                    lines.append(f'\t{prop_name} = <{hex(val)}>;')
+                else:
+                    lines.append(f'\t/* {prop_name}: complex value, omitted */')
+            lines.append("};")
+            lines.append("")
+
+        with open(dtso_path, 'w') as f:
+            f.write('\n'.join(lines))
+        lopper.log._info(f"overlay dtso written: {dtso_path}")
+
+
 class LopperSDT:
     """The LopperSDT Class represents and manages the full system DTS file
 
@@ -134,6 +822,77 @@ class LopperSDT:
         self.werror = False
         self.tmpfiles = []
         self.schema = None
+        self.overlay_emit = set()
+
+    def _compile_overlay_subtrees(self, overlay_dts_files, include_paths):
+        """Compile each overlay DTS into a named node list for lazy merging.
+
+        Each overlay file is keyed by its filename without extension (e.g.
+        'my-overlay' for 'my-overlay.dtso').  Nodes are stored under that key
+        in self.tree._metadata['overlay_subtrees'] so callers can retrieve a
+        fully merged copy via self.tree.overlay_tree('my-overlay') without
+        modifying the base tree.
+
+        Args:
+           overlay_dts_files (list): paths to overlay DTS/DTSO files to compile
+           include_paths (list): include paths passed to dtc during compilation
+
+        Returns:
+           Nothing
+
+        """
+        if not overlay_dts_files or self.tree is None:
+            return
+
+        skip_paths = {'/', '__fixups__', '/__fixups__',
+                      '__local_fixups__', '/__local_fixups__',
+                      '__symbols__', '/__symbols__'}
+
+        for overlay_file in overlay_dts_files:
+            overlay_name = os.path.basename(overlay_file)
+            stem = os.path.splitext(overlay_name)[0]
+
+            lopper.log._info(f"Registering overlay '{stem}' from {overlay_name}")
+
+            ov_tree = compile_overlay_standalone(
+                overlay_file,
+                include_paths=include_paths,
+                tmpdir=self.tmpdir,
+                save_temps=self.save_temps
+            )
+
+            if ov_tree is None:
+                lopper.log._error(f"Could not compile overlay {overlay_name}")
+                sys.exit(1)
+
+            # Unwrap the dtc plugin structure (fragment@N/__overlay__) into
+            # clean nodes at their real target paths with phandles resolved
+            # against the base tree.  Assists see normal LopperNode objects;
+            # no knowledge of dtc's internal compilation format is needed.
+            nodes = _unwrap_overlay_tree(ov_tree, self.tree)
+            self.tree._metadata.setdefault('overlay_subtrees', {})[stem] = nodes
+
+            lopper.log._debug(f"Registered {len(nodes)} overlay nodes for '{stem}'")
+
+    def subtrees_sync(self):
+        """Populate subtrees dict from self.tree._metadata['child_trees']
+
+        Copies child trees (extracted, overlays) tracked on the main SDT tree
+        into the subtrees dict so they're accessible by name. This allows
+        assists and other code to access these trees via sdt.subtrees['name'].
+
+        Called after assists run or when subtrees dict access is needed.
+
+        Note: Operates on self.tree (the main SDT tree), not arbitrary trees.
+        """
+        if self.tree is None:
+            return
+
+        for child in self.tree._metadata.get('child_trees', []):
+            name = child._metadata.get('name')
+            if name and name not in self.subtrees:
+                self.subtrees[name] = child
+                lopper.log._debug( f"Synced subtree '{name}' from tree metadata" )
 
     def setup(self, sdt_file, input_files, include_paths, force=False, libfdt=True, config=None):
         """executes setup and initialization tasks for a system device tree
@@ -280,7 +1039,8 @@ class LopperSDT:
                                     found = True
                                     sdt_files.append( ifile )
                                 if re.search( r"compatible: .*subsystem", line ) or \
-                                   re.search( r",domain-v1", line ):
+                                   re.search( r",domain-v1", line ) or \
+                                   re.search( r"lopper-overlays:", line ):
                                     sdt_files.append( ifile )
                                     found = True
 
@@ -301,40 +1061,78 @@ class LopperSDT:
             # do we have any extra sdt files to concatenate first ?
             fp = ""
             fpp = tempfile.NamedTemporaryFile( delete=False )
+            overlay_dts_files = []
             # TODO: if the count is one, we shouldn't be doing the tmp file processing.
             if sdt_files:
                 sdt_files.insert( 0, self.dts )
 
-                # this block concatenates all the files into a single dts to
-                # compile
+                # Identify overlay files and extract their targets for source tracking.
+                # This allows us to tag properties that came from user overlays
+                # after the full compilation is complete.
+                #
+                # Uses compiled tree analysis when possible (per design) - compiles
+                # overlay with base SDT context for label resolution, then analyzes
+                # the resulting tree. Falls back to regex parsing if compilation fails.
+                self._overlay_targets = {}
+                for f in sdt_files:
+                    if (f.endswith(".dts") or f.endswith(".dtsi")) and f != self.dts:
+                        if is_overlay_file(f):
+                            overlay_name = os.path.basename(f)
+                            targets = extract_overlay_targets(
+                                f,
+                                include_paths=include_paths,
+                                tmpdir=self.tmpdir,
+                                save_temps=self.save_temps
+                            )
+                            if targets:
+                                self._overlay_targets[overlay_name] = targets
+                                lopper.log._debug(f"Identified overlay {overlay_name} targeting: {list(targets.keys())}")
+
+                # Separate overlay DTS files from base DTS files so that
+                # base and overlay layers can be seeded independently.
+                # Overlay files use &label { } syntax to modify existing nodes.
+                overlay_dts_files = []
+                base_dts_files = []
+                for f in sdt_files:
+                    if f.endswith(".dts") or f.endswith(".dtsi"):
+                        if f != self.dts and is_overlay_file(f):
+                            overlay_dts_files.append(f)
+                        else:
+                            base_dts_files.append(f)
+
+                # Concatenate only base DTS files into the file to compile.
+                # Overlay files will be compiled separately after the base tree
+                # is loaded so that base and overlay layers are properly seeded.
                 with open( fpp.name, 'wb') as wfd:
-                    for f in sdt_files:
-                        if f.endswith(".dts") or f.endswith(".dtsi"):
-                            with open(f, 'rb') as fd:
-                                shutil.copyfileobj(fd, wfd)
+                    for f in base_dts_files:
+                        with open(f, 'rb') as fd:
+                            shutil.copyfileobj(fd, wfd)
 
-                        elif re.search( r".yaml$", f ):
-                            # Note: if tree merging isn't sufficient for these, we could use
-                            #       deepmerge functionality directly on mutltiple yaml files
-                            # look for a special front end, for this or any file for that matter
-                            yaml = LopperYAML( f, config=config )
-                            yaml_tree = yaml.to_tree()
-                            yaml_tree._type = "yaml"
+                # Handle yaml/json extended trees from all sdt_files
+                for f in sdt_files:
+                    if re.search( r".yaml$", f ):
+                        # Note: if tree merging isn't sufficient for these, we could use
+                        #       deepmerge functionality directly on mutltiple yaml files
+                        # look for a special front end, for this or any file for that matter
+                        yaml = LopperYAML( f, config=config )
+                        yaml_tree = yaml.to_tree()
+                        yaml_tree._type = "yaml"
 
-                            # save the tree for future processing (and joining with the main
-                            # system device tree). No code after this needs to be concerned that
-                            # this came from yaml.
-                            sdt_extended_trees.append( yaml_tree )
-                        elif re.search( r".json$", f ):
-                            # look for a special front end, for this or any file for that matter
-                            json = LopperJSON( json=f, config=config )
-                            json_tree = json.to_tree()
-                            json_tree._type = "json"
+                        # save the tree for future processing (and joining with the main
+                        # system device tree). No code after this needs to be concerned that
+                        # this came from yaml.
+                        sdt_extended_trees.append( yaml_tree )
+                    elif re.search( r".json$", f ):
+                        # look for a special front end, for this or any file for that matter
+                        json = LopperJSON( json=f, config=config )
+                        json_tree = json.to_tree()
+                        json_tree._type = "json"
 
-                            # save the tree for future processing (and joining with the main
-                            # system device tree). No code after this needs to be concerned that
-                            # this came from yaml.
-                            sdt_extended_trees.append( json_tree )
+                        # save the tree for future processing (and joining with the main
+                        # system device tree). No code after this needs to be concerned that
+                        # this came from yaml.
+                        sdt_extended_trees.append( json_tree )
+
 
                 fp = fpp.name
             else:
@@ -440,6 +1238,7 @@ class LopperSDT:
             self.tree.strict = not self.permissive
             self.tree.schema = self.schema
             self.tree.load( dct )
+            _deserialize_overlay_subtrees( self.tree )
 
             self.tree.__dbg__ = self.verbose
 
@@ -447,6 +1246,11 @@ class LopperSDT:
             self.tree.resolve( check=True )
 
             self.tree.__symbols__ = self.symbols
+
+            # Compile each overlay file into a named node list so the base tree
+            # can produce a fully merged copy on demand via overlay_tree(name).
+            if overlay_dts_files:
+                self._compile_overlay_subtrees(overlay_dts_files, include_paths)
 
             # join any extended trees to the one we just created
             for t in sdt_extended_trees:
@@ -468,6 +1272,22 @@ class LopperSDT:
                             merge = True
 
                         self.tree = self.tree.add( node, merge=merge )
+
+                # When a YAML file contains sigil syntax (e.g. compatible!linux),
+                # to_tree() collects the conditional LopperNodes into
+                # t._metadata['overlay_subtrees'][condition_name].  Those nodes
+                # are not part of the base tree; they are kept separate so
+                # overlay_tree(name) can merge them on demand.  After joining
+                # the YAML nodes into the main DTS tree we must also copy this
+                # per-condition node registry onto the main tree, otherwise
+                # overlay_tree() won't find any overlays to apply.
+                if t._type == "yaml":
+                    yaml_cond_nodes = t._metadata.get('overlay_subtrees', {})
+                    main_cond_nodes = self.tree._metadata.setdefault('overlay_subtrees', {})
+                    for condition_name, overlay_nodes in yaml_cond_nodes.items():
+                        if condition_name not in main_cond_nodes:
+                            main_cond_nodes[condition_name] = []
+                        main_cond_nodes[condition_name].extend(overlay_nodes)
 
             fpp.close()
             self.tmpfiles.append( fpp.name )
@@ -568,6 +1388,7 @@ class LopperSDT:
                 self.tree.werror = self.werror
                 self.tree.strict = not self.permissive
                 self.tree.load( Lopper.export( self.FDT ) )
+                _deserialize_overlay_subtrees( self.tree )
 
                 # Do a check for common sanity issues here, invalid phandles, etc.
                 self.tree.resolve( check=True )
@@ -839,6 +1660,11 @@ class LopperSDT:
 
             tree_to_write.strict = not self.permissive
             tree_to_write.resolve()
+            _serialize_overlay_subtrees(tree_to_write, keep_embedded='embedded' in self.overlay_emit)
+            if 'sidecar' in self.overlay_emit:
+                _write_overlay_sidecar(tree_to_write, output_filename)
+            if 'dtso' in self.overlay_emit:
+                _write_overlay_dtso_files(tree_to_write, output_filename)
             tree_to_write.print( output_filename )
 
         elif re.search( r"\.yaml$", output_filename ):
