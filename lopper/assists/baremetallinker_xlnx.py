@@ -45,7 +45,7 @@ def get_memranges(tgt_node, sdt, options):
         "psv_ocm": 0, "psx_ocm": 0, "ocm": 0, "ddr4": 0,
         "ddr5": 0, "mig_7series": 0, "ps7_ram": 0,
         "axi_emc": 0, "psu_qspi_linear": 0, "ps7_qspi_linear": 0, "pmc_ram": 0,
-        "ddr3": 0, "lpddr": 0, "axi_xspi": 0, "psv_xram": 0
+        "ddr3": 0, "lpddrmc" : 0, "lpddr": 0, "axi_xspi": 0, "psv_xram": 0
     }
     symbol_node = ""
     for node in root_sub_nodes:
@@ -490,6 +490,13 @@ def get_ddr_address(sdt,tgt_node,mem_ranges,match_cpunode,cpu_ip_name,memtest_co
     has_ddr = {key:value for key,value in mem_ranges.items() for ddr in lower_ddrs if re.search(ddr, key) and value}
     if has_ddr and not memtest_config and not "microblaze" in cpu_ip_name:
         default_ddr = min(has_ddr, key=lambda k: has_ddr[k])
+
+    # For Microblaze RISC-V, use the BRAM memory if available
+    if cpu_ip_name == "microblaze_riscv" and valid_mem_ips and not memtest_config:
+        has_bram = [key for key in sorted(mem_ranges.items(), key=lambda e: e[1][1], reverse=traverse) if "_bram" in key and
+                    any(key.rsplit('_', 1)[0] in mem_ip for mem_ip in valid_mem_ips)]
+        if has_bram:
+            default_ddr = has_bram[0]
 
     mb_reset_addr = None
     if "microblaze" in cpu_ip_name:
