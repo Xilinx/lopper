@@ -644,6 +644,59 @@ class lopper_base:
         except:
             return {}
 
+    @classmethod
+    def phandle_companion_properties(cls):
+        """Get the dictionary mapping phandle properties to companion -names properties
+
+        Many phandle-containing properties have an associated -names property that
+        provides string identifiers for each phandle entry by index. When manipulating
+        phandle properties (e.g., creating overlay fragments), the companion -names
+        property should be included to maintain consistency.
+
+        Args:
+            None
+
+        Returns:
+            dict: Mapping of phandle property name to its companion -names property.
+                  Only includes properties that have a standard companion.
+
+        Example:
+            >>> lopper_base.phandle_companion_properties()
+            {'clocks': 'clock-names', 'resets': 'reset-names', ...}
+        """
+        return {
+            "clocks": "clock-names",
+            "resets": "reset-names",
+            "dmas": "dma-names",
+            "mboxes": "mbox-names",
+            "phys": "phy-names",
+            "pwms": "pwm-names",
+            "gpios": "gpio-names",
+            "interrupts-extended": "interrupt-names",
+            "power-domains": "power-domain-names",
+            "mbox-names": "mboxes",  # reverse mapping
+            "clock-names": "clocks",
+            "reset-names": "resets",
+            "dma-names": "dmas",
+            "phy-names": "phys",
+            "pwm-names": "pwms",
+            "gpio-names": "gpios",
+            "interrupt-names": "interrupts-extended",
+            "power-domain-names": "power-domains",
+        }
+
+    @classmethod
+    def phandle_property_companion(cls, prop_name):
+        """Get the companion property name for a phandle or -names property
+
+        Args:
+            prop_name (str): The property name to look up
+
+        Returns:
+            str or None: The companion property name, or None if no companion exists
+        """
+        return cls.phandle_companion_properties().get(prop_name)
+
     @staticmethod
     def phandle_safe_name( phandle_name ):
         """Make the passed name safe to use as a phandle label/reference
@@ -660,6 +713,23 @@ class lopper_base:
         safe_name = safe_name.replace( '/', "_" )
 
         return safe_name
+
+    @staticmethod
+    def path_to_prop_name( abs_path ):
+        """Encode a node abs_path as a legal DTS property name (reversible).
+
+        Used for keying overlay node data in /__lopper-overlays__ properties.
+        Inverse of prop_name_to_path().
+        """
+        return abs_path.lstrip('/').replace('@', '__at__').replace('/', '__sl__')
+
+    @staticmethod
+    def prop_name_to_path( prop_name ):
+        """Decode a /__lopper-overlays__ property name back to a node abs_path.
+
+        Inverse of path_to_prop_name().
+        """
+        return '/' + prop_name.replace('__sl__', '/').replace('__at__', '@')
 
 
     @staticmethod

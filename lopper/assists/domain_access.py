@@ -296,6 +296,25 @@ def core_domain_access( tgt_node, sdt, options ):
 
     _info( f"cb: core_domain_access( {domain_node}, {sdt}, {verbose} )")
 
+    # If the domain node carries a 'lopper,activate' property, use the named
+    # overlay tree so that conditional properties (sigil syntax) are visible
+    # during processing.  Fall back to 'os,type' if lopper,activate is absent.
+    _activate = domain_node.propval('lopper,activate')
+    if not _activate or _activate == ['']:
+        _activate = domain_node.propval('os,type')
+    # propval may return a bare string or a list; normalise to list so the
+    # for-loop below iterates over names, not characters.
+    if isinstance(_activate, str):
+        _activate = [_activate]
+    for _ov_name in (_activate or []):
+        if _ov_name and _ov_name.strip():
+            _ov_tree = sdt.tree.overlay_tree(_ov_name.strip())
+            if _ov_tree is not None:
+                _info( f"domain_access: activating overlay tree '{_ov_name.strip()}'" )
+                sdt.tree = _ov_tree
+                domain_node = sdt.tree[tgt_node]
+            break
+
     direct_node_refs = []
 
     # 1) direct access = <> nodes
@@ -463,14 +482,21 @@ def core_domain_access( tgt_node, sdt, options ):
     # property) and mark them as surviving in the Linux output, even though no
     # Linux device consumes them.
     #
-    # ref_node.ref = 1 marks only the directly-referenced node, consistent with
-    # how step 1a already handles indirect references.
+    # ref_node.ref = 1 marks only the directly-referenced node. We also walk
+    # up the parent chain and mark each ancestor, so that the simple-bus filter
+    # (step 5) does not drop a bus node before its refcounted children can be
+    # pruned. This mirrors the parent=True behaviour of resolve_all_refs() used
+    # in step 1a, without the unwanted transitive phandle following.
     try:
-        for subnode in domain_node.subnodes(children_only=True):
+        for subnode in domain_node.subnodes():
             for prop in subnode:
                 for ref_node in prop.resolve_phandles():
                     ref_node.ref = 1
                     _info(f"domain_access: refcounting domain subnode phandle: {ref_node.abs_path}")
+                    p = ref_node.parent
+                    while p and p.abs_path != "/":
+                        p.ref = 1
+                        p = p.parent
     except Exception as e:
         _warning(f"domain_access: exception in domain subnode refcounting: {e}")
 

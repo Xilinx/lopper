@@ -286,6 +286,59 @@ Example:
            - libmetal_uio_data@99d0000
 
 
+Conditional Properties and ``lopper,activate``
+---------------------------------------------
+
+A single YAML file can describe multiple OS or configuration variants using
+**conditional property sigils**.  A sigil is appended to a property name or
+node name using ``!`` as a delimiter:
+
+.. code-block:: YAML
+
+   property-name!condition!merge-scheme: value
+   node-name!condition:
+     child-key: value
+
+Supported merge schemes are ``replace`` (default), ``append``, ``prepend``,
+and ``delete``.  The condition name may be any string (e.g. ``linux``,
+``zephyr``, ``baremetal``).
+
+Sigils may appear on any node in the tree, including nodes that are not under
+``/domains/``.  This is the common pattern for per-domain driver binding:
+
+.. code-block:: YAML
+
+   axi:
+     timer@f1e90000:
+       compatible: "cdns,ttc"          # base — all domains without activation
+       compatible!linux: "uio"         # linux overlay replaces with UIO binding
+
+   domains:
+     APU_Linux:
+       compatible: openamp,domain-v1
+       lopper,activate: linux          # selects overlay_tree('linux')
+       cpus: ...
+       memory: ...
+
+     RPU1_BM:
+       compatible: openamp,domain-v1
+       # no lopper,activate — base tree used, compatible stays "cdns,ttc"
+       cpus: ...
+       memory: ...
+
+When ``domain_access`` processes ``APU_Linux`` it reads ``lopper,activate``,
+calls ``overlay_tree('linux')``, and uses that merged tree for all subsequent
+processing.  The resulting tree has ``compatible = "uio"`` at the timer node.
+When it processes ``RPU1_BM`` the base tree is used unchanged.
+
+The ``lopper,activate`` property replaces and supersedes ``os,type`` for
+overlay selection.  If ``lopper,activate`` is absent, ``os,type`` is used as
+a fallback so existing domain YAML files work without modification.
+
+For full syntax reference and API documentation see
+``docs/conditional-properties.md``.
+
+
 OS and Vendor Extensions
 ------------------------
 

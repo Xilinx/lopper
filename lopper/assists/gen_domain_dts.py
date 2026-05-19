@@ -624,6 +624,20 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                     sdt.tree[match_cpunode].delete('timebase-frequency')
             except KeyError:
                 pass
+
+            # For SpartanUP+ Variants, add the riscv,timer node at root.
+            # It is wired to the per-hart CPU interrupt controller (cpu0_intc) at IRQ 5.
+            if linux_dt and match_cpunode.propval('xlnx,family', list)[0] in ('spartanuplus', 'spartanuplusaes1'):
+                from lopper.tree import LopperProp
+                timer_node = LopperNode()
+                timer_node.abs_path = "/timer"
+                timer_node.name = "timer"
+                timer_node.label = "int_timer"
+                timer_node ["compatible"] = "riscv,timer"
+                timer_node + LopperProp("bootph-all")
+                timer_node + LopperProp("interrupts-extended = <&cpu0_intc 5>")
+                sdt.tree + timer_node
+
             delete_unused_props( sdt.tree[match_cpunode] , driver_proplist, False)
 
     if zephyr_dt:
@@ -986,6 +1000,17 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
                             node["#size-cells"] = LopperProp("#size-cells")
                             node["#size-cells"].value = 0
                             node.add(node["#size-cells"])
+                    # PS-I3C
+                    if "snps,dw-i3c-master-1.00a" in node["compatible"].value:
+                        node["compatible"].value = ["snps,designware-i3c"]
+                        if node.propval('#address-cells') != [3]:
+                            node["#address-cells"] = LopperProp("#address-cells")
+                            node["#address-cells"].value = 3
+                            node.add(node["#address-cells"])
+                        if node.propval('#size-cells') != [0]:
+                            node["#size-cells"] = LopperProp("#size-cells")
+                            node["#size-cells"].value = 0
+                            node.add(node["#size-cells"])
                     #UFS
                     if "amd,versal2-ufs" in node["compatible"].value:
                         new_node = LopperNode()
@@ -1011,6 +1036,15 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
                                     ufs_reg_val = ufs_reg_val + ufs_crp_reg
                                     break
                         node["reg"].value = ufs_reg_val
+                        if node.props('clock-names') != []:
+                            desired_clock_names = ["core", "ref_clk"]
+                            clk_names = node.propval("clock-names")
+                            if clk_names == []:
+                                clk_names_list = []
+                            else:
+                                clk_names_list = [str(x) for x in clk_names]
+                            if clk_names_list != desired_clock_names:
+                                node["clock-names"].value = desired_clock_names
                     #AXI-GPIO
                     if "xlnx,xps-gpio-1.00.a" in node["compatible"].value:
                         node["compatible"].value = ["xlnx,xps-gpio-1.00.a"]
@@ -1125,7 +1159,7 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
                             else:
                                 clk_names_list = [str(x) for x in clk_names]
                             if clk_names_list != desired_clock_names:
-                                node["clock_names"].value = desired_clock_names
+                                node["clock-names"].value = desired_clock_names
                         if node.props("#dma-cells") != [] and node.propval("#dma-cells") != [1]:
                             node['#dma-cells'].value = [1]
                         if node.props("xlnx,bus-width") != [] and node.propval("xlnx,bus-width") != [64]:
@@ -1246,7 +1280,9 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine):
                             sdt.tree.add(new_node)
                             if node.props('clocks') != []:
                                 node.delete('clocks')
-                            if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or node["compatible"].value == ["amd,versal2-dma-1.0"]:
+                            if node["compatible"].value == ["xlnx,zynqmp-dma-1.0"] or \
+                                node["compatible"].value == ["amd,versal2-dma-1.0"] or \
+                                "amd,versal2-ufs" in node["compatible"].value:
                                 clock_prop = f"clocks = <&{new_node.name}>, <&{new_node.name}>"
                             else:
                                 clock_prop = f"clocks = <&{new_node.name}>"
