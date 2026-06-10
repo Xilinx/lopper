@@ -150,31 +150,43 @@ def chunks_variable(lst, chunk_sizes):
         yield chunk
         start = end
 
-def _resolve_overlay_fixups(tree, fixups_node):
+def _resolve_overlay_fixups(tree, fixups):
     """Patch 0xffffffff phandle placeholders left by dtc plugin compilation.
 
-    dtc compiles DTS overlay files with /plugin/ which cannot resolve label
-    references at compile time (the base tree is absent).  It instead writes
-    0xffffffff into every phandle slot and records the location of each slot in
-    the __fixups__ node as "node_path:prop_name:byte_offset" strings, keyed by
-    the label name that needs resolving.
+    Called at overlay_tree() build time, after all overlay nodes have been
+    merged into the result tree, so phandles are resolved against a complete
+    and final tree rather than the base tree at registration time.
 
-    This function walks those records, looks up each label in the already-merged
-    result tree to find its real phandle, and patches the slot in place.
+    Args:
+        tree:    the merged result LopperTree (base + overlay nodes)
+        fixups:  dict produced by _unwrap_overlay_tree():
+                   { phandle_target_label:
+                       [(fragment_label, relative_path, prop_name, byte_offset_str), ...] }
+                 fragment_label    — label of the overlay target node (e.g. "amba_pl")
+                 relative_path     — path below that target to the property-holder node,
+                                     e.g. "/zyxclmm_drm" or "" if on the target itself
+                 phandle_target_label is the label whose phandle value replaces 0xffffffff
+
+    Because each entry stores a label + relative path rather than a baked abs_path,
+    resolution always uses the label's current location in the result tree.  Any
+    rename or move of the target node by an assist between registration and
+    overlay_tree() build time is handled transparently — no fallback needed.
     """
-    for label, fixup_refs in fixups_node.__props__.items():
+    for label, refs in fixups.items():
         nodes = tree.lnodes(label, exact=True)
         if not nodes:
             continue
         target_phandle = nodes[0].phandle
         if not target_phandle or target_phandle < 0:
             continue
-        refs = fixup_refs if isinstance(fixup_refs, list) else [fixup_refs]
         for ref in refs:
             try:
-                # format: "node_path:prop_name:byte_offset"
-                node_path, prop_name, byte_offset_str = ref.rsplit(':', 2)
+                frag_label, relative_path, prop_name, byte_offset_str = ref
                 byte_offset = int(byte_offset_str)
+                frag_nodes = tree.lnodes(frag_label, exact=True)
+                if not frag_nodes:
+                    continue
+                node_path = frag_nodes[0].abs_path + relative_path
                 if node_path not in tree.__nodes__:
                     continue
                 node = tree.__nodes__[node_path]
@@ -1615,7 +1627,12 @@ class LopperProp():
         if prop_type == "comment":
             outstring = ""
             for s in prop_val:
-                outstring += s
+                if isinstance(s, int):
+                    outstring += chr(s)
+                elif isinstance(s, (bytes, bytearray)):
+                    outstring += s.decode("utf-8", errors="replace")
+                else:
+                    outstring += s
 
         elif prop_type == "label":
             outstring = ""
@@ -4297,6 +4314,15 @@ class LopperTree:
             if name not in subtrees:
                 return None
             self._overlay_trees[name] = self._build_overlay_tree(name)
+        # NOTE: the cached result is a snapshot taken at first-call time.
+        # If the base tree is mutated between two calls for the same name
+        # (e.g. phandles renumbered, nodes renamed) the second call returns the
+        # stale first snapshot rather than a fresh merge.  This is intentional
+        # for the common single-use flow (domain_access calls once, replaces
+        # sdt.tree) but would silently produce wrong results if the same name
+        # were requested across mutations.  If that becomes necessary, consider
+        # checksumming the base tree's node/phandle table and invalidating the
+        # cache on mismatch.
         return self._overlay_trees[name]
 
     def _build_overlay_tree(self, name):
@@ -4335,10 +4361,10 @@ class LopperTree:
             _merge_node_into_tree(result, ov_node)
 
         # Resolve phandle placeholders left by dtc plugin compilation.
-        # Plain YAML overlays have no fixups node so this is a no-op for them.
-        fixups_node = self._metadata.get('overlay_fixups', {}).get(name)
-        if fixups_node is not None:
-            _resolve_overlay_fixups(result, fixups_node)
+        # Plain YAML overlays have no fixups entry so this is a no-op for them.
+        fixups = self._metadata.get('overlay_fixups', {}).get(name)
+        if fixups:
+            _resolve_overlay_fixups(result, fixups)
 
         # Re-resolve the whole tree so string_val is current for DTS output
         result.resolve()
