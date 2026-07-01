@@ -14,8 +14,9 @@ This module provides schema-based property validation for device trees,
 loading constraints from vendored dt-schema YAML files.
 
 Key components:
-- ConstraintType: Enum of constraint types (required, forbidden, etc.)
-- PropertyConstraint: Dataclass for individual property constraints
+- ConstraintType: Enum of constraint types (from lopper.schema.core)
+- Constraint: Dataclass for individual constraints (from lopper.schema.core)
+- PropertyConstraint: Alias for Constraint (backwards compatibility)
 - NodeConstraints: Dataclass for node-level constraint groupings
 - load_constraints_from_schema(): Loads constraints from dt-schema YAML
 - Standalone check functions: check_forbidden_properties, etc.
@@ -23,10 +24,12 @@ Key components:
 
 The constraints are loaded dynamically from YAML schema files in
 lopper/dt-schema/schemas/, making validation fully data-driven.
+
+Note: This module uses unified types from lopper.schema.core. The
+PropertyConstraint name is preserved for backwards compatibility.
 """
 
 from dataclasses import dataclass, field
-from enum import Enum
 from fnmatch import fnmatch
 import glob
 import os
@@ -48,35 +51,15 @@ from .base import (
     ValidatorRegistry,
 )
 
+# Import unified types from lopper.schema.core
+from lopper.schema.core import ConstraintType, Constraint
 
-class ConstraintType(Enum):
-    """
-    Property constraint types using dt-schema/JSON Schema terminology.
+# Import unified property types for learned schema integration
+from lopper.schema.types import PropertyType
 
-    These are lopper's own constraint implementations, using vocabulary
-    consistent with upstream dt-schema for familiarity.
-    """
-    REQUIRED = "required"    # Property must be present
-    FORBIDDEN = "forbidden"  # Property must NOT be present
-    CONST = "const"          # Property must have specific value
-    ENUM = "enum"            # Property must be one of allowed values
-    MUTEX = "mutex"          # Properties are mutually exclusive
-
-
-@dataclass
-class PropertyConstraint:
-    """A single property constraint.
-
-    Attributes:
-        constraint_type: Type of constraint (required, forbidden, etc.)
-        properties: List of property names this constraint applies to
-        expected_value: Expected value for CONST/ENUM constraints
-        message: Optional human-readable message for violations
-    """
-    constraint_type: ConstraintType
-    properties: list
-    expected_value: object = None
-    message: str = None
+# Backwards compatibility alias: PropertyConstraint -> Constraint
+# Existing code using PropertyConstraint will continue to work
+PropertyConstraint = Constraint
 
 
 @dataclass
@@ -85,9 +68,12 @@ class NodeConstraints:
 
     Attributes:
         node_pattern: Glob pattern matching node paths (e.g., "/memory@*")
-        constraints: List of PropertyConstraint objects
+        constraints: List of Constraint objects
         description: Optional description of this constraint set
         schema_file: Source schema file path
+
+    Note: This is similar to lopper.schema.core.NodeSpec but includes
+    schema_file for audit diagnostics. Keeping locally for now.
     """
     node_pattern: str
     constraints: list
@@ -101,7 +87,7 @@ class NodeConstraints:
 
 def _get_schema_dir():
     """Get the path to vendored dt-schema files."""
-    return os.path.join(os.path.dirname(__file__), '..', 'dt-schema', 'schemas')
+    return os.path.join(os.path.dirname(__file__), '..', 'schema', 'dt-schema', 'schemas')
 
 
 def _parse_schema_file(schema_path):
@@ -636,6 +622,369 @@ def check_mutex_properties(tree, constraints=None):
 
 
 # =============================================================================
+# Learned Type Validation
+# =============================================================================
+
+def _infer_type_from_value(value):
+    """Infer PropertyType from a property value.
+
+    Args:
+        value: Property value (may be wrapped in property object)
+
+    Returns:
+        PropertyType enum value
+    """
+    # Unwrap property object if needed
+    if hasattr(value, 'value'):
+        value = value.value
+
+    if value is None or value == []:
+        return PropertyType.EMPTY
+
+    if isinstance(value, bool):
+        return PropertyType.FLAG
+
+    if isinstance(value, str):
+        # Empty string is also EMPTY/FLAG
+        if value == '':
+            return PropertyType.EMPTY
+        return PropertyType.STRING
+
+    if isinstance(value, int):
+        # Could be uint8, uint16, uint32, uint64 - default to uint32
+        if value < 0:
+            return PropertyType.INT32
+        elif value <= 0xFF:
+            return PropertyType.UINT8  # Could be uint8
+        elif value <= 0xFFFF:
+            return PropertyType.UINT16  # Could be uint16
+        elif value <= 0xFFFFFFFF:
+            return PropertyType.UINT32
+        else:
+            return PropertyType.UINT64
+
+    if isinstance(value, list):
+        if len(value) == 0:
+            return PropertyType.EMPTY
+
+        first = value[0]
+
+        # List containing only empty string is EMPTY/FLAG (e.g., ranges;)
+        if len(value) == 1 and first == '':
+            return PropertyType.EMPTY
+
+        # List of strings
+        if isinstance(first, str):
+            if len(value) == 1:
+                return PropertyType.STRING
+            return PropertyType.STRING_ARRAY
+
+        # List of integers
+        if isinstance(first, int):
+            # For arrays, report as array type
+            if len(value) == 1:
+                return PropertyType.UINT32
+            return PropertyType.UINT32_ARRAY
+
+        # Nested list (matrix)
+        if isinstance(first, list):
+            return PropertyType.UINT32_ARRAY
+
+    return PropertyType.UNKNOWN
+
+
+def _get_resolver():
+    """Get the property type resolver from learned schema.
+
+    Returns:
+        DTSPropertyTypeResolver instance, or None if unavailable
+    """
+    try:
+        # Use internal _get_schema_manager() to avoid deprecation warnings
+        # in internal code paths. Public API users get the warning.
+        from lopper.schema.learned import _get_schema_manager
+        manager = _get_schema_manager()
+        if manager:
+            # Try both the method and the attribute
+            resolver = getattr(manager, 'resolver', None)
+            if resolver is None:
+                resolver = getattr(manager, '_resolver', None)
+            return resolver
+    except Exception:
+        pass
+    return None
+
+
+def _types_compatible(actual, expected):
+    """Check if actual type is compatible with expected type.
+
+    Some type mismatches are acceptable:
+    - UINT8/UINT16/UINT32/UINT64 are all "integers"
+    - STRING and STRING_ARRAY with single element
+    - Array variants of base types
+    - FLAG/EMPTY can also have values (ranges, dma-ranges)
+
+    Args:
+        actual: PropertyType inferred from value
+        expected: PropertyType from learned schema
+
+    Returns:
+        True if types are compatible
+    """
+    if actual == expected:
+        return True
+
+    # Integer types are compatible with each other (including arrays)
+    int_types = {
+        PropertyType.UINT8, PropertyType.UINT16, PropertyType.UINT32, PropertyType.UINT64,
+        PropertyType.INT8, PropertyType.INT16, PropertyType.INT32, PropertyType.INT64,
+    }
+    int_array_types = {
+        PropertyType.UINT8_ARRAY, PropertyType.UINT16_ARRAY,
+        PropertyType.UINT32_ARRAY, PropertyType.UINT64_ARRAY,
+    }
+    all_int_types = int_types | int_array_types
+
+    # All integer types (scalar and array) are compatible
+    if actual in all_int_types and expected in all_int_types:
+        return True
+
+    # Array types are compatible with scalar types
+    array_pairs = {
+        (PropertyType.UINT8, PropertyType.UINT8_ARRAY),
+        (PropertyType.UINT16, PropertyType.UINT16_ARRAY),
+        (PropertyType.UINT32, PropertyType.UINT32_ARRAY),
+        (PropertyType.UINT64, PropertyType.UINT64_ARRAY),
+        (PropertyType.STRING, PropertyType.STRING_ARRAY),
+    }
+    if (actual, expected) in array_pairs or (expected, actual) in array_pairs:
+        return True
+
+    # PHANDLE is stored as UINT32
+    if expected == PropertyType.PHANDLE and actual in (PropertyType.UINT32, PropertyType.UINT8, PropertyType.UINT16):
+        return True
+    if expected == PropertyType.PHANDLE_ARRAY and actual == PropertyType.UINT32_ARRAY:
+        return True
+
+    # EMPTY and FLAG are compatible
+    if {actual, expected} == {PropertyType.EMPTY, PropertyType.FLAG}:
+        return True
+
+    # FLAG/EMPTY can also have integer values (ranges, dma-ranges can be empty or have values)
+    if expected == PropertyType.FLAG and actual in all_int_types:
+        return True
+
+    return False
+
+
+def check_learned_type_violations(tree, min_confidence=0.8):
+    """Check properties match their learned types.
+
+    This function validates that property values match the types learned
+    from observing device trees. High-confidence learned types are used
+    to detect anomalies.
+
+    Args:
+        tree: LopperTree to validate
+        min_confidence: Minimum confidence threshold (0.0-1.0)
+
+    Returns:
+        List of ValidationResult objects
+    """
+    results = []
+    resolver = _get_resolver()
+
+    if not resolver:
+        results.append(ValidationResult(
+            check_name='schema_learned_types',
+            phase=ValidationPhase.POST_YAML,
+            passed=True,
+            message="No learned schema available - skipping type checks",
+        ))
+        return results
+
+    violations = 0
+    checked = 0
+
+    for node in tree:
+        # Get compatible string for context
+        compatible = None
+        try:
+            compat_prop = node['compatible']
+            if compat_prop and hasattr(compat_prop, 'value'):
+                compatible = compat_prop.value
+                if isinstance(compatible, list) and len(compatible) > 0:
+                    compatible = compatible[0]
+        except (KeyError, TypeError):
+            pass
+
+        # Check each property (iterate over node yields property objects)
+        for prop in node:
+            try:
+                prop_name = prop.name
+                if prop is None:
+                    continue
+
+                # Get learned type specification
+                spec = resolver.resolve_property_spec(prop_name, node.abs_path, compatible)
+
+                # Skip low-confidence or unknown types
+                if spec.confidence < min_confidence:
+                    continue
+                if spec.type_def.property_type == PropertyType.UNKNOWN:
+                    continue
+
+                checked += 1
+
+                # Infer actual type from value
+                actual_type = _infer_type_from_value(prop)
+
+                # Compare types
+                expected_type = spec.type_def.property_type
+                if not _types_compatible(actual_type, expected_type):
+                    violations += 1
+                    results.append(ValidationResult(
+                        check_name='schema_learned_types',
+                        phase=ValidationPhase.POST_YAML,
+                        passed=False,
+                        message=f"{node.abs_path}: {prop_name} type mismatch - "
+                                f"expected {expected_type.value}, got {actual_type.value}",
+                        source_path=node.abs_path,
+                        details={
+                            'property': prop_name,
+                            'expected_type': expected_type.value,
+                            'actual_type': actual_type.value,
+                            'confidence': spec.confidence,
+                            'source': spec.source,
+                        }
+                    ))
+
+            except Exception as e:
+                lopper.log._debug(f"schema: error checking {node.abs_path}/{prop_name}: {e}")
+
+    if violations == 0:
+        results.append(ValidationResult(
+            check_name='schema_learned_types',
+            phase=ValidationPhase.POST_YAML,
+            passed=True,
+            message=f"Checked {checked} properties against learned types - no violations",
+        ))
+
+    return results
+
+
+def check_type_frequency_anomalies(tree, minority_threshold=0.1):
+    """Check for property type usage that differs from majority.
+
+    Some properties have ambiguous types in the learned schema (seen as
+    both string and integer across different device trees). This check
+    identifies when a property uses a minority type.
+
+    Args:
+        tree: LopperTree to validate
+        minority_threshold: Report if type frequency is below this (0.0-1.0)
+
+    Returns:
+        List of ValidationResult objects
+    """
+    results = []
+    resolver = _get_resolver()
+
+    if not resolver:
+        results.append(ValidationResult(
+            check_name='schema_type_frequency',
+            phase=ValidationPhase.POST_YAML,
+            passed=True,
+            message="No learned schema available - skipping frequency checks",
+        ))
+        return results
+
+    anomalies = 0
+
+    for node in tree:
+        for prop in node:
+            try:
+                prop_name = prop.name
+                if prop is None:
+                    continue
+
+                # Get learned type specification
+                spec = resolver.resolve_property_spec(prop_name, node.abs_path)
+
+                # Check if there are type frequencies
+                if not spec.type_frequencies:
+                    continue
+
+                # Calculate total observations
+                total = sum(spec.type_frequencies.values())
+                if total < 5:  # Not enough data
+                    continue
+
+                # Infer actual type
+                actual_type = _infer_type_from_value(prop)
+
+                # Find matching frequency entry
+                # Type names in frequencies may be like 'uint32', 'string', etc.
+                actual_name = actual_type.value
+                freq = spec.type_frequencies.get(actual_name, 0)
+
+                # Also check array variants
+                if freq == 0 and actual_name.endswith('-array'):
+                    base_name = actual_name.replace('-array', '')
+                    freq = spec.type_frequencies.get(base_name, 0)
+
+                if freq == 0:
+                    # Type not seen before at all
+                    anomalies += 1
+                    results.append(ValidationResult(
+                        check_name='schema_type_frequency',
+                        phase=ValidationPhase.POST_YAML,
+                        passed=False,
+                        message=f"{node.abs_path}: {prop_name} uses unseen type {actual_name} "
+                                f"(known types: {list(spec.type_frequencies.keys())})",
+                        source_path=node.abs_path,
+                        details={
+                            'property': prop_name,
+                            'actual_type': actual_name,
+                            'type_frequencies': spec.type_frequencies,
+                        }
+                    ))
+                elif freq / total < minority_threshold:
+                    # Type is rare
+                    anomalies += 1
+                    pct = (freq / total) * 100
+                    results.append(ValidationResult(
+                        check_name='schema_type_frequency',
+                        phase=ValidationPhase.POST_YAML,
+                        passed=False,
+                        message=f"{node.abs_path}: {prop_name} uses minority type {actual_name} "
+                                f"({pct:.1f}% of observations)",
+                        source_path=node.abs_path,
+                        details={
+                            'property': prop_name,
+                            'actual_type': actual_name,
+                            'frequency': freq,
+                            'total': total,
+                            'percentage': pct,
+                            'type_frequencies': spec.type_frequencies,
+                        }
+                    ))
+
+            except Exception as e:
+                lopper.log._debug(f"schema: error checking frequencies for {prop_name}: {e}")
+
+    if anomalies == 0:
+        results.append(ValidationResult(
+            check_name='schema_type_frequency',
+            phase=ValidationPhase.POST_YAML,
+            passed=True,
+            message="No type frequency anomalies detected",
+        ))
+
+    return results
+
+
+# =============================================================================
 # Schema Validator Class
 # =============================================================================
 
@@ -659,6 +1008,8 @@ class SchemaValidator(BaseValidator):
         'schema_required_props',
         'schema_prop_values',
         'schema_mutex_props',
+        'schema_learned_types',
+        'schema_type_frequency',
     ]
 
     # Meta-flags that enable multiple checks
@@ -668,10 +1019,16 @@ class SchemaValidator(BaseValidator):
             'schema_required_props',
             'schema_prop_values',
             'schema_mutex_props',
+            'schema_learned_types',
+            'schema_type_frequency',
         ],
         'schema_reserved_memory': [
             'schema_forbidden_props',
             'schema_mutex_props',
+        ],
+        'schema_learned': [
+            'schema_learned_types',
+            'schema_type_frequency',
         ],
     }
 
@@ -681,6 +1038,8 @@ class SchemaValidator(BaseValidator):
         'schema_required_props': (ValidationPhase.POST_YAML, check_required_properties),
         'schema_prop_values': (ValidationPhase.POST_YAML, check_property_values),
         'schema_mutex_props': (ValidationPhase.POST_YAML, check_mutex_properties),
+        'schema_learned_types': (ValidationPhase.POST_YAML, check_learned_type_violations),
+        'schema_type_frequency': (ValidationPhase.POST_YAML, check_type_frequency_anomalies),
     }
 
     def run_phase(self, phase, tree, **kwargs):

@@ -4585,18 +4585,7 @@ class LopperTree:
             # we can try to assign
             if type(key) == int:
                 self.__nnodes__[key] = val
-                self.__nodes__[val.abspath] = val
-                if val.phandle != 0:
-                    self.__pnodes__[val.phandle] = val
-                if val.label:
-                    self.__lnodes__[val.label] = val
-            else:
-                self.__nodes__[key] = val
-                self.__nnodes__[val.number] = val
-                if val.phandle != 0:
-                    self.__pnodes__[val.phandle] = val
-                if val.label:
-                    self.__lnodes__[val.label] = val
+            self._register_node(val)
         else:
             # thrown an exception, since this is not a valid
             # thing to assign.
@@ -4667,6 +4656,28 @@ class LopperTree:
                                 node_string="node:" + node_string
                                 lopper.log._warning( node_string )
 
+    def link_for_resolution( self, parent_tree ):
+        """Resolve this tree's references against parent_tree, without overlaying.
+
+        Registers parent_tree as an external tree so that phandle and label
+        references in this tree which aren't satisfied locally resolve against
+        parent_tree (see the trees_to_check list in the phandle resolver). This
+        is the resolution half of overlay_of(), factored out so callers that
+        need a *standalone* subtree copied out of a base — one whose
+        cross-references must still resolve against that base, but whose output
+        must remain a plain device tree rather than a dtc overlay — can get
+        just that behavior.
+
+        Unlike overlay_of(), this does NOT change self._type, does NOT register
+        self as a child overlay of parent_tree, does NOT strip local phandle
+        properties, and does NOT generate overlay fragments.
+
+        Args:
+            parent_tree (LopperTree): tree to resolve unresolved references against
+        """
+        if parent_tree not in self._metadata['external_trees']:
+            self._metadata['external_trees'].append( parent_tree )
+
     def overlay_of( self, parent_tree, name=None, exclude_props=None, exclude_nodes=None ):
         """Make this tree an overlay of parent_tree
 
@@ -4697,8 +4708,8 @@ class LopperTree:
             del n.__props__['phandle']
 
         # store the parent tree, this is used for resolving
-        # labels and phandles before printing
-        self._metadata['external_trees'].append(parent_tree)
+        # labels and phandles before printing (shared with link_for_resolution)
+        self.link_for_resolution( parent_tree )
 
         # Set metadata for this overlay
         if name is None:
@@ -5220,6 +5231,88 @@ class LopperTree:
         # Without this, cached string_val entries for properties like address-map may
         # still reference deleted nodes, causing stale phandle records in the output.
         if self.strict:
+            # Pass A: drop dangling path-ref properties.
+            # Any string property whose value is an absolute node path that no longer
+            # exists in the tree is removed (e.g. stale /aliases entries after
+            # domain_access filters out a node).
+            try:
+                aliases_node = self["/aliases"]
+            except Exception:
+                aliases_node = None
+
+            # Only properties whose *type* resolves to path-ref are eligible for
+            # pruning. A value starting with '/' is path-ref ONLY when the property
+            # name isn't already typed as something else (string / alias-ref /
+            # boolean) — mirror the schema resolver's name-based exclusions
+            # (lopper/schema learned.py _determine_property_type) so we never drop
+            # e.g. bootargs ("/dev/mmcblk0 ...") or a label that starts with '/'.
+            try:
+                _hints = lopper.schema.PROPERTY_TYPE_HINTS
+                non_path_ref_names = (
+                    set(_hints.get('string_properties', []))
+                    | set(_hints.get('alias_ref_properties', []))
+                    | set(_hints.get('boolean_properties', []))
+                )
+            except Exception:
+                non_path_ref_names = set()
+
+            for n in self:
+                props_to_delete = []
+                for p in n:
+                    # Skip names typed as non-path-ref; their values are never
+                    # path-refs even when they start with '/'.
+                    if p.name in non_path_ref_names:
+                        continue
+                    val = p.value
+                    # String properties are stored as a list; extract single string value.
+                    if not isinstance(val, list) or len(val) != 1 or not isinstance(val[0], str):
+                        continue
+                    raw = val[0].strip().strip('"')
+                    if raw.startswith('/'):
+                        try:
+                            self[raw]
+                        except Exception:
+                            props_to_delete.append(p)
+                            # Suppress noise for comment nodes — they disappear
+                            # with their parent by design, not a real dangling ref.
+                            if not p.name.startswith('lopper-comment-'):
+                                lopper.log._warning(
+                                    f"strict: dropping dangling path-ref "
+                                    f"'{n.abs_path}/{p.name}' -> '{raw}' (node gone)")
+                for p in props_to_delete:
+                    n - p
+
+            # Pass B: drop dangling alias-ref properties.
+            # Properties like stdout-path reference an alias name; if that alias was
+            # removed in pass A (or never existed), the property is also stale.
+            # Only check properties explicitly registered as alias-ref to avoid false
+            # positives from generic string properties whose values look like identifiers.
+            if aliases_node is not None:
+                try:
+                    alias_ref_props = set(
+                        lopper.schema.PROPERTY_TYPE_HINTS.get('alias_ref_properties', [])
+                    )
+                except Exception:
+                    alias_ref_props = {'stdout-path', 'linux,stdout-path'}
+                for n in self:
+                    props_to_delete = []
+                    for p in n:
+                        if p.name not in alias_ref_props:
+                            continue
+                        val = p.value
+                        if not isinstance(val, list) or len(val) != 1 or not isinstance(val[0], str):
+                            continue
+                        raw = val[0].strip().strip('"')
+                        alias_name = raw.split(':')[0]
+                        if alias_name and aliases_node.propval(alias_name) == ['']:
+                            props_to_delete.append(p)
+                            lopper.log._warning(
+                                f"strict: dropping dangling alias-ref "
+                                f"'{n.abs_path}/{p.name}' -> alias '{alias_name}' "
+                                f"(no longer in /aliases)")
+                    for p in props_to_delete:
+                        n - p
+
             for n in self:
                 for p in n:
                     p.resolve()
@@ -5473,6 +5566,34 @@ class LopperTree:
 
         return True
 
+    def _register_node(self, node):
+        """Insert a node into all tree index dicts atomically.
+
+        Writes the node into __nodes__, __nnodes__, __pnodes__, and __lnodes__
+        in one call, keeping all four indices consistent.  Duplicate labels are
+        disambiguated via label_set() so __lnodes__ always holds unique keys.
+
+        This is the single correct way to register a fully-constructed node
+        object.  Callers that write to __nodes__ directly will leave __lnodes__
+        (and potentially __pnodes__) stale, which causes lnodes() to silently
+        miss the node.  Use this method instead.
+
+        Args:
+            node (LopperNode): node to register; node.abs_path must be set.
+        """
+        self.__nodes__[node.abs_path] = node
+        if node.number >= 0:
+            self.__nnodes__[node.number] = node
+        if node.phandle > 0:
+            self.__pnodes__[node.phandle] = node
+        if node.label:
+            try:
+                if self.__lnodes__[node.label]:
+                    node.label_set(node.label)
+            except KeyError:
+                pass
+            self.__lnodes__[node.label] = node
+
     def add( self, node, dont_sync = False, merge = False ):
         """Add a node to a tree
 
@@ -5659,31 +5780,7 @@ class LopperTree:
             lopper.log._debug( f"node add: {node.abs_path}, after load. depth is : {node.depth}"
                                f"         phandle: {node.phandle} tree: {node.tree}" )
 
-            self.__nodes__[node.abs_path] = node
-
-            # note: this is similar to the the tree.load() code, it should be
-            #       consolidated
-            if node.number >= 0:
-                self.__nnodes__[node.number] = node
-            if node.phandle > 0:
-                # note: this should also have been done by node.load()
-                #       and the phandle_set() that was called in case of
-                #       a detected collision, but we assign it here to
-                #       be sure and to mark that we consider it part of the
-                #       tree at this point.
-                self.__pnodes__[node.phandle] = node
-            if node.label:
-                # we should check if there's already a node at the label
-                # value, and either warn, adjust or take some other appropriate
-                # action
-                try:
-                    if self.__lnodes__[node.label]:
-                        node.label_set( node.label )
-                        lopper.log._debug( f"node add: duplicate label, generated a new one: {node.label}" )
-                except:
-                    pass
-
-                self.__lnodes__[node.label] = node
+            self._register_node(node)
 
             # Check to see if the node has any children. If it does, are they already in
             # our node dictionary ? If they aren't, it means we are not just adding one
@@ -6662,13 +6759,7 @@ class LopperTree:
                 # we want to find these by name AND number (but note, number can
                 # change after some tree ops, so make sure to check the state of
                 # a tree/node before using the number
-                self.__nodes__[node.abs_path] = node
-
-                self.__nnodes__[node.number] = node
-                if node.phandle > 0:
-                    self.__pnodes__[node.phandle] = node
-                if node.label:
-                    self.__lnodes__[node.label] = node
+                self._register_node(node)
 
             for node_abs_path in nodes_saved:
                 # invalidate nodes, in case someone is holding a reference

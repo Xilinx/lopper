@@ -166,6 +166,8 @@ def usage():
     print('  --exclude-nodes=<node>[,<node>,...] - Comma-separated list of node paths/labels to exclude')
     print('                      These nodes will be removed from the generated overlay output.')
     print('                      Example: --exclude-nodes=/amba_pl/some_node')
+    print('  --exclude-overlays=<file>[,<file>,...] - Exclude specific *.dtso files from auto-discovery')
+    print('                      Supports glob patterns (e.g., --exclude-overlays=*.dtso to skip all)')
     print('\nExamples:')
     print(' With machine argument:')
     print(' lopper -O <output_dir>/ -f --enhanced <path_to_system_top>/system-top.dts <path_to_lopper_gen_dt>/lopper-gen.dts -- xlnx_overlay_pl_dt <machine> <config> <path_to_pl_dtsi>/pl.dtsi')
@@ -272,6 +274,7 @@ def validate_and_parse_options(options, sdt):
     node_specs = None
     exclude_props = None
     exclude_nodes = None
+    exclude_overlays = None
     for arg in optional_args:
         if arg.startswith("--firmware-name="):
             firmware_override = arg.split("=", 1)[1]
@@ -281,6 +284,11 @@ def validate_and_parse_options(options, sdt):
             exclude_props = [p.strip() for p in arg.split("=", 1)[1].split(",") if p.strip()]
         elif arg.startswith("--exclude-nodes="):
             exclude_nodes = [n.strip() for n in arg.split("=", 1)[1].split(",") if n.strip()]
+        elif arg.startswith("--exclude-overlays="):
+            exclude_overlays = [f.strip() for f in arg.split("=", 1)[1].split(",") if f.strip()]
+        elif arg == "--exclude-overlays":
+            _error("--exclude-overlays requires a value (e.g., --exclude-overlays=a.dtso,b.dtso)")
+            sys.exit(1)
 
     # Parse arguments based on count
     try:
@@ -350,7 +358,7 @@ def validate_and_parse_options(options, sdt):
         usage()
         sys.exit(1)
 
-    return platform, config, zynq_platforms, versal_platforms, firmware_override, node_specs, exclude_props, exclude_nodes
+    return platform, config, zynq_platforms, versal_platforms, firmware_override, node_specs, exclude_props, exclude_nodes, exclude_overlays
 
 def validate_amba_pl_node(amba_node):
     """
@@ -424,7 +432,7 @@ def create_fpga_node(platform, config, firmware_name, zynq_platforms, versal_pla
 
     Args:
         platform: Target platform (e.g., cortexa53-zynqmp, cortexa72-versal)
-        config: Configuration type (full, dfx, external-fpga-config)
+        config: Configuration type (full, segmented, dfx, external-fpga-config)
         firmware_name: Property containing firmware name value
         zynq_platforms: List of Zynq/ZynqMP platform identifiers
         versal_platforms: List of Versal/VersalNet platform identifiers
@@ -445,10 +453,10 @@ def create_fpga_node(platform, config, firmware_name, zynq_platforms, versal_pla
     fpga_node = LopperNode(name=fpga_node_name)
 
     # Configure fpga node based on platform and configuration:
-    # - "full" config: Uses firmware-name for all platforms
+    # - "full"/"segmented" config: Uses firmware-name for all platforms
     # - "dfx" config: Uses firmware-name for ZynqMP, external-fpga-config for Versal
     # - "external-fpga-config": Always uses external-fpga-config property
-    if config == "full":
+    if config in ("full", "segmented"):
         fpga_node["firmware-name"] = firmware_name.value
     elif config == "dfx":
         if platform in zynq_platforms:
@@ -515,7 +523,8 @@ def move_nodes_to_fpga(new_amba_node, fpga_node, node_collections, platform, con
     - misc_clk nodes (all platforms)
     - fpga_pr nodes (all platforms)
 
-    Conditionally moves (ZynqMP/Zynq platforms with "full" or "dfx" config only):
+    Conditionally moves (ZynqMP/Zynq platforms with non external-fpga-config,
+    i.e. "full", "segmented" or "dfx" config only):
     - clocking nodes
     - afi nodes
 
@@ -524,7 +533,7 @@ def move_nodes_to_fpga(new_amba_node, fpga_node, node_collections, platform, con
         fpga_node: The fpga node to add nodes to
         node_collections: Dictionary containing categorized node lists
         platform: Target platform identifier
-        config: Configuration type (full, dfx, external-fpga-config)
+        config: Configuration type (full, segmented, dfx, external-fpga-config)
         zynq_platforms: List of Zynq/ZynqMP platform identifiers
 
     Returns:
@@ -542,7 +551,7 @@ def move_nodes_to_fpga(new_amba_node, fpga_node, node_collections, platform, con
             new_amba_node = new_amba_node - pr_node
             fpga_node = fpga_node + pr_node
 
-    # For ZynqMP/Zynq platforms with "full" or "dfx" config, move AFI and clocking to fpga node
+    # For ZynqMP/Zynq platforms with "full", "segmented" or "dfx" config, move AFI and clocking to fpga node
     if (platform in zynq_platforms) and config != "external-fpga-config":
         if node_collections['clocking']:
             for clk_node in node_collections['clocking']:
@@ -769,16 +778,63 @@ Output:
     - pl.dtso: Copy of pl.dtsi with .dtso extension
     Note: Modified system device tree (with /amba_pl node removed) is written by lopper itself
 """
+
+def discover_overlay_files(sdt, exclude_overlays=None):
+    """Auto-discover *.dtso overlay files co-located with system-top.dts.
+
+    Scans the directory containing the input SDT file for files matching
+    the *.dtso extension and registers them via the same compilation path
+    used by the -i flag, so fragment_add_for_refs() emits them as overlay
+    fragments in pl.dtsi automatically.
+
+    Args:
+        sdt: LopperSDT object with .dts pointing to the input file
+        exclude_overlays: list of filename patterns to exclude (supports glob)
+    """
+    if not sdt.dts:
+        return
+
+    sdt_dir = Path(sdt.dts).resolve().parent
+    overlay_files = sorted(sdt_dir.glob('*.dtso'))
+
+    if not overlay_files:
+        return
+
+    if exclude_overlays:
+        overlay_files = [f for f in overlay_files
+                         if not any(f.match(pat) for pat in exclude_overlays)]
+
+    if not overlay_files:
+        return
+
+    existing = set(sdt.tree._metadata.get('overlay_subtrees', {}).keys())
+    new_files = []
+    for f in overlay_files:
+        if f.stem not in existing:
+            new_files.append(str(f))
+        else:
+            _info(f"Overlay '{f.stem}' already registered (via -i?), skipping")
+
+    if not new_files:
+        return
+
+    for f in new_files:
+        print(f"Auto-discovered overlay: {Path(f).name}")
+
+    sdt._compile_overlay_subtrees(new_files, str(sdt_dir))
+
 def xlnx_generate_overlay_dt(tgt_node, sdt, options):
     _level(utils.log_setup(options), __name__)
     # Parse and validate options
-    platform, config, zynq_platforms, versal_platforms, firmware_override, node_specs, exclude_props, exclude_nodes = validate_and_parse_options(options, sdt)
+    platform, config, zynq_platforms, versal_platforms, firmware_override, node_specs, exclude_props, exclude_nodes, exclude_overlays = validate_and_parse_options(options, sdt)
 
     # Remove SDT-specific properties from overlay automatically
     if exclude_props is None:
         exclude_props = ['address-map']
     elif 'address-map' not in exclude_props:
         exclude_props.append('address-map')
+
+    discover_overlay_files(sdt, exclude_overlays)
 
     overlay_tree = LopperTree()
 
@@ -851,7 +907,10 @@ def xlnx_generate_overlay_dt(tgt_node, sdt, options):
 
     # Write the main SDT output (base tree, no overlay values) and clear
     # sdt.output_file so the main lopper loop does not write a second copy.
-    if getattr(sdt, '_overlay_targets', None) and sdt.output_file:
+    overlay_subtrees = (
+        sdt.tree._metadata.get('overlay_subtrees') if sdt.tree else None
+    )
+    if overlay_subtrees and sdt.output_file:
         sdt.write()
         sdt.output_file = ""
 

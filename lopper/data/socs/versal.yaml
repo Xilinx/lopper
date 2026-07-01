@@ -1,0 +1,269 @@
+# AMD Versal SoC hardware description
+#
+# Sourced exclusively from public material:
+#   - xlnx-versal-power.h (Linux kernel, include/dt-bindings/power/,
+#     GPL-2.0; vendored under lopper/data/upstream/linux-xlnx/)
+#   - Zephyr's amd/versal.dtsi + arm/xilinx/versal_rpu.dtsi
+#     (Apache-2.0; vendored under lopper/data/upstream/zephyr/) —
+#     for TCM/OCM/GIC address facts on the RPU side
+#   - Versal ACAP Technical Reference Manual (UG1304, Xilinx/AMD,
+#     publicly downloadable) — for TCM global-view addresses, IPI
+#     buffer base, and cluster topology
+#
+# NOT sourced from any reference SDT, internal XSA, or
+# internal-only header.
+#
+# Schema: openamp,domain-v1,soc-facts (see sdt-from-linux design §6.1).
+# Loader picks this file by matching any `matches:` entry against the
+# input tree's root `compatible` list.
+#
+# Block layout in this file:
+#   pm_devices         — hex PM ID → canonical name lookup
+#                        (consumed today by compose_devices' PM-ID decoder)
+#   cluster_templates  — per-cluster-type silicon facts (compatible,
+#                        enable-method, default cpu count, per-cpu PM
+#                        IDs). Future M11+ assemble_sdt will read this
+#                        to emit per-cluster wrappers and GIC splits
+#                        when the board augment asks for a cluster.
+#   tcm_map            — RPU TCM banks: local address (R5 view),
+#                        global address (A72/PMC view), size, PM ID.
+#                        Future assemble_sdt will emit memory@ nodes.
+#   ocm_map            — OCM banks
+#   ipi                — IPI buffer base and channel count for the
+#                        message-passing interconnect; future
+#                        assemble_sdt will emit IPI mailbox topology
+#                        when partition intent declares IPI channels.
+#   gic                — Global Interrupt Controller layout (per
+#                        cluster); future per-cluster GIC split uses
+#                        this to wrap GIC under amba_apu / amba_rpu.
+
+domains:
+  versal:
+    compatible: openamp,domain-v1,soc-facts
+    soc_family: xlnx,versal
+    matches:
+      - xlnx,versal
+      - xlnx,versal-vck190-revA
+      - xlnx,versal-vmk180-revA
+      - xlnx,versal-vc-p-a2197-00-revA
+
+    pm_devices:
+      # Processors
+      0x18104001: PM_DEV_PMC_PROC
+      0x18108002: PM_DEV_PSM_PROC
+      0x1810c003: PM_DEV_ACPU_0
+      0x1810c004: PM_DEV_ACPU_1
+      0x18110005: PM_DEV_RPU0_0
+      0x18110006: PM_DEV_RPU0_1
+      # On-chip memory
+      0x18314007: PM_DEV_OCM_0
+      0x18314008: PM_DEV_OCM_1
+      0x18314009: PM_DEV_OCM_2
+      0x1831400a: PM_DEV_OCM_3
+      0x1831800b: PM_DEV_TCM_0_A
+      0x1831800c: PM_DEV_TCM_0_B
+      0x1831800d: PM_DEV_TCM_1_A
+      0x1831800e: PM_DEV_TCM_1_B
+      0x1831c00f: PM_DEV_L2_BANK_0
+      # DDR
+      0x18320010: PM_DEV_DDR_0
+      0x18520045: PM_DEV_DDRMC_0
+      0x18520046: PM_DEV_DDRMC_1
+      0x18520047: PM_DEV_DDRMC_2
+      0x18520048: PM_DEV_DDRMC_3
+      # LPD/FPD peripherals
+      0x18224018: PM_DEV_USB_0
+      0x18224019: PM_DEV_GEM_0
+      0x1822401a: PM_DEV_GEM_1
+      0x1822401b: PM_DEV_SPI_0
+      0x1822401c: PM_DEV_SPI_1
+      0x1822401d: PM_DEV_I2C_0
+      0x1822401e: PM_DEV_I2C_1
+      0x1822401f: PM_DEV_CAN_FD_0
+      0x18224020: PM_DEV_CAN_FD_1
+      0x18224021: PM_DEV_UART_0
+      0x18224022: PM_DEV_UART_1
+      0x18224023: PM_DEV_GPIO
+      0x18224024: PM_DEV_TTC_0
+      0x18224025: PM_DEV_TTC_1
+      0x18224026: PM_DEV_TTC_2
+      0x18224027: PM_DEV_TTC_3
+      0x18224028: PM_DEV_SWDT_LPD
+      0x18224029: PM_DEV_SWDT_FPD
+      0x1822402a: PM_DEV_OSPI
+      0x1822402b: PM_DEV_QSPI
+      0x1822402c: PM_DEV_GPIO_PMC
+      0x1822402d: PM_DEV_I2C_PMC
+      0x1822402e: PM_DEV_SDIO_0
+      0x1822402f: PM_DEV_SDIO_1
+      0x18224034: PM_DEV_RTC
+      0x18224035: PM_DEV_ADMA_0
+      0x18224036: PM_DEV_ADMA_1
+      0x18224037: PM_DEV_ADMA_2
+      0x18224038: PM_DEV_ADMA_3
+      0x18224039: PM_DEV_ADMA_4
+      0x1822403a: PM_DEV_ADMA_5
+      0x1822403b: PM_DEV_ADMA_6
+      0x1822403c: PM_DEV_ADMA_7
+      # IPI (inter-processor interrupts)
+      0x1822403d: PM_DEV_IPI_0
+      0x1822403e: PM_DEV_IPI_1
+      0x1822403f: PM_DEV_IPI_2
+      0x18224040: PM_DEV_IPI_3
+      0x18224041: PM_DEV_IPI_4
+      0x18224042: PM_DEV_IPI_5
+      0x18224043: PM_DEV_IPI_6
+      0x18224073: PM_DEV_IPI_PMC
+      # AI Engine
+      0x18224072: PM_DEV_AI
+
+    # Per-cluster-type silicon facts. Each entry describes ONE class
+    # of cluster the Versal Prime silicon (vc1902 and family) ships
+    # with. A board's augment.yaml says which clusters it actually
+    # populates; future assemble_sdt iterations read these templates
+    # to emit consistent cluster wrappers with the right PM IDs.
+    cluster_templates:
+      - role: apu
+        cluster_compatible: cpus,cluster
+        compatible: arm,cortex-a72
+        enable_method: psci
+        max_cpus: 2
+        per_cpu_pm_ids:                # in core-index order
+          - PM_DEV_ACPU_0
+          - PM_DEV_ACPU_1
+        notes: >
+          APU is the Linux-running cluster. Always present; the Linux
+          DT enumerates this side. Cache: 32K I + 32K D per core, 1 MB
+          unified L2.
+
+      - role: rpu
+        cluster_compatible: cpus,cluster
+        compatible: arm,cortex-r5
+        enable_method: xlnx,r5-remoteproc
+        max_cpus: 2
+        per_cpu_pm_ids:
+          - PM_DEV_RPU0_0
+          - PM_DEV_RPU0_1
+        modes: [split, lockstep]      # both RPU operating modes supported
+        notes: >
+          RPU is the real-time cluster. Two R5F cores that can run
+          split (independent) or lockstep (paired for safety). Each
+          core has its own ATCM + BTCM (see tcm_map). The APU
+          typically loads R5 firmware via the remoteproc driver.
+
+      - role: pmc
+        cluster_compatible: cpus,cluster
+        compatible: pmc-microblaze
+        enable_method: bootrom
+        max_cpus: 1
+        per_cpu_pm_ids:
+          - PM_DEV_PMC_PROC
+        notes: >
+          Platform Management Controller — runs the PLM firmware.
+          Boot-only from the Linux perspective; typically not
+          partitionable.
+
+      - role: psm
+        cluster_compatible: cpus,cluster
+        compatible: psm-microblaze
+        enable_method: bootrom
+        max_cpus: 1
+        per_cpu_pm_ids:
+          - PM_DEV_PSM_PROC
+        notes: >
+          Platform Security Module microblaze — handles low-power
+          state transitions on behalf of the PMC.
+
+    # RPU TCM (Tightly Coupled Memory) banks. Each R5 core has an
+    # ATCM and BTCM, each 32 KB. The "local" address is what the R5
+    # sees (0x0 for ATCM, 0x20000 for BTCM); the "global" address
+    # (0xFFE0_0000 range) is what the APU / PMC see via the system
+    # interconnect. Lockstep mode aliases the second R5's TCM
+    # addresses; split mode exposes both pairs independently.
+    tcm_map:
+      - name: PM_DEV_TCM_0_A           # RPU0 core 0 ATCM
+        pm_id: 0x1831800b
+        local_addr: 0x00000000
+        global_addr: 0xffe00000
+        size: 0x10000                  # 64 KB (per TRM UG1304)
+        rpu_core: 0
+      - name: PM_DEV_TCM_0_B           # RPU0 core 0 BTCM
+        pm_id: 0x1831800c
+        local_addr: 0x00020000
+        global_addr: 0xffe20000
+        size: 0x10000
+        rpu_core: 0
+      - name: PM_DEV_TCM_1_A           # RPU0 core 1 ATCM
+        pm_id: 0x1831800d
+        local_addr: 0x00000000         # core-local; same as core 0 in lockstep
+        global_addr: 0xffe90000        # global view distinct
+        size: 0x10000
+        rpu_core: 1
+      - name: PM_DEV_TCM_1_B           # RPU0 core 1 BTCM
+        pm_id: 0x1831800e
+        local_addr: 0x00020000
+        global_addr: 0xffeb0000
+        size: 0x10000
+        rpu_core: 1
+
+    # OCM (On-Chip Memory) banks — 256 KB total, accessible from
+    # both APU and RPU. Confirmed via Zephyr's amd/versal.dtsi
+    # (`memory@fffc0000, size = 256K`).
+    ocm_map:
+      base: 0xfffc0000
+      total_size: 0x40000              # 256 KB
+      bank_size: 0x10000               # 64 KB per PM-tracked bank
+      banks:
+        - { name: PM_DEV_OCM_0, pm_id: 0x18314007, offset: 0x00000 }
+        - { name: PM_DEV_OCM_1, pm_id: 0x18314008, offset: 0x10000 }
+        - { name: PM_DEV_OCM_2, pm_id: 0x18314009, offset: 0x20000 }
+        - { name: PM_DEV_OCM_3, pm_id: 0x1831400a, offset: 0x30000 }
+
+    # Versal IPI (Inter-Processor Interrupt) topology. The buffer
+    # base is at 0xFF3F_0000 (LPD region) per UG1304. There are 8 IPI
+    # agents in total (IPI_0..IPI_6 plus IPI_PMC), each with its own
+    # PM device ID for power control.
+    ipi:
+      compatible: xlnx,zynqmp-ipi-mailbox   # binding used for Versal IPI too
+      buffer_base: 0xff3f0000
+      buffer_size: 0x10000              # 64 KB per UG1304
+      channel_count: 8
+      channels:
+        - { name: PM_DEV_IPI_0,   pm_id: 0x1822403d, role: general }
+        - { name: PM_DEV_IPI_1,   pm_id: 0x1822403e, role: general }
+        - { name: PM_DEV_IPI_2,   pm_id: 0x1822403f, role: general }
+        - { name: PM_DEV_IPI_3,   pm_id: 0x18224040, role: general }
+        - { name: PM_DEV_IPI_4,   pm_id: 0x18224041, role: general }
+        - { name: PM_DEV_IPI_5,   pm_id: 0x18224042, role: general }
+        - { name: PM_DEV_IPI_6,   pm_id: 0x18224043, role: general }
+        - { name: PM_DEV_IPI_PMC, pm_id: 0x18224073, role: pmc }
+
+    # Global Interrupt Controller (GIC-500, ARM GIC-v3) layout.
+    # Single physical GIC, two views: amba_apu wraps the GIC seen by
+    # the A72 cluster; amba_rpu wraps the GIC seen by the R5 cluster.
+    # Both views point at the same hardware. Addresses confirmed via
+    # the vendored Zephyr versal_rpu.dtsi (gic @ 0xf9000000).
+    gic:
+      compatible: arm,gic-v3
+      distributor:    { addr: 0xf9000000, size: 0x10000 }
+      redistributor:  { addr: 0xf9080000, size: 0x80000 }
+      cpu_interface:  { addr: 0xf9001000, size: 0x2000 }   # GICv2 compat
+      its:            { addr: 0xf9020000, size: 0x20000 }  # MSI controller
+      # Per-cluster bus wrapping for the per-cluster GIC view:
+      apu_bus: amba_apu
+      rpu_bus: amba_rpu
+
+# Encoding key (Versal PM node ID layout, from public TRM):
+#   0x18 _C_ N N _I I  where:
+#     0x18 = device-class (NODE_CLASS=DEVICE)
+#     C    = subclass nibble:
+#            0x10 → cluster control (subdivided below)
+#            0x22 → LPD/FPD peripheral
+#            0x31 → memory (OCM/TCM/L2)
+#            0x32 → DDR memory
+#            0x33 → memory-region (XRAM)
+#            0x42 → power-island/SOC
+#            0x52 → DDR controller
+#     NN   = type sub-nibble (4=PMC_PROC, 8=PSM_PROC,
+#            0c=ACPU, 10=RPU0, ...)
+#     II   = per-type index

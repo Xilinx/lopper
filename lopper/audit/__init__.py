@@ -73,23 +73,28 @@ from .memviz import (
 
 # Re-export schema validation functions and classes
 from .schema import (
-    # Enums
+    # Data classes (note: ConstraintType is re-exported from lopper.schema.core)
     ConstraintType,
-    # Data classes
-    PropertyConstraint,
+    PropertyConstraint,  # Alias for lopper.schema.core.Constraint
     NodeConstraints,
     # Constraint definitions
     NODE_PROPERTY_CONSTRAINTS,
-    # Validation functions
+    # Validation functions (dt-schema based)
     check_forbidden_properties,
     check_required_properties,
     check_property_values,
     check_mutex_properties,
+    # Validation functions (learned schema based)
+    check_learned_type_violations,
+    check_type_frequency_anomalies,
     # Validator class
     SchemaValidator,
     # Convenience function
     validate_schema,
 )
+
+# Also export Constraint directly for code using the new unified name
+from lopper.schema.core import Constraint
 
 # Define what is exported when using `from lopper.audit import *`
 __all__ = [
@@ -131,15 +136,19 @@ __all__ = [
     # Schema enums
     'ConstraintType',
     # Schema data classes
-    'PropertyConstraint',
+    'Constraint',  # New unified name
+    'PropertyConstraint',  # Alias for Constraint (backwards compatibility)
     'NodeConstraints',
     # Schema constraints
     'NODE_PROPERTY_CONSTRAINTS',
-    # Schema validation functions
+    # Schema validation functions (dt-schema based)
     'check_forbidden_properties',
     'check_required_properties',
     'check_property_values',
     'check_mutex_properties',
+    # Schema validation functions (learned schema based)
+    'check_learned_type_violations',
+    'check_type_frequency_anomalies',
     # Schema validator
     'SchemaValidator',
     'validate_schema',
