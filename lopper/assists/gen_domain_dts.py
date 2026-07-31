@@ -1189,26 +1189,28 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine, options=None):
                             rounded_clk = int(round(clk_freq[0] / 1000000.0)) * 1000000
                             node["clock-frequency"] = LopperProp("clock-frequency")
                             node["clock-frequency"].value = rounded_clk
+                            node.delete(node["timer-width"])
                             node.add(node["clock-frequency"])
                         else:
+                            node["compatible"] = "xlnx,ttc"
+                            node["clock-frequency"] = LopperProp("clock-frequency")
+                            node["clock-frequency"].value = node["xlnx,clock-freq"].value
+                            node.add(node["clock-frequency"])
+                            node + LopperProp(name="#address-cells", value=[1])
+                            node + LopperProp(name="#size-cells", value=[0])
                             for i in range(3):
-                                new_node = LopperNode()
-                                new_node["compatible"] = "xlnx,ttc-counter"
-                                new_node["clock-frequency"] = LopperProp("clock-frequency")
-                                new_node["clock-frequency"].value = node["xlnx,clock-freq"].value
-                                new_node.add(new_node["clock-frequency"])
-                                new_node["reg"] = node["reg"]
-                                new_node.label_set(f"{node.label}_timer{i}")
-                                new_node["interrupt-parent"] = node["interrupt-parent"]
-                                new_node.name = f"counter{i}@{node['reg'][1]:x}"
-                                new_node["timer-id"] = LopperProp("timer-id")
-                                new_node["timer-id"].value = i
-                                new_node["interrupts"] = LopperProp("interrupts")
-                                new_node["interrupts"].value = node["interrupts"].value[i * 4 : (i + 1) * 4]
-                                new_node["timer-width"] = node["timer-width"]
-                                new_node.parent = node.parent
-                                node.parent.add(new_node)
-                            sdt.tree.delete(node)
+                                child = LopperNode()
+                                child.name = f"counter@{i}"
+                                child.label_set(f"{node.label}_timer{i}")
+                                child + LopperProp(name="compatible", value=["xlnx,ttc-counter"])
+                                child + LopperProp(name="reg", value=[i])
+                                child["interrupts"] = LopperProp("interrupts")
+                                child["interrupts"].value = \
+                                node["interrupts"].value[i * 4:(i + 1) * 4]
+                                child["status"] = "disabled"
+                                node.add(child)
+                            node.delete("interrupts")
+                            node["status"] = "disabled"
                     # CANFD
                     if "xlnx,canfd-2.0" in node["compatible"].value:
                         node["compatible"] = "xlnx,canfd-2.0"
@@ -1223,6 +1225,11 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine, options=None):
                             node["#size-cells"] = LopperProp("#size-cells")
                             node["#size-cells"].value = 0
                             node.add(node["#size-cells"])
+
+                        if node.propval("xlnx,clock-freq") != ['']:
+                            node + LopperProp(name="clock-frequency",
+                                              value=node["xlnx,clock-freq"].value)
+
                     # SPIPS
                     if "cdns,spi-r1p6" in node["compatible"].value:
                         node["compatible"] = "cdns,spi"
@@ -1539,6 +1546,23 @@ def generate_board_kconfig_defconfig(isa_string, cpu_node, intc_node, num_interr
                 content += f"config {config_name}\n"
                 content += "\tdefault y\n\n"
                 added_extensions.add(config_name)
+
+    # Design-specific defaults: NUM_IRQS and PMP only.
+    if cpu_node is not None and cpu_node.propval('xlnx,pmp-entries') != ['']:
+        pmp_entries = cpu_node.propval('xlnx,pmp-entries', list)[0]
+        if pmp_entries % 8 == 0 and pmp_entries != 0:
+            content += "config RISCV_PMP\n"
+            content += "\tdefault y\n\n"
+            content += "config PMP_SLOTS\n"
+            content += f"\tdefault {pmp_entries}\n\n"
+            if cpu_node.propval('xlnx,pmp-granularity') != ['']:
+                pmp_granularity = cpu_node.propval('xlnx,pmp-granularity', list)[0]
+                content += "config PMP_GRANULARITY\n"
+                content += f"\tdefault {pow(pmp_granularity + 2, 2)}\n\n"
+
+    if num_interrupts:
+        content += "config NUM_IRQS\n"
+        content += f"\tdefault {num_interrupts}\n\n"
 
     content += "endif\n"
     return content
@@ -1878,7 +1902,7 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
                             if val == "axi_intc":
                                 num_intr = node.propval('xlnx,num-intr-inputs', list)[0]
                                 num_intr += 12
-                            else:
+                            elif val == "iomodule":
                                 num_intr = 32
                         is_supported_periph = [value for key,value in schema.items() if key in node["compatible"].value]
                         result = _apply_pl_peripheral_transforms(node, schema,

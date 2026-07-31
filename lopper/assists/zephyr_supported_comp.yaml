@@ -332,6 +332,7 @@ xlnx,versal-ospi-1.0:
     - cdns,fifo-width
     - '#address-cells'
     - '#size-cells'
+    - clock-frequency
 
 cdns,spi-r1p6:
   required:
@@ -463,6 +464,9 @@ cdns,ttc:
     - interrupts
     - interrupt-names
     - clock-frequency
+    - timer-width
+    - '#address-cells'
+    - '#size-cells'
 
 xlnx,iomodule-3.1:
   required:
