@@ -23,8 +23,110 @@ from baremetalconfig_xlnx import compat_list, get_cpu_node, get_mapped_nodes, ge
 from common_utils import to_cmakelist
 import common_utils as utils
 from domain_access import update_mem_node
-from zephyr_board_dt import process_overlay_with_lopper_api
+from zephyr_board_dt import merge_board_overlay_from_sdt, merge_board_overlay_content
 from openamp_xlnx import xlnx_openamp_keep_node
+
+
+def _xlnx_zephyr_assign_ttc0(tree, machine):
+    """Give the Zephyr-selected ZynqMP/Versal R5 TTC a stable label.
+
+    Domain access has already removed devices that are not assigned to the
+    target. Preserve an explicit ``ttc0`` selection. If none exists, promote
+    the first TTC retained for this domain so Zephyr has its conventional
+    timer label.
+    """
+    if not ("psu_cortexr5" in machine or "psv_cortexr5" in machine):
+        return
+
+    ttc_compatibles = {"cdns,ttc", "xlnx,ttcps"}
+    ttc_nodes = []
+    for node in tree.nodes('.*'):
+        compatibles = set(node.propval("compatible", list))
+        if compatibles & ttc_compatibles:
+            ttc_nodes.append(node)
+
+    if any(node.label == "ttc0" for node in ttc_nodes):
+        return
+    if not ttc_nodes:
+        return
+
+    ttc = ttc_nodes[0]
+    ttc.label_set("ttc0")
+    try:
+        symbols = tree["/__symbols__"]
+    except KeyError:
+        symbols = LopperNode(-1, "/__symbols__")
+        tree + symbols
+    symbols["ttc0"] = ttc.abs_path
+
+
+def xlnx_zephyr_fixup_rpu_memory_names(tree, machine, memory_nodes):
+    """Match R5/R52 Zephyr memory unit addresses to their local reg view."""
+    if not ("cortexr5" in machine or "cortexr52" in machine):
+        return
+
+    chosen = tree['/chosen']
+    chosen_refs = {
+        prop.name: chosen.propval(prop.name, list)[0]
+        for prop in chosen
+        if len(chosen.propval(prop.name, list)) == 1
+    }
+
+    local_tcm_nodes = []
+    for node in tree.nodes('.*'):
+        regions = node.propval("zephyr,memory-region", list)
+        if (node.abs_path == chosen_refs.get("zephyr,sram") or
+                any("TCM" in region for region in regions)):
+            local_tcm_nodes.append(node)
+
+    renamed = False
+    for node in list(memory_nodes) + local_tcm_nodes:
+        reg = node.propval("reg", list)
+        if len(reg) < 4:
+            continue
+        old_path = node.abs_path
+        stem = node.name.split('@', 1)[0]
+        # RPU local TCM addresses use a zero high cell, so reg[1] is the
+        # unit address visible to the processor.
+        new_name = "%s@%x" % (stem, reg[1])
+        new_path = "%s/%s" % (node.parent.abs_path.rstrip('/'), new_name)
+        if new_path == old_path:
+            continue
+        tree.delete(node)
+        node.abs_path = new_path
+        node.name = new_name
+        tree.add(node)
+        renamed = True
+        for prop_name, path in chosen_refs.items():
+            if path == old_path:
+                chosen[prop_name] = new_path
+
+        try:
+            symbols = tree['/__symbols__']
+            for prop in symbols:
+                if symbols.propval(prop.name, list) == [old_path]:
+                    symbols[prop.name] = new_path
+        except KeyError:
+            pass
+
+    if renamed:
+        tree.resolve()
+        tree.sync()
+
+
+def _xlnx_zephyr_convert_zynqmp_ipi_id(node):
+    """Convert a ZynqMP mailbox IPI identifier when one is present."""
+    if not node.props("xlnx,ipi-id"):
+        return
+
+    if "xlnx,zynqmp-ipi-dest-mailbox" in node["compatible"].value:
+        node + LopperProp(name="remote-ipi-id",
+                          value=node["xlnx,ipi-id"].value)
+        node.delete("xlnx,ipi-id")
+    elif "xlnx,zynqmp-ipi-mailbox" in node["compatible"].value:
+        node + LopperProp(name="local-ipi-id",
+                          value=node["xlnx,ipi-id"].value)
+        node.delete("xlnx,ipi-id")
 
 
 def _extra_zephyr_comp_paths(options):
@@ -104,6 +206,16 @@ def is_compat( node, compat_string_to_test ):
     if "module,gen_domain_dts" in compat_string_to_test:
         return xlnx_generate_domain_dts
     return ""
+
+def _zephyr_node_must_be_preserved(node, tree):
+    """Return True for explicit Zephyr regions and chosen-node references."""
+    if "zephyr,memory-region" in node.propval("compatible", list):
+        return True
+    try:
+        chosen = tree['/chosen']
+    except KeyError:
+        return False
+    return any(node.abs_path in prop.value for prop in chosen.__props__.values())
 
 def filter_ipi_nodes_for_cpu(sdt, machine):
     """
@@ -439,6 +551,9 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
         modify_val = update_mem_node(node, prop_val)
         node['reg'].value = modify_val
 
+    if zephyr_dt:
+        xlnx_zephyr_fixup_rpu_memory_names(sdt.tree, machine, memnode_list)
+
     if linux_dt:
         for node in memnode_list:
             # Yocto project expects zynq DDR base addresses to start from 0x0 for linux to boot.
@@ -545,7 +660,8 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                     # of the device-tree intact and also to keep the nodes which are required for the mapped nodes to function properly.
                     mapped_children_nodes.append(node)
                     continue
-                elif xlnx_openamp_keep_node(linux_dt, zephyr_dt, node, sdt.tree):
+                elif (xlnx_openamp_keep_node(linux_dt, zephyr_dt, node, sdt.tree) or
+                      _zephyr_node_must_be_preserved(node, sdt.tree)):
                     continue
                 else:
                     sdt.tree.delete(node)
@@ -718,6 +834,7 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
     if zephyr_dt:
         if "r52" in machine or "a78" in machine or "a72" in machine or "r5" in machine or "a53" in machine:
             xlnx_generate_zephyr_domain_dts_arm(tgt_node, sdt, options, machine)
+            _xlnx_zephyr_assign_ttc0(sdt.tree, machine)
             if "a78" in machine or "a72" in machine:
                 new_dst_node = LopperNode()
                 new_dst_node['compatible'] = "arm,psci-1.1"
@@ -747,12 +864,18 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
             pass
         if zephyr_board_dt and os.path.exists(zephyr_board_dt):
             try:
-                # Read the overlay file
-                with open(zephyr_board_dt, 'r') as f:
-                    overlay_content = f.read()
-                cleaned_content = process_overlay_with_lopper_api(overlay_content, sdt.tree)
-                with open(os.path.join(sdt.outdir, "board.overlay"), 'w') as f:
-                    f.write(cleaned_content)
+                if os.path.isdir(zephyr_board_dt):
+                    merge_board_overlay_from_sdt(sdt, options)
+                else:
+                    with open(zephyr_board_dt, 'r') as f:
+                        overlay_content = f.read()
+                    sdt_folder = os.path.dirname(zephyr_board_dt)
+                    merge_board_overlay_content(
+                        overlay_content,
+                        sdt.tree,
+                        sdt=sdt,
+                        sdt_folder=sdt_folder,
+                    )
             except Exception as e:
                 print(f"[ERROR] Failed to process overlay file: {e}")
                 import traceback
@@ -1081,6 +1204,10 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine, options=None):
                     elif "xlnx,versal-ipi-dest-mailbox" in node["compatible"].value:
                         node["compatible"].value = ["xlnx,mbox-versal-ipi-dest-mailbox"]
                         node.name = f"child@{hex(node.propval('reg')[1])[2:]}"
+                    _xlnx_zephyr_convert_zynqmp_ipi_id(node)
+                    if "xlnx,zynqmp-ipi-mailbox" in node["compatible"].value:
+                        node + LopperProp(name="reg-names", value="host_ipi_reg")
+                        node + LopperProp(name="status", value="okay")
                     # PS-IIC
                     if "cdns,i2c-r1p14" in node["compatible"].value:
                         node["compatible"].value = ["cdns,i2c"]
@@ -1396,8 +1523,20 @@ def xlnx_remove_unsupported_nodes(tgt_node, sdt, machine, options=None):
                             if prop not in required_prop:
                                 node.delete(prop)
                     else:
-                        if node.name not in ("axi", "soc", "amba_pl") and node not in memnode_list and not xlnx_openamp_keep_node(False, True, node, sdt.tree):
+                        if (node.name not in ("axi", "soc", "amba_pl") and
+                                node not in memnode_list and
+                                not xlnx_openamp_keep_node(False, True, node, sdt.tree) and
+                                not _zephyr_node_must_be_preserved(node, sdt.tree)):
                             sdt.tree.delete(node)
+
+    for node in root_sub_nodes:
+        if (node.props("remote-ipi-id") and node.parent and
+                "xlnx,zynqmp-ipi-mailbox" in
+                node.parent.propval("compatible", list)):
+            if node.props("compatible"):
+                node.delete("compatible")
+            if node.props("#mbox-cells"):
+                node.delete("#mbox-cells")
 
     for node in memnode_list:
         if node.propval('ranges') != ['']:
@@ -1828,7 +1967,8 @@ def xlnx_generate_zephyr_domain_dts(tgt_node, sdt, options):
 
             selected_sram = ddr_memory or bram_memory or ocm_memory
 
-            if selected_sram:
+            if (selected_sram and
+                    chosen_node.propval('zephyr,sram', list) == ['']):
                 chosen_node['zephyr,sram'] = LopperProp(name="zephyr,sram", value=selected_sram.abs_path)
         except Exception:
             pass
