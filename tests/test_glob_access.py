@@ -274,6 +274,252 @@ domains:
         assert "serialff000000" in zephyr_access, \
             "serial@ff000000 should be in zephyr (explicit claim)"
 
+    def test_star_no_parent_pool_keeps_all(self, tmp_path):
+        """An unscoped '*' (no parent device pool) means "everything": it must
+        not error, and domain_access must keep the tree (no device pruning)
+        while removing the transient keep-all marker."""
+        import subprocess
+        import os
+
+        domains_yaml = tmp_path / "keepall.yaml"
+        domains_yaml.write_text("""
+domains:
+  keepall:
+    compatible: openamp,domain-v1
+    id: 0
+    os,type: linux
+    access:
+    - dev: "*"
+""")
+
+        output_dts = tmp_path / "output.dts"
+        cmd = [
+            "./lopper.py", "-f", "--permissive", "--auto",
+            "-i", str(domains_yaml),
+            "./lopper/selftest/system-top.dts",
+            str(output_dts),
+            "--", "domain_access", "-t", "/domains/keepall",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=os.getcwd())
+
+        # Previously fatal ("no parent domain found"); now succeeds.
+        assert result.returncode == 0, f"Lopper failed: {result.stderr}"
+
+        content = output_dts.read_text()
+        # The whole tree is kept (a scoped domain would have pruned most of these).
+        assert content.count("@") > 10, \
+            "keep-all should retain the system's device nodes, not prune them"
+        # The keep-all marker is persisted as provenance (the keep-all
+        # equivalent of a scoped domain's access list), so it stays in the
+        # output for idempotent re-consumption; strip at finalize if unwanted.
+        assert "lopper,access-keep-all" in content, \
+            "keep-all marker should persist in the output as provenance"
+
+    def test_memory_star_keeps_all_physical_memory(self, tmp_path):
+        """memory: '*' keeps all physical memory nodes with their full reg (not
+        shrunk to a domain allocation); the keep-all markers persist as
+        provenance."""
+        import subprocess
+        import os
+
+        domains_yaml = tmp_path / "memall.yaml"
+        domains_yaml.write_text("""
+domains:
+  memall:
+    compatible: openamp,domain-v1
+    id: 0
+    os,type: linux
+    access:
+    - dev: "*"
+    memory:
+    - "*"
+""")
+
+        output_dts = tmp_path / "output.dts"
+        cmd = [
+            "./lopper.py", "-f", "--permissive", "--auto",
+            "-i", str(domains_yaml),
+            "./lopper/selftest/system-top.dts",
+            str(output_dts),
+            "--", "domain_access", "-t", "/domains/memall",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=os.getcwd())
+        assert result.returncode == 0, f"Lopper failed: {result.stderr}"
+
+        content = output_dts.read_text()
+        # All physical memory nodes retained (system-top.dts ships several).
+        assert content.count('device_type = "memory"') >= 5, \
+            "memory: '*' should keep all physical memory nodes"
+        # Full DDR reg preserved (a scoped domain would shrink it).
+        assert "0x7ff00000" in content.lower(), \
+            "memory: '*' should preserve full physical memory reg, not shrink it"
+        # Markers persist as provenance (idempotent re-consumption).
+        assert "lopper,access-keep-all" in content and "lopper,memory-keep-all" in content, \
+            "keep-all markers should persist in the output as provenance"
+
+    def test_cli_overrides_equivalent_to_star_domain(self, tmp_path):
+        """The command-line overrides (--no-device-prune --no-memory-prune) on a
+        plain domain produce the same *functional* output as expressing keep-all
+        as data (access: '*' + memory: '*') on the same domain. The data form
+        additionally persists provenance markers (which the flag form has no
+        reason to emit), so equality is checked after normalizing those lines
+        out. Data is the primary mechanism (works auto-fired/in pipelines); the
+        flags are an override."""
+        import subprocess
+        import os
+
+        cli_yaml = tmp_path / "cli.yaml"
+        cli_yaml.write_text("""
+domains:
+  d:
+    compatible: openamp,domain-v1
+    id: 0
+    os,type: linux
+""")
+        data_yaml = tmp_path / "data.yaml"
+        data_yaml.write_text("""
+domains:
+  d:
+    compatible: openamp,domain-v1
+    id: 0
+    os,type: linux
+    access:
+    - dev: "*"
+    memory:
+    - "*"
+""")
+
+        def run(inp, extra):
+            out = tmp_path / (os.path.basename(str(inp)) + ".out.dts")
+            cmd = ["./lopper.py", "-f", "--permissive", "--auto",
+                   "-i", str(inp), "./lopper/selftest/system-top.dts", str(out),
+                   "--", "domain_access", "-t", "/domains/d"] + extra
+            r = subprocess.run(cmd, capture_output=True, text=True, cwd=os.getcwd())
+            assert r.returncode == 0, f"lopper failed: {r.stderr}"
+            return out.read_text()
+
+        cli_out = run(cli_yaml, ["--no-device-prune", "--no-memory-prune"])
+        data_out = run(data_yaml, [])
+
+        def strip_markers(text):
+            return "\n".join(l for l in text.splitlines()
+                             if "keep-all" not in l)
+
+        assert strip_markers(cli_out) == strip_markers(data_out), \
+            "CLI overrides and access/memory '*' data must produce the same " \
+            "functional output (ignoring the data form's provenance markers)"
+        # And the data form does carry the provenance markers.
+        assert "lopper,access-keep-all" in data_out and "lopper,memory-keep-all" in data_out, \
+            "the data form should persist keep-all markers"
+        assert cli_out.count('device_type = "memory"') >= 5, \
+            "both approaches should keep the full physical memory"
+
+    def test_sram_star_no_garbage_reg(self, tmp_path):
+        """sram: '*' is handled symmetrically to memory: '*' — no specific
+        carveout is assigned and, crucially, the old garbage-reg fallback
+        (sram = <0xdead 0xffff>, from the string '*' hitting m.keys()) is gone.
+        sram *node* retention is access's job, so access: '*' keeps the
+        mmio-sram devices; the sram marker only suppresses the carveout."""
+        import subprocess
+        import os
+
+        domains_yaml = tmp_path / "sramall.yaml"
+        domains_yaml.write_text("""
+domains:
+  sramall:
+    compatible: openamp,domain-v1
+    id: 0
+    os,type: linux
+    access:
+    - dev: "*"
+    sram:
+    - "*"
+""")
+
+        output_dts = tmp_path / "output.dts"
+        cmd = [
+            "./lopper.py", "-f", "--permissive", "--auto",
+            "-i", str(domains_yaml),
+            "./lopper/selftest/system-top.dts",
+            str(output_dts),
+            "--", "domain_access", "-t", "/domains/sramall",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=os.getcwd())
+        assert result.returncode == 0, f"Lopper failed: {result.stderr}"
+
+        content = output_dts.read_text()
+        # The garbage fallback reg must not appear.
+        assert "0xdead" not in content.lower(), \
+            "sram: '*' produced the garbage-reg fallback (0xdead ...)"
+        # The sram keep-all marker persists as provenance.
+        assert "lopper,sram-keep-all" in content, \
+            "sram keep-all marker should persist in the output as provenance"
+        # access: '*' keeps the mmio-sram device nodes.
+        assert "mmio-sram" in content, \
+            "access: '*' should retain the mmio-sram device nodes"
+
+    def test_keepall_survives_roundtrip_and_is_idempotent(self, tmp_path):
+        """The keep-all marker is a persisted 'lopper,' property, so:
+          1) it survives a DTS round-trip (expand -> write -> domain_access on
+             the written DTS still keeps everything); a non-persistent name
+             (e.g. '__'-prefixed, stripped on reload) would silently prune the
+             domain to bare and drop all memory, and
+          2) it makes domain_access idempotent on its own output: re-consuming
+             the result in a further stage keeps everything again, instead of
+             bare-pruning a domain that no longer carries access/memory data.
+        Guards against re-introducing a non-persistent name or re-adding the
+        marker-delete."""
+        import subprocess
+        import os
+
+        domains_yaml = tmp_path / "ka.yaml"
+        domains_yaml.write_text("""
+domains:
+  ka:
+    compatible: openamp,domain-v1
+    id: 0
+    os,type: linux
+    access:
+    - dev: "*"
+    memory:
+    - "*"
+""")
+
+        def domain_access_on(inp):
+            out = tmp_path / (os.path.basename(str(inp)) + ".da.dts")
+            r = subprocess.run(
+                ["./lopper.py", "-f", "--enhanced", str(inp), str(out),
+                 "--", "domain_access", "-t", "/domains/ka"],
+                capture_output=True, text=True, cwd=os.getcwd())
+            assert r.returncode == 0, f"domain_access failed: {r.stderr}"
+            return out
+
+        # Step 1: expand YAML into a written DTS (the round-trip boundary).
+        expanded = tmp_path / "expanded.dts"
+        r1 = subprocess.run(
+            ["./lopper.py", "-f", "--permissive", "--enhanced", "--auto",
+             "-i", str(domains_yaml), "./lopper/selftest/system-top.dts", str(expanded)],
+            capture_output=True, text=True, cwd=os.getcwd())
+        assert r1.returncode == 0, f"expand failed: {r1.stderr}"
+        assert "lopper,access-keep-all" in expanded.read_text(), \
+            "keep-all marker did not persist into the expanded DTS (non-persistent name?)"
+
+        # Step 2: domain_access on the reloaded DTS must still keep everything,
+        # and the marker must persist for the next stage.
+        out2 = domain_access_on(expanded)
+        c2 = out2.read_text()
+        assert c2.count('device_type = "memory"') >= 5, \
+            "keep-all lost across the DTS round-trip (memory nodes pruned)"
+        assert "lopper,access-keep-all" in c2 and "lopper,memory-keep-all" in c2, \
+            "keep-all markers must persist for idempotent re-consumption"
+
+        # Step 3: re-consume the previous output. Because the markers persist,
+        # this is idempotent (a deleted-marker design would bare-prune here).
+        out3 = domain_access_on(out2)
+        c3 = out3.read_text()
+        assert c3.count('device_type = "memory"') >= 5, \
+            "re-consuming the keep-all output pruned it (markers not idempotent)"
+
     def test_peer_exclusion_multiple_explicit(self, tmp_path):
         """Test multiple explicit refs are all excluded from glob."""
         import subprocess
@@ -728,3 +974,96 @@ class TestPathRefPruning:
         remaining_chosen = [p.name for p in chosen]
         assert "stdout-path" not in remaining_chosen, \
             "stdout-path referencing pruned alias must itself be pruned"
+
+
+class TestRenameFollowsRefs:
+    """LopperTree.rename() / update_path_refs() / sync(follow_renames=True):
+    when a node is renamed in place, path references to it (and its
+    descendants) follow to the new path instead of being dropped as dangling.
+    Renames only -- moves never follow (a path-ref addresses a location;
+    phandles follow identity)."""
+
+    OLD = "/axi/serial@f1920000"
+    NEW_NAME = "uart@f1920000"
+    NEW = "/axi/uart@f1920000"
+
+    def _tree(self):
+        from lopper.tree import LopperTree, LopperNode, LopperProp
+
+        tree = LopperTree()
+        root = LopperNode(-1, "/"); root.abs_path = "/"; tree + root
+        axi = LopperNode(-1, "axi"); axi.abs_path = "/axi"; tree + axi
+        ser = LopperNode(-1, "serial@f1920000"); ser.abs_path = self.OLD; tree + ser
+        foo = LopperNode(-1, "foo"); foo.abs_path = self.OLD + "/foo"; tree + foo
+
+        aliases = LopperNode(-1, "aliases"); aliases.abs_path = "/aliases"; tree + aliases
+        a0 = LopperProp("serial0", -1, aliases, [self.OLD]); a0.pclass = "string"; aliases + a0
+        # a reference to a *descendant* of the node being renamed
+        ad = LopperProp("serial0foo", -1, aliases, [self.OLD + "/foo"]); ad.pclass = "string"; aliases + ad
+        tree.resolve()
+        return tree, ser, aliases
+
+    def test_rename_follows_path_refs(self):
+        """rename() rewrites refs to the node and to its descendants."""
+        tree, ser, aliases = self._tree()
+        tree.rename(ser, self.NEW_NAME)
+        assert ser.abs_path == self.NEW
+        assert aliases.propval("serial0") == [self.NEW], \
+            "path-ref to the renamed node should follow the rename"
+        assert aliases.propval("serial0foo") == [self.NEW + "/foo"], \
+            "path-ref to a descendant of the renamed node should follow too"
+
+    def test_rename_rejects_move(self):
+        """rename() takes a leaf name, not a path -- reparenting is a move."""
+        import pytest
+        tree, ser, _ = self._tree()
+        with pytest.raises(ValueError):
+            tree.rename(ser, "soc/uart@f1920000")
+
+    def test_sync_follow_renames_is_opt_in(self):
+        """A raw `node.name = ...; tree.sync()` (default) must NOT rewrite refs;
+        `sync(follow_renames=True)` must."""
+        # default off: refs unchanged
+        tree, ser, aliases = self._tree()
+        ser.name = self.NEW_NAME
+        tree.sync()
+        assert aliases.propval("serial0") == [self.OLD], \
+            "default sync must not follow renames (opt-in only)"
+
+        # opt-in on: refs follow
+        tree, ser, aliases = self._tree()
+        ser.name = self.NEW_NAME
+        tree.sync(follow_renames=True)
+        assert aliases.propval("serial0") == [self.NEW], \
+            "sync(follow_renames=True) should follow the rename"
+
+    def test_update_path_refs_skips_symbols(self):
+        """/__symbols__ is rebuilt from abs_path on resolve(); update_path_refs
+        must not touch it."""
+        from lopper.tree import LopperNode, LopperProp
+        tree, ser, aliases = self._tree()
+        sym = LopperNode(-1, "__symbols__"); sym.abs_path = "/__symbols__"; tree + sym
+        ps = LopperProp("ser", -1, sym, [self.OLD]); ps.pclass = "string"; sym + ps
+        tree.update_path_refs(self.OLD, self.NEW)
+        assert tree["/__symbols__"].propval("ser") == [self.OLD], \
+            "update_path_refs must skip /__symbols__ (resolve rebuilds it)"
+        assert aliases.propval("serial0") == [self.NEW], \
+            "non-symbols path-refs should still be rewritten"
+
+    def test_update_path_refs_excludes_non_path_typed_names(self):
+        """A property whose *name* the schema types as string/alias-ref/boolean
+        is never treated as a path-ref, even if its value starts with '/'."""
+        import pytest
+        import lopper.schema
+        from lopper.tree import LopperProp
+        string_names = list(
+            lopper.schema.PROPERTY_TYPE_HINTS.get("string_properties", []))
+        if not string_names:
+            pytest.skip("no string_properties hints available to exercise exclusion")
+        name = string_names[0]
+
+        tree, ser, aliases = self._tree()
+        sp = LopperProp(name, -1, aliases, [self.OLD]); sp.pclass = "string"; aliases + sp
+        tree.update_path_refs(self.OLD, self.NEW)
+        assert aliases.propval(name) == [self.OLD], \
+            f"schema-typed non-path-ref '{name}' must not be rewritten"
