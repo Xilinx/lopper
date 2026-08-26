@@ -402,12 +402,20 @@ def compile_overlay_standalone(overlay_file, include_paths="", tmpdir=None, save
         overlay_dir = os.path.dirname(overlay_file)
         full_includes = f"{include_paths} {overlay_dir}".strip()
 
-        dtb_file, _ = Lopper.dt_compile(
+        dtb_file, overlay_schema = Lopper.dt_compile(
             plugin_file, [], full_includes,
             force_overwrite=True, outdir=work_dir,
             save_temps=save_temps, verbose=0, enhanced=False,
             permissive=True, symbols=False
         )
+
+        # The overlay introduces properties the input tree never had, so they
+        # are absent from the schema learned when that tree was compiled. Fold
+        # in what compiling the overlay just taught us, before its nodes are
+        # loaded and typed -- otherwise those properties are typed by name
+        # heuristics rather than by what they were observed to be.
+        import lopper.schema
+        lopper.schema._schema_manager.merge_schema( overlay_schema )
 
         if dtb_file and os.path.exists(dtb_file):
             overlay_tree = LopperTree()
@@ -3064,13 +3072,18 @@ class LopperSDT:
                     except:
                         node = None
 
-                    if not node:
-                        lopper.log._error( f"no nodes found for {modify_path}", True )
-
                     # node operation
                     # in case /<name>/ was passed as the new name, we need to drop them
                     # since they aren't valid in set_name()
                     if modify_val:
+                        # a rename/move needs an existing source node, so a
+                        # non-matching selector here is a real error. a node
+                        # *delete* (the else branch below) is tolerant of a
+                        # selector that matches nothing: it is a no-op, per the
+                        # match-or-skip contract of the modify operand.
+                        if not node:
+                            lopper.log._error( f"no nodes found for {modify_path}", True )
+
                         modify_source_path = Path(node.abs_path)
 
                         if modify_val.startswith( "/" ):
@@ -3125,7 +3138,7 @@ class LopperSDT:
                         node_to_remove = node
 
                         if not node_to_remove:
-                            lopper.log._warning( f"Cannot find node {node.abs_path} for delete operation"  )
+                            lopper.log._warning( f"Cannot find node {modify_path} for delete operation"  )
                             if self.werror:
                                 sys.exit(1)
                         else:
