@@ -79,6 +79,8 @@ def usage():
 
       -v, --verbose       Enable verbose output
       -o, --output PATH   Output domains YAML path (required)
+      --single-domain     Emit only the primary A-profile cluster,
+                          instead of one domain per cluster
 
    Walks the SDT for cpus,cluster nodes and emits a starter
    domains.yaml partitioning resources across one domain per
@@ -134,6 +136,28 @@ _SHARED_CARVEOUT_RE = re.compile(r'(rpmsg|shmem|vdev|ipc_share)',
 _CLUSTER_CARVEOUT_RE = re.compile(r'(rpu\d*|r5|m4|m7|mcu)[_\-]?',
                                   re.IGNORECASE)
 _LINUX_CARVEOUT_PROPS = ('linux,cma-default', 'linux,dma-default')
+
+# Reuse the inventory's classification rather than restating it, so
+# sdt_devices and sdt_domains cannot disagree about what is SRAM. Both the
+# name patterns and the infrastructure exclusion are needed: the SRAM
+# patterns are substrings, so an OCM *protection unit* (`..._ocm_xmpu_0`)
+# matches `ocm` and has a reg, and would otherwise be handed to a domain as
+# if it were memory.
+try:
+    from lopper.assists._devices_core import DevicesCore
+    _SRAM_NAME_PATTERNS = tuple(DevicesCore.MEMORY_TYPE_PATTERNS['sram'])
+    _INFRA_PATTERNS = tuple(
+        p for patterns in DevicesCore.INFRASTRUCTURE_CATEGORIES.values()
+        for p in patterns)
+except Exception:
+    _SRAM_NAME_PATTERNS = (r'tcm', r'ocm', r'sram', r'bram')
+    _INFRA_PATTERNS = (r'xmpu', r'xppu')
+
+# Regions that claim no cluster are collected here rather than dropped, so
+# nothing silently disappears from the template. It carries no cpus and no
+# access: it is a holding area for the user to redistribute or delete, not an
+# execution domain.
+_UNASSIGNED_DOMAIN = 'unassigned'
 
 
 def _node_has_prop(node, name):
@@ -195,6 +219,74 @@ def _enumerate_root_memory(sdt, want_source=None):
         elif want_source is not None and src == want_source:
             out.append(n)
     return out
+
+
+def _is_infrastructure(node):
+    """True if the node is infrastructure rather than an assignable resource.
+
+    Matched against the node's name and compatible, using the inventory's
+    categories — which include the protection units (xmpu / xppu) that a
+    substring match on `ocm` would otherwise pull in.
+    """
+    compat = node.propval('compatible')
+    if isinstance(compat, list):
+        compat = ' '.join(str(c) for c in compat)
+    haystack = f"{node.name or ''} {compat or ''}".lower()
+    return any(re.search(p, haystack) for p in _INFRA_PATTERNS)
+
+
+def _is_sram_node(node):
+    """True if this node is an SRAM/TCM/OCM region.
+
+    Classified with the same name patterns the device inventory uses
+    (`_devices_core.DevicesCore.MEMORY_TYPE_PATTERNS`) rather than a
+    second set here: the inventory and the domain template have to
+    agree about what counts as SRAM, or the template references
+    regions the inventory does not list.
+
+    A `reg` is required — the patterns are substrings, and a region
+    without an address is not something a domain can be given.
+    """
+    name = (node.name or '').lower()
+    if not any(re.search(p, name) for p in _SRAM_NAME_PATTERNS):
+        return False
+    if _is_infrastructure(node):
+        return False
+    start, size = lopper_lib.node_reg_start_size(node)
+    return not (start is None and size is None)
+
+
+def _enumerate_sram(sdt):
+    """Return the SRAM/TCM/OCM regions declared anywhere in the tree."""
+    return [n for n in sdt.tree if _is_sram_node(n)]
+
+
+def _cluster_sram_prefix(cluster_node):
+    """The name prefix an SRAM region uses to claim this cluster.
+
+    Cluster labels carry a `cpus_` prefix that the regions do not:
+    cluster `cpus_r52_0` owns `r52_0a_atcm_global`.
+    """
+    label = (_cluster_label(cluster_node) or '').lower()
+    return label[len('cpus_'):] if label.startswith('cpus_') else label
+
+
+def _sram_owner(node, cluster_prefixes):
+    """Domain name owning this SRAM region, None if it claims no cluster.
+
+    Longest prefix wins, so a design carrying both `r5` and `r52`
+    clusters attributes `r52_*` to `r52` rather than to whichever was
+    walked first.
+    """
+    name = (node.name or '').lower()
+    best_prefix = None
+    best_domain = None
+    for prefix, domain_name in cluster_prefixes:
+        if not prefix or not name.startswith(prefix):
+            continue
+        if best_prefix is None or len(prefix) > len(best_prefix):
+            best_prefix, best_domain = prefix, domain_name
+    return best_domain
 
 
 def _enumerate_reserved_memory(sdt):
@@ -307,13 +399,30 @@ def _build_non_linux_domain(sdt, cluster_node, cluster_arch, cluster_source,
     return domain
 
 
-def _build_domains_payload(sdt):
+def _primary_cluster(clusters):
+    """The A-profile cluster a single-domain template starts from.
+
+    Falls back to the first cluster found, so a design with no
+    application-class CPUs still produces a template.
+    """
+    for cluster in clusters:
+        if re.match(r'a\d+', lopper_lib.cluster_arch(cluster) or ''):
+            return cluster
+    return clusters[0]
+
+
+def _build_domains_payload(sdt, single_domain=False):
     """Walk the SDT, return the full {domains: ...} payload.
 
     Every cpus,cluster becomes one starter domain. No cluster is
     special-cased out by its CPU type — the starter represents what the
     SDT actually contains, and the user prunes the domains they don't
     intend to partition.
+
+    With `single_domain`, only the primary A-profile cluster is emitted,
+    leaving the user to add the rest by hand. That is a smaller starting
+    point than the design contains, so it is not the default; it exists
+    for flows that specify a single-domain template.
     """
     clusters = [n for n in sdt.tree if lopper_lib.is_cpu_cluster(n)]
     if not clusters:
@@ -321,31 +430,64 @@ def _build_domains_payload(sdt):
             "no cpus,cluster nodes found in SDT — "
             "did assemble_sdt run first?")
 
+    if single_domain:
+        clusters = [_primary_cluster(clusters)]
+
     reserved_mem = _enumerate_reserved_memory(sdt)
     bus_children = _enumerate_non_linux_bus_children(sdt)
+    sram_nodes = _enumerate_sram(sdt)
+
+    # Resolve each cluster's domain name up front: SRAM is attributed by
+    # matching a region name against a cluster prefix, and that needs the
+    # final (de-duplicated) domain names, which are assigned below.
+    cluster_names = {}
+    used_names = set()
+    for cluster in clusters:
+        name = _domain_name_from_cluster(cluster)
+        candidate = name
+        idx = 0
+        while candidate in used_names:
+            idx += 1
+            candidate = f'{name}_{idx}'
+        used_names.add(candidate)
+        cluster_names[id(cluster)] = candidate
+
+    cluster_prefixes = [(_cluster_sram_prefix(c), cluster_names[id(c)])
+                        for c in clusters]
+
+    sram_by_domain = {}
+    unassigned_sram = []
+    for region in sram_nodes:
+        owner = _sram_owner(region, cluster_prefixes)
+        if owner:
+            sram_by_domain.setdefault(owner, []).append(_memory_entry(region))
+        else:
+            unassigned_sram.append(_memory_entry(region))
 
     inner = {}
     domain_id = 0
     for cluster in clusters:
         src = lopper_lib.source_tag(cluster)
         arch = lopper_lib.cluster_arch(cluster)
-        name = _domain_name_from_cluster(cluster)
-        # Avoid duplicate keys if two clusters resolve to the same name.
-        candidate = name
-        idx = 0
-        while candidate in inner:
-            idx += 1
-            candidate = f'{name}_{idx}'
-        name = candidate
+        name = cluster_names[id(cluster)]
 
         if not src:
             domain = _build_linux_domain(sdt, cluster, reserved_mem)
         else:
             domain = _build_non_linux_domain(
                 sdt, cluster, arch, src, reserved_mem, bus_children)
+        if name in sram_by_domain:
+            domain['sram'] = sram_by_domain[name]
         domain['id'] = domain_id
         domain_id += 1
         inner[name] = domain
+
+    if unassigned_sram:
+        inner[_UNASSIGNED_DOMAIN] = {
+            'compatible': 'openamp,domain-v1',
+            'sram': unassigned_sram,
+            'id': domain_id,
+        }
 
     return {
         'domains': {
@@ -373,17 +515,21 @@ def sdt_domains(tgt_node, sdt, options):
 
     try:
         opts, _ = getopt.getopt(args, "hvo:",
-                                ["help", "verbose", "output="])
+                                ["help", "verbose", "output=",
+                                 "single-domain"])
     except getopt.GetoptError as e:
         lopper.log._error(f"sdt_domains: invalid option: {e}")
         usage()
         return False
 
     output_path = None
+    single_domain = False
     for o, a in opts:
         if o in ('-h', '--help'):
             usage()
             return True
+        elif o in ('--single-domain',):
+            single_domain = True
         elif o in ('-v', '--verbose'):
             verbose += 1
         elif o in ('-o', '--output'):
@@ -400,7 +546,7 @@ def sdt_domains(tgt_node, sdt, options):
         return False
 
     try:
-        payload = _build_domains_payload(sdt)
+        payload = _build_domains_payload(sdt, single_domain=single_domain)
     except Exception as e:
         lopper.log._error(f"sdt_domains: failed: {e}")
         import traceback
