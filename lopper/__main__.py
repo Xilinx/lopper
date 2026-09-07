@@ -107,7 +107,8 @@ def usage():
     print('    , --emit-embedded-overlays  re-embed /__lopper-overlays__ even when loaded from a prior DTS embed (use for >2-pass workflows)' )
     print('  -S, --save-temps    don\'t remove temporary files' )
     print('    , --cfgfile       specify a lopper configuration file to use (configparser format) ' )
-    print('    , --cfgval        specify a configuration value to use (in configparser section format). Can be specified multiple times' )
+    print('    , --cfgval        specify a configuration value to use (in configparser section format). Can be specified multiple times.' )
+    print('                      values are readable by code lops via "config", allowing a lop to be parameterized per invocation' )
     print('    , --schema        one of: "path to a dts schema", "learn" or "none" ')
     print('  -h, --help          display this help and exit')
     print('  -O, --outdir        directory to use for output files')
@@ -393,13 +394,16 @@ def main():
     if config_vals:
         # was there a ".", if so that's the section split marker
         for i,k in config_vals.items():
-            config_sections = k.split( '.' )
+            # separate the value before looking for section markers. only the
+            # section.option portion is dot delimited, a value is free form and
+            # routinely contains dots itself (".repo.yaml", "1.2.3", a path).
+            # splitting the whole string would consume those as section markers.
+            config_key, config_has_val, config_option_val = k.partition( '=' )
+            config_sections = config_key.split( '.' )
             if len(config_sections) > 1:
                 # we have sections
-                config_option = config_sections[-1]
-                config_option_name = config_option.split('=')[0]
-                config_option_val = config_option.split('=')[-1]
-                if config_option_name == config_option_val:
+                config_option_name = config_sections[-1]
+                if not config_has_val:
                     config_option_val = True
 
                 for item in config_sections[:-1]:
