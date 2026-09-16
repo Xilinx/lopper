@@ -33,6 +33,10 @@ from lopper.log import _init, _warning, _info, _error
 
 sys.path.append(os.path.dirname(__file__))
 from openamp_xlnx_common import *
+from openamp_xlnx_common import (
+    _openamp_domain_processor,
+    _openamp_domain_selects_cpu,
+)
 from baremetalconfig_xlnx import get_cpu_node
 from string import ascii_lowercase as alc
 
@@ -130,11 +134,7 @@ def xlnx_openamp_update_relation_timers(sdt, target_os, machine):
         if domain is None:
             continue
 
-        domain_cpus = domain.propval("cpus")
-        domain_cluster = (
-            tree.pnode(domain_cpus[0]) if domain_cpus != [''] else None
-        )
-        if match_cpu.parent == domain_cluster:
+        if _openamp_domain_selects_cpu(tree, domain, match_cpu):
             relation_groups.append(node)
 
     if not relation_groups:
@@ -216,7 +216,8 @@ def xlnx_handle_relations(sdt, machine, find_only = True, os = None):
             continue
 
         # ensure target domain matches
-        if match_cpunode.parent == sdt.tree.pnode(n.parent.parent.propval("cpus")[0]):
+        if _openamp_domain_selects_cpu(
+                tree, n.parent.parent, match_cpunode):
             if find_only:
                  return n
             else: # do processing on found nodes
@@ -345,7 +346,8 @@ def xlnx_openamp_get_ddr_elf_load(machine, sdt):
             continue
 
         # ensure target domain matches
-        if match_cpunode.parent == sdt.tree.pnode(n.parent.parent.propval("cpus")[0]):
+        if _openamp_domain_selects_cpu(
+                sdt.tree, n.parent.parent, match_cpunode):
              target_node = n
              break
 
@@ -1187,8 +1189,10 @@ def xlnx_remoteproc_v2_construct_cluster(tree, openamp_channel_info, channel_elf
 
     Algorithm:
         Validates platform support, merges power-domain data from carveouts, derives
-        ranges for TCM and DDR nodes, ensures the cluster node exists with correct
-        configuration, tracks newly added DDR regions, and finally inserts the core
+        ranges for TCM and DDR nodes, and ensures the cluster node exists with the
+        correct configuration. Versal2 TCM addresses are selected by their SCMI
+        power-domain IDs; older firmware IDs and ``xlnx,power-domain`` remain
+        compatibility paths. Finally, tracks new DDR regions and inserts the core
         node using ``xlnx_remoteproc_v2_add_core``.
     """
     print(" -> xlnx_remoteproc_v2_construct_cluster")
@@ -1201,8 +1205,6 @@ def xlnx_remoteproc_v2_construct_cluster(tree, openamp_channel_info, channel_elf
     core_reg_names = []
     power_domains = []
     core_reg_val = []
-
-    global memory_nodes
 
     if not platform_validate(platform):
         return False
@@ -1217,10 +1219,52 @@ def xlnx_remoteproc_v2_construct_cluster(tree, openamp_channel_info, channel_elf
 
     # loop through TCM nodes
     for n in [ n for n in channel_elfload_nodes if n.propval("xlnx,ip-name") != [''] ]:
-        pd = n.propval("power-domains")
+        # Preserve the complete provider/specifier tuple for the generated
+        # remoteproc node. It is also the primary source for selecting the TCM
+        # address mapping below.
+        pd = n.propval("power-domains", list)
+        node_path = getattr(n, "abs_path", n.name)
+        if not pd or pd == [""] or len(pd) < 2:
+            print(f"ERROR: TCM node {node_path} is missing a valid "
+                  "power-domains property")
+            return False
         power_domains.extend(pd)
-        core_reg_val.extend(memory_nodes[pd[1]]["rpu_view"])
-        cluster_ranges_val.extend(memory_nodes[pd[1]]["system_view"])
+
+        pd_id = pd[1]
+        legacy_pd_id = None
+
+        # Versal2 uses SCMI IDs in power-domains. Translate a supported SCMI
+        # TCM ID to the existing legacy address-table key.
+        if platform == SOC_TYPE.VERSAL2:
+            legacy_pd_id = versal2_scmi_to_legacy_pd.get(pd_id)
+
+        # Older ZynqMP and Versal SDTs, plus some Versal NET TCMs, put the
+        # legacy address-table ID directly in power-domains.
+        if legacy_pd_id is None and pd_id in legacy_memory_nodes:
+            legacy_pd_id = pd_id
+
+        # Transitional SDTs may carry the legacy key separately. This remains
+        # a compatibility fallback; modern Versal2 mapping does not require it.
+        legacy_pd = n.propval("xlnx,power-domain", list)
+        if (legacy_pd_id is None and legacy_pd and
+                legacy_pd != [""]):
+            legacy_pd_id = legacy_pd[0]
+
+        mapping = legacy_memory_nodes.get(legacy_pd_id)
+        if mapping is None:
+            pd_id_string = hex(pd_id) if isinstance(pd_id, int) else str(pd_id)
+            legacy_id_string = ""
+            if legacy_pd and legacy_pd != [""]:
+                legacy_id = legacy_pd[0]
+                if isinstance(legacy_id, int):
+                    legacy_id = hex(legacy_id)
+                legacy_id_string = f", legacy ID {legacy_id}"
+            print(f"ERROR: TCM node {node_path} has no address mapping for "
+                  f"power-domains ID {pd_id_string}{legacy_id_string}")
+            return False
+
+        core_reg_val.extend(mapping["rpu_view"])
+        cluster_ranges_val.extend(mapping["system_view"])
 
         # map TCM node name to binding compliant TCM name
         if not any(tcm_name_substr in n.name.lower() for tcm_name_substr in core_reg_names_mappings):
@@ -1362,8 +1406,11 @@ def openamp_nontree_outputs_handler(sdt, output_file_name, openamp_args, verbose
 
     match_cpunode = get_cpu_node(sdt, {'args':[machine]}) if os != "linux_dt" else None
     if not match_cpunode and os != "linux_dt":
-        print("openamp_nontree_outputs_handler: unable to find machine: ", machine)
-        return False
+        _error(
+            "openamp_xlnx: cannot generate '%s': processor '%s' was not "
+            "found in the system device tree" % (output_file_name, machine),
+            1,
+        )
 
     domains = sdt.tree['/domains']
     relation_node = None
@@ -1396,7 +1443,9 @@ def openamp_nontree_outputs_handler(sdt, output_file_name, openamp_args, verbose
                                  (domain_node.name, domain_os, domain_processor))
 
         # ensure target domain matches
-        if os != "linux_dt" and match_cpunode.parent != sdt.tree.pnode(domain_node.propval("cpus")[0]):
+        if (os != "linux_dt"
+                and not _openamp_domain_selects_cpu(
+                    sdt.tree, domain_node, match_cpunode)):
             continue
 
         # filter based on name
@@ -1409,10 +1458,12 @@ def openamp_nontree_outputs_handler(sdt, output_file_name, openamp_args, verbose
     if relation_node is None:
         compatible = openamp_args['compatible_string'] or "any"
         targets = ", ".join(supported_targets) if supported_targets else "none"
-        _error("openamp_xlnx: no %s relation found for processor '%s' and OS "
-               "'%s'; supported targets: %s" %
-               (compatible, machine, os, targets))
-        return False
+        _error(
+            "openamp_xlnx: cannot generate '%s': no %s relation found for "
+            "processor '%s' and OS '%s'; supported targets: %s" %
+            (output_file_name, compatible, machine, os, targets),
+            1,
+        )
 
     carveouts = None
     ipi_node = None
@@ -1631,9 +1682,13 @@ def xlnx_openamp_parse(sdt, options, verbose = 0 ):
     Returns:
         bool: True when processing succeeds or no domains exist, False on errors.
 
+    Raises:
+        SystemExit: If a requested OpenAMP relation cannot be processed.
+
     Algorithm:
         Parses assist arguments, checks for OpenAMP-compatible domains, delegates
-        relation handling when appropriate.
+        relation handling when appropriate. Relation-processing failures are
+        fatal because continuing would write an incomplete OpenAMP device tree.
     """
     # Xilinx OpenAMP subroutine to parse OpenAMP Channel
     # information and generate Device Tree information.
@@ -1663,6 +1718,11 @@ def xlnx_openamp_parse(sdt, options, verbose = 0 ):
     if openamp_args["dt_type"] in ["zephyr_dt", "linux_dt"] or openamp_args["openamp_output_filename"]:
         # if find_only is False, then processing will also occur.
         if not xlnx_handle_relations(sdt, machine, False, openamp_args["dt_type"]):
-            return False
+            _error(
+                "openamp_xlnx: failed to process OpenAMP relations for "
+                "processor '%s' and OS '%s'" %
+                (machine, openamp_args["dt_type"]),
+                1,
+            )
 
     return True

@@ -15,6 +15,12 @@ import sys
 from pathlib import Path
 
 from baremetalconfig_xlnx import get_cpu_node
+from lopper.log import _warning
+from lopper.assists.lopper_lib import (
+    CpuSelectionSource,
+    _cpu_matches_legacy_label,
+    resolve_domain_cpus,
+)
 
 IPI_MAILBOX_COMPATIBLES = {
     "xlnx,versal-ipi-mailbox",
@@ -82,13 +88,58 @@ def _openamp_ipi_controllers(tree):
     return controllers
 
 
-def _openamp_domain_processor(tree, domain):
+def _openamp_domain_cpu_assignment(tree, domain):
+    """Resolve a domain's CPUs using canonical and legacy metadata."""
+    legacy_cpu = _openamp_legacy_domain_processor(domain)
+    selection = resolve_domain_cpus(tree, domain, legacy_cpu)
+
+    if selection.diagnostic:
+        domain_name = getattr(domain, "abs_path", domain.name)
+        if selection.source == CpuSelectionSource.UNRESOLVED:
+            _warning(f"{domain_name}: {selection.diagnostic}")
+        else:
+            _warning(f"{domain_name}: {selection.diagnostic}; migrate "
+                     "the domain to a cluster-relative mask")
+
+    return selection.cluster, selection.mask, selection.cpus
+
+
+def _openamp_legacy_domain_processor(domain):
+    """Read the historical OpenAMP core label, when present."""
     dtd = next((n for n in domain.subnodes(children_only=True)
                 if n.name == "domain-to-domain"), None)
-    if dtd and dtd.propval("cluster_cpu") != [""]:
-        return dtd.propval("cluster_cpu")[0]
-    cpus = domain.propval("cpus")
-    cluster = tree.pnode(cpus[0]) if cpus != [""] else None
+    value = dtd.propval("cluster_cpu") if dtd else [""]
+    return value[0] if value != [""] and value else None
+
+
+def _openamp_domain_selects_cpu(tree, domain, cpu):
+    """Return whether the domain's resolved CPU set contains ``cpu``."""
+    cluster, _, selected = _openamp_domain_cpu_assignment(tree, domain)
+    if cpu in selected:
+        return True
+
+    # Some released Versal Net domains use the unprefixed historical value
+    # ``cortexr52_N`` for cluster_cpu while their SDT CPU symbol is
+    # ``psx_cortexr52_N``.  Match either spelling, but only for the named CPU
+    # in the referenced cluster so an unresolved mask cannot widen selection.
+    legacy_cpu = _openamp_legacy_domain_processor(domain)
+    return bool(
+        not selected
+        and legacy_cpu
+        and cpu is not None
+        and cpu.parent == cluster
+        and (_cpu_matches_legacy_label(tree, cpu, legacy_cpu)
+             or _cpu_matches_legacy_label(tree, cpu, f"psx_{legacy_cpu}"))
+    )
+
+
+def _openamp_domain_processor(tree, domain):
+    cluster, _, selected = _openamp_domain_cpu_assignment(tree, domain)
+    if selected:
+        return ", ".join(cpu.label or cpu.name for cpu in selected)
+    legacy = _openamp_legacy_domain_processor(domain)
+    if legacy:
+        return legacy
     return (cluster.label or cluster.name) if cluster else "unspecified"
 
 
@@ -105,7 +156,7 @@ def _openamp_configured_relations(tree):
             continue
         dtd = next((n for n in domain.subnodes(children_only=True)
                     if n.name == "domain-to-domain"), None)
-        if not dtd or dtd.propval("cluster_cpu") == [""]:
+        if not dtd:
             continue
         for relation in dtd.subnodes(children_only=True):
             compatible = relation.propval("compatible")
@@ -249,7 +300,7 @@ class CLUSTER_CONFIG(Enum):
     RPU_0 = 1
     RPU_1 = 2
 
-memory_nodes = {
+legacy_memory_nodes = {
     15: {  # psu_r5_0_atcm_global
         "system_view": [0x0, 0x0, 0x0, 0xffe00000, 0x0, 0x10000],
         "rpu_view": [0x0, 0x0, 0x0, 0x10000]
@@ -355,8 +406,45 @@ memory_nodes = {
         "rpu_view": [0x1, 0x18000, 0x0, 0x8000]
     },
 }
-"""dict[int, dict[str, list[int]]]: Mapping of power-domain identifiers to
-system-view and RPU-view memory descriptors used for remoteproc construction."""
+"""dict[int, dict[str, list[int]]]: Legacy firmware power-domain IDs mapped to
+system-view and RPU-view memory descriptors used for remoteproc construction.
+
+Older SDTs place these IDs directly in ``power-domains``. Transitional Versal2
+SDTs may expose them separately through ``xlnx,power-domain``.
+"""
+
+# The direct legacy-ID fallback relies on the SCMI and legacy key spaces
+# remaining disjoint. The supported Versal2 SCMI TCM IDs fall within
+# 0x44-0x61, while legacy_memory_nodes uses 0x0f-0x12 and 0x1831xxxx.
+# Nothing enforces this separation: if a future SCMI ID overlaps a legacy
+# key, the fallback will silently select the wrong address descriptor.
+# Reassess or explicitly guard the fallback whenever SCMI IDs are extended.
+#
+# Versal2's SCMI binding assigns new power-domain IDs to the TCM banks. Keep
+# this translation separate from the legacy address table so ``power-domains``
+# can be the authoritative input without duplicating the address descriptors.
+# Only TCMs already supported by legacy_memory_nodes are listed here.
+versal2_scmi_to_legacy_pd = {
+    0x44: 0x183180cb,  # r52_0a_atcm_global
+    0x45: 0x183180cc,  # r52_0a_btcm_global
+    0x46: 0x183180cd,  # r52_0a_ctcm_global
+    0x4a: 0x183180ce,  # r52_0b_atcm_global
+    0x4b: 0x183180cf,  # r52_0b_btcm_global
+    0x4c: 0x183180d0,  # r52_0b_ctcm_global
+    0x56: 0x18318106,  # r52_0d_atcm_global
+    0x57: 0x18318107,  # r52_0d_btcm_global
+    0x58: 0x18318108,  # r52_0d_ctcm_global
+    0x59: 0x18318109,  # r52_1d_atcm_global
+    0x5a: 0x1831810a,  # r52_1d_btcm_global
+    0x5b: 0x1831810b,  # r52_1d_ctcm_global
+    0x5c: 0x1831810c,  # r52_0e_atcm_global
+    0x5d: 0x1831810d,  # r52_0e_btcm_global
+    0x5e: 0x1831810e,  # r52_0e_ctcm_global
+    0x5f: 0x1831810f,  # r52_1e_atcm_global
+    0x60: 0x18318110,  # r52_1e_btcm_global
+    0x61: 0x18318111,  # r52_1e_ctcm_global
+}
+"""dict[int, int]: Versal2 SCMI TCM IDs mapped to legacy address-table IDs."""
 
 openamp_linux_hosts = [ "psv_cortexa72_0", "psx_cortexa78_0", "psu_cortexa53_0", "cortexa78_0" ]
 """list[str]: Names of processor nodes recognized as OpenAMP Linux hosts."""
