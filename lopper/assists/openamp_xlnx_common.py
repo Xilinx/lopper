@@ -345,16 +345,64 @@ legacy_memory_nodes = {
         "system_view": [0x0, 0x18000, 0x0, 0xeba20000, 0x0, 0x8000],
         "rpu_view": [0x0, 0x18000, 0x0, 0x8000]
     },
-    0x183180ce: {  # r52_0b_atcm_global
-        "system_view": [0x1, 0x0, 0x0, 0xEBA80000, 0x0, 0x10000],
+    0x183180ce: {  # r52_1a_atcm_global
+        "system_view": [0x1, 0x0, 0x0, 0xEBA40000, 0x0, 0x10000],
         "rpu_view": [0x1, 0x0, 0x0, 0x10000]
     },  
-    0x183180cf: {  # r52_0b_btcm_global
-        "system_view": [0x1, 0x10000, 0x0, 0xEBA90000, 0x0, 0x8000],
+    0x183180cf: {  # r52_1a_btcm_global
+        "system_view": [0x1, 0x10000, 0x0, 0xEBA50000, 0x0, 0x8000],
         "rpu_view": [0x1, 0x10000, 0x0, 0x8000]
     },  
-    0x183180d0: {  # r52_0b_ctcm_global
-        "system_view": [0x1, 0x18000, 0x0, 0xEBAA0000, 0x0, 0x8000],
+    0x183180d0: {  # r52_1a_ctcm_global
+        "system_view": [0x1, 0x18000, 0x0, 0xEBA60000, 0x0, 0x8000],
+        "rpu_view": [0x1, 0x18000, 0x0, 0x8000]
+    },
+    0x183180d1: {  # r52_0b_atcm_global
+        "system_view": [0x0, 0x0, 0x0, 0xEBA80000, 0x0, 0x10000],
+        "rpu_view": [0x0, 0x0, 0x0, 0x10000]
+    },
+    0x183180d2: {  # r52_0b_btcm_global
+        "system_view": [0x0, 0x10000, 0x0, 0xEBA90000, 0x0, 0x8000],
+        "rpu_view": [0x0, 0x10000, 0x0, 0x8000]
+    },
+    0x183180d3: {  # r52_0b_ctcm_global
+        "system_view": [0x0, 0x18000, 0x0, 0xEBAA0000, 0x0, 0x8000],
+        "rpu_view": [0x0, 0x18000, 0x0, 0x8000]
+    },
+    0x183180d4: {  # r52_1b_atcm_global
+        "system_view": [0x1, 0x0, 0x0, 0xEBAC0000, 0x0, 0x10000],
+        "rpu_view": [0x1, 0x0, 0x0, 0x10000]
+    },
+    0x183180d5: {  # r52_1b_btcm_global
+        "system_view": [0x1, 0x10000, 0x0, 0xEBAD0000, 0x0, 0x8000],
+        "rpu_view": [0x1, 0x10000, 0x0, 0x8000]
+    },
+    0x183180d6: {  # r52_1b_ctcm_global
+        "system_view": [0x1, 0x18000, 0x0, 0xEBAE0000, 0x0, 0x8000],
+        "rpu_view": [0x1, 0x18000, 0x0, 0x8000]
+    },
+    0x18318100: {  # r52_0c_atcm_global
+        "system_view": [0x0, 0x0, 0x0, 0xEBB00000, 0x0, 0x10000],
+        "rpu_view": [0x0, 0x0, 0x0, 0x10000]
+    },
+    0x18318101: {  # r52_0c_btcm_global
+        "system_view": [0x0, 0x10000, 0x0, 0xEBB10000, 0x0, 0x8000],
+        "rpu_view": [0x0, 0x10000, 0x0, 0x8000]
+    },
+    0x18318102: {  # r52_0c_ctcm_global
+        "system_view": [0x0, 0x18000, 0x0, 0xEBB20000, 0x0, 0x8000],
+        "rpu_view": [0x0, 0x18000, 0x0, 0x8000]
+    },
+    0x18318103: {  # r52_1c_atcm_global
+        "system_view": [0x1, 0x0, 0x0, 0xEBB40000, 0x0, 0x10000],
+        "rpu_view": [0x1, 0x0, 0x0, 0x10000]
+    },
+    0x18318104: {  # r52_1c_btcm_global
+        "system_view": [0x1, 0x10000, 0x0, 0xEBB50000, 0x0, 0x8000],
+        "rpu_view": [0x1, 0x10000, 0x0, 0x8000]
+    },
+    0x18318105: {  # r52_1c_ctcm_global
+        "system_view": [0x1, 0x18000, 0x0, 0xEBB60000, 0x0, 0x8000],
         "rpu_view": [0x1, 0x18000, 0x0, 0x8000]
     },
     0x18318106: {  # r52_0d_atcm_global
@@ -411,6 +459,10 @@ system-view and RPU-view memory descriptors used for remoteproc construction.
 
 Older SDTs place these IDs directly in ``power-domains``. Transitional Versal2
 SDTs may expose them separately through ``xlnx,power-domain``.
+
+Only the bank index and local offset (the first two cells of each view) are
+used. The global address and size come from the TCM node's ``reg`` in the
+SDT; the remaining cells are kept for reference.
 """
 
 # The direct legacy-ID fallback relies on the SCMI and legacy key spaces
@@ -424,13 +476,29 @@ SDTs may expose them separately through ``xlnx,power-domain``.
 # this translation separate from the legacy address table so ``power-domains``
 # can be the authoritative input without duplicating the address descriptors.
 # Only TCMs already supported by legacy_memory_nodes are listed here.
+# Each SCMI TCM ID maps to the firmware ID of the same bank:
+# SCMI_PD_VERSAL2_DEV_TCM_<cluster>_<core><bank> to PM_DEV_TCM_<cluster>_
+# <core><bank>. 0x183180ce-0x183180d0 are TCM_A_1{A,B,C}, the banks of RPU
+# cluster A core 1 (r52_1a_*_global).
 versal2_scmi_to_legacy_pd = {
     0x44: 0x183180cb,  # r52_0a_atcm_global
     0x45: 0x183180cc,  # r52_0a_btcm_global
     0x46: 0x183180cd,  # r52_0a_ctcm_global
-    0x4a: 0x183180ce,  # r52_0b_atcm_global
-    0x4b: 0x183180cf,  # r52_0b_btcm_global
-    0x4c: 0x183180d0,  # r52_0b_ctcm_global
+    0x47: 0x183180ce,  # r52_1a_atcm_global
+    0x48: 0x183180cf,  # r52_1a_btcm_global
+    0x49: 0x183180d0,  # r52_1a_ctcm_global
+    0x4a: 0x183180d1,  # r52_0b_atcm_global
+    0x4b: 0x183180d2,  # r52_0b_btcm_global
+    0x4c: 0x183180d3,  # r52_0b_ctcm_global
+    0x4d: 0x183180d4,  # r52_1b_atcm_global
+    0x4e: 0x183180d5,  # r52_1b_btcm_global
+    0x4f: 0x183180d6,  # r52_1b_ctcm_global
+    0x50: 0x18318100,  # r52_0c_atcm_global
+    0x51: 0x18318101,  # r52_0c_btcm_global
+    0x52: 0x18318102,  # r52_0c_ctcm_global
+    0x53: 0x18318103,  # r52_1c_atcm_global
+    0x54: 0x18318104,  # r52_1c_btcm_global
+    0x55: 0x18318105,  # r52_1c_ctcm_global
     0x56: 0x18318106,  # r52_0d_atcm_global
     0x57: 0x18318107,  # r52_0d_btcm_global
     0x58: 0x18318108,  # r52_0d_ctcm_global
@@ -464,6 +532,31 @@ class SOC_TYPE:
     ZYNQ = 2
     VERSAL_NET = 3
     VERSAL2 = 4
+
+# Power-domain ID of the first RPU core and the number of RPU cores on each
+# platform. The cores' IDs are consecutive: PD_RPU_0/1 on ZynqMP,
+# PM_DEV_RPU0_0/1 on Versal (also used by Versal Gen 2 R5 parts),
+# PM_DEV_RPU_A_0..PM_DEV_RPU_B_1 on Versal NET, and
+# SCMI_PD_VERSAL2_DEV_RPU_A_0..RPU_E_1 on Versal2.
+rpu_core_pd_ids = {
+    SOC_TYPE.ZYNQMP: (0x7, 2),
+    SOC_TYPE.VERSAL: (0x18110005, 2),
+    SOC_TYPE.VERSAL_NET: (0x181100bf, 4),
+    SOC_TYPE.VERSAL2: (0x0, 10),
+}
+"""dict[int, tuple[int, int]]: First RPU core power-domain ID and core count."""
+
+# Power-domain ID of the first TCM bank and the number of TCM banks of each
+# RPU core. Each core's banks have consecutive IDs, in RPU core order:
+# PD_TCM_0_A.. on ZynqMP, PM_DEV_TCM_0_A.. on Versal, PM_DEV_TCM_A_0A.. on
+# Versal NET, and SCMI_PD_VERSAL2_DEV_TCM_A_0A.. on Versal2.
+rpu_tcm_pd_ids = {
+    SOC_TYPE.ZYNQMP: (0xf, 2),
+    SOC_TYPE.VERSAL: (0x1831800b, 2),
+    SOC_TYPE.VERSAL_NET: (0x183180cb, 3),
+    SOC_TYPE.VERSAL2: (0x44, 3),
+}
+"""dict[int, tuple[int, int]]: First TCM bank power-domain ID, banks per core."""
 
 platform_info_header_r5_template = """
 /*

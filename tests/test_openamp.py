@@ -92,18 +92,25 @@ class _FakeTree:
 
 def _remoteproc_v2_fixture(
         pd_id=0x44, legacy_pd=None,
-        node_name="r52_0a_atcm_global@eba00000"):
+        node_name="r52_0a_atcm_global@eba00000", reg_size=0x10000,
+        with_reg=True):
     """Build the minimum channel data needed for R52 TCM construction."""
-    tcm = LopperNode(
-        -1,
-        f"/{node_name}",
-        name=node_name,
-    )
+    tree = LopperTree()
+    axi = LopperNode(-1, "/axi")
+    axi["#address-cells"] = [2]
+    axi["#size-cells"] = [2]
+    tree + axi
+    tcm = LopperNode(-1, f"/axi/{node_name}")
     tcm["xlnx,ip-name"] = ["r52_0a_atcm_global"]
+    if with_reg:
+        base = int(node_name.split("@")[1], 16)
+        tcm["reg"] = (lopper_lib.int_to_cells(base, 2) +
+                      lopper_lib.int_to_cells(reg_size, 2))
     if pd_id is not None:
         tcm["power-domains"] = [0xA5, pd_id]
     if legacy_pd is not None:
         tcm["xlnx,power-domain"] = [legacy_pd]
+    tree + tcm
 
     pd_property = type("PowerDomainProperty", (), {"value": [0xA5, 0]})()
     channel_info = {
@@ -441,46 +448,14 @@ def test_openamp_enables_only_selected_linux_uio_timer(monkeypatch):
     assert unrelated.propval("compatible", list) == ["cdns,ttc"]
 
 
-@pytest.mark.parametrize(
-    "platform, pd_id, legacy_pd, node_name, expected_legacy_id",
-    [
-        # Current Versal2 SDTs use an SCMI ID and need no legacy property.
-        (
-            openamp_xlnx.SOC_TYPE.VERSAL2,
-            0x44,
-            None,
-            "r52_0a_atcm_global@eba00000",
-            0x183180CB,
-        ),
-        # Older platforms put the address-table ID in power-domains itself.
-        (
-            openamp_xlnx.SOC_TYPE.ZYNQMP,
-            15,
-            None,
-            "psu_r5_0_atcm_global@ffe00000",
-            15,
-        ),
-        # Transitional SDTs can fall back to xlnx,power-domain.
-        (
-            openamp_xlnx.SOC_TYPE.VERSAL2,
-            0xDEADBEEF,
-            0x183180CB,
-            "r52_0a_atcm_global@eba00000",
-            0x183180CB,
-        ),
-    ],
-)
-def test_remoteproc_v2_resolves_current_and_legacy_tcm_ids(
-        monkeypatch, platform, pd_id, legacy_pd, node_name,
-        expected_legacy_id):
-    """Modern, legacy, and transitional TCM IDs resolve address mappings."""
-    channel_info, tcm = _remoteproc_v2_fixture(
-        pd_id, legacy_pd, node_name)
+def _construct_remoteproc_v2(monkeypatch, platform, channel_info, tcm,
+                             rpu_core=0):
+    """Run remoteproc cluster construction and capture its outputs."""
     captured = {}
 
     monkeypatch.setattr(
         openamp_xlnx, "determinte_rpu_core",
-        lambda tree, cpu_config, remote_node: openamp_xlnx.RPU_CORE.RPU_0)
+        lambda tree, cpu_config, remote_node: openamp_xlnx.RPU_CORE(rpu_core))
     monkeypatch.setattr(
         openamp_xlnx, "get_platform",
         lambda tree, verbose=0: platform)
@@ -502,14 +477,216 @@ def test_remoteproc_v2_resolves_current_and_legacy_tcm_ids(
         openamp_xlnx, "xlnx_remoteproc_v2_add_core", capture_core)
 
     result = openamp_xlnx.xlnx_remoteproc_v2_construct_cluster(
-        object(), channel_info, [tcm])
+        tcm.tree, channel_info, [tcm])
+    return result, captured
 
-    mapping = openamp_xlnx.legacy_memory_nodes[expected_legacy_id]
+
+@pytest.mark.parametrize(
+    "platform, core, pd_id, legacy_pd, node_name, size, bank, offset, "
+    "reg_name",
+    [
+        # ZynqMP: power-domains holds the firmware ID directly.
+        (openamp_xlnx.SOC_TYPE.ZYNQMP, 0, 15, None,
+         "psu_r5_0_atcm_global@ffe00000", 0x10000, 0, 0x0, "atcm0"),
+        (openamp_xlnx.SOC_TYPE.ZYNQMP, 1, 18, None,
+         "psu_r5_1_btcm_global@ffeb0000", 0x10000, 1, 0x20000, "btcm1"),
+        # Versal: firmware IDs, including R5 core 1.
+        (openamp_xlnx.SOC_TYPE.VERSAL, 0, 0x1831800B, None,
+         "psv_r5_0_atcm_global@ffe00000", 0x10000, 0, 0x0, "atcm0"),
+        (openamp_xlnx.SOC_TYPE.VERSAL, 1, 0x1831800E, None,
+         "psv_r5_1_btcm_global@ffeb0000", 0x10000, 1, 0x20000, "btcm1"),
+        # Versal NET: TCM_A_1A is the core 1 ATCM at 0xeba40000.
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET, 1, 0x183180CE, None,
+         "psx_r52_1a_atcm_global@eba40000", 0x10000, 1, 0x0, "atcm0"),
+        # Versal NET: transitional SDTs may still use xlnx,power-domain.
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET, 0, 0xDEADBEEF, 0x183180CB,
+         "psx_r52_0a_atcm_global@eba00000", 0x10000, 0, 0x0, "atcm0"),
+        # Versal NET cluster B: TCM_B_0A at 0xeba80000, TCM_B_1B at
+        # 0xebad0000. The SDT's xlnx,power-domain for r52_0b holds TCM_A_1A
+        # (0x183180ce); power-domains is used first.
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET, 2, 0x183180D1, 0x183180CE,
+         "psx_r52_0b_atcm_global@eba80000", 0x10000, 0, 0x0, "atcm0"),
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET, 3, 0x183180D5, None,
+         "psx_r52_1b_btcm_global@ebad0000", 0x8000, 1, 0x10000, "btcm0"),
+        # Versal2: SCMI IDs for cluster A core 0 and core 1 (r52_1a).
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 0, 0x44, None,
+         "r52_0a_atcm_global@eba00000", 0x10000, 0, 0x0, "atcm0"),
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 1, 0x47, None,
+         "r52_1a_atcm_global@eba40000", 0x10000, 1, 0x0, "atcm0"),
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 1, 0x49, None,
+         "r52_1a_ctcm_global@eba60000", 0x8000, 1, 0x18000, "ctcm0"),
+        # Versal2: the address comes from the SDT, not the address table.
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 6, 0x56, None,
+         "r52_0d_atcm_global@ebb80000", 0x10000, 0, 0x0, "atcm0"),
+    ],
+)
+def test_remoteproc_v2_tcm_ranges_use_sdt_reg(
+        monkeypatch, platform, core, pd_id, legacy_pd, node_name, size, bank,
+        offset, reg_name):
+    """Remoteproc ranges use the SDT TCM address with the table bank view."""
+    channel_info, tcm = _remoteproc_v2_fixture(
+        pd_id, legacy_pd, node_name, reg_size=size)
+    base = int(node_name.split("@")[1], 16)
+
+    result, captured = _construct_remoteproc_v2(
+        monkeypatch, platform, channel_info, tcm, rpu_core=core)
+
     assert result == "core"
     assert captured["power_domains"] == [0xA5, 0, 0xA5, pd_id]
-    assert captured["reg"] == mapping["rpu_view"]
-    assert captured["ranges"] == mapping["system_view"]
-    assert captured["reg_names"] == ["atcm0"]
+    assert captured["reg"] == [bank, offset, 0x0, size]
+    assert captured["ranges"] == [bank, offset, 0x0, base, 0x0, size]
+    assert captured["reg_names"] == [reg_name]
+
+
+# Local offsets of the A, B, and C TCM banks on an R52 core.
+_R52_BANK_OFFSETS = (0x0, 0x10000, 0x18000)
+
+
+def _r52_legacy_core_and_bank(legacy_id):
+    """Core and bank encoded in a Versal NET/Versal2 TCM firmware ID.
+
+    TCM_A_0A..TCM_B_1C are 0x183180cb-0x183180d6 and TCM_C_0A..TCM_E_1C
+    are 0x18318100-0x18318111: three banks per core, in RPU core order
+    (A_0, A_1, B_0, B_1, C_0, ...).
+    """
+    if 0x183180CB <= legacy_id <= 0x183180D6:
+        index = legacy_id - 0x183180CB
+        return index // 3, index % 3
+    if 0x18318100 <= legacy_id <= 0x18318111:
+        index = legacy_id - 0x18318100
+        return 4 + index // 3, index % 3
+    return None
+
+
+def test_r52_tcm_table_bank_view_matches_firmware_id():
+    """Each R52 table entry maps its TCM to the right core and bank."""
+    checked = 0
+    for legacy_id, mapping in openamp_xlnx.legacy_memory_nodes.items():
+        decoded = _r52_legacy_core_and_bank(legacy_id)
+        if decoded is None:
+            continue
+        core, bank = decoded
+        expected = [core % 2, _R52_BANK_OFFSETS[bank]]
+        assert mapping["rpu_view"][:2] == expected, hex(legacy_id)
+        assert mapping["system_view"][:2] == expected, hex(legacy_id)
+        checked += 1
+    assert checked
+
+
+def test_r5_tcm_table_bank_view_matches_firmware_id():
+    """Each R5 table entry maps its TCM to the right core and bank."""
+    expected = {
+        # ZynqMP psu_r5_{0,1}_{a,b}tcm_global
+        15: [0, 0x0], 16: [0, 0x20000], 17: [1, 0x0], 18: [1, 0x20000],
+        # Versal psv_r5_{0,1}_{a,b}tcm_global
+        0x1831800B: [0, 0x0], 0x1831800C: [0, 0x20000],
+        0x1831800D: [1, 0x0], 0x1831800E: [1, 0x20000],
+    }
+    for legacy_id, view in expected.items():
+        mapping = openamp_xlnx.legacy_memory_nodes[legacy_id]
+        assert mapping["rpu_view"][:2] == view, hex(legacy_id)
+        assert mapping["system_view"][:2] == view, hex(legacy_id)
+
+
+def test_versal2_scmi_tcm_ids_translate_to_same_core_and_bank():
+    """Each Versal2 SCMI TCM ID maps to the same core and bank.
+
+    SCMI TCM IDs start at SCMI_PD_VERSAL2_DEV_TCM_A_0A (0x44) and follow
+    the same core and bank order as the firmware IDs.
+    """
+    table = openamp_xlnx.versal2_scmi_to_legacy_pd
+    for scmi_id, legacy_id in table.items():
+        index = scmi_id - 0x44
+        assert (index // 3, index % 3) == \
+            _r52_legacy_core_and_bank(legacy_id), hex(scmi_id)
+        assert legacy_id in openamp_xlnx.legacy_memory_nodes, hex(scmi_id)
+
+
+def test_versal2_scmi_tcm_ids_cover_every_bank():
+    """Every Versal2 SCMI TCM ID, TCM_A_0A (0x44) to TCM_E_1C (0x61), maps."""
+    assert sorted(openamp_xlnx.versal2_scmi_to_legacy_pd) == \
+        list(range(0x44, 0x62))
+
+
+def test_remoteproc_v2_versal2_ignores_xlnx_power_domain(monkeypatch):
+    """Versal2 maps power-domains, not a conflicting xlnx,power-domain."""
+    # SCMI 0x4a is TCM_B_0A. The SDT's xlnx,power-domain for the same node
+    # has been seen to carry TCM_A_1A (0x183180ce).
+    channel_info, tcm = _remoteproc_v2_fixture(
+        0x4A, 0x183180CE, "r52_0b_atcm_global@eba80000")
+
+    result, captured = _construct_remoteproc_v2(
+        monkeypatch, openamp_xlnx.SOC_TYPE.VERSAL2, channel_info, tcm,
+        rpu_core=2)
+
+    assert result == "core"
+    assert captured["ranges"] == [0, 0x0, 0x0, 0xEBA80000, 0x0, 0x10000]
+
+
+@pytest.mark.parametrize(
+    "platform, core, pd_id, node_name, owner",
+    [
+        # RPU1 given RPU0's ATCM.
+        (openamp_xlnx.SOC_TYPE.ZYNQMP, 1, 15,
+         "psu_r5_0_atcm_global@ffe00000", 0),
+        (openamp_xlnx.SOC_TYPE.VERSAL, 0, 0x1831800E,
+         "psv_r5_1_btcm_global@ffeb0000", 1),
+        # RPU_A_1 given r52_0b (TCM_B_0A), the bank the Versal NET and
+        # Versal2 SDTs swap with r52_1a in xlnx,power-domain.
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET, 1, 0x183180D1,
+         "psx_r52_0b_atcm_global@eba80000", 2),
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 1, 0x4A,
+         "r52_0b_atcm_global@eba80000", 2),
+    ],
+)
+def test_remoteproc_v2_rejects_tcm_of_another_core(
+        monkeypatch, capsys, platform, core, pd_id, node_name, owner):
+    """A split core may not load another core's TCM bank."""
+    channel_info, tcm = _remoteproc_v2_fixture(pd_id, None, node_name)
+
+    result, _ = _construct_remoteproc_v2(
+        monkeypatch, platform, channel_info, tcm, rpu_core=core)
+
+    assert result is False
+    assert (f"TCM node {tcm.abs_path} belongs to RPU core {owner}, but the "
+            f"remote runs on RPU core {core}") in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "platform, core, pd_id, node_name, allowed",
+    [
+        # R5 lockstep core 0 uses core 1's banks in its own cluster ...
+        (openamp_xlnx.SOC_TYPE.ZYNQMP, 0, 17,
+         "psu_r5_1_atcm_global@ffe90000", True),
+        # ... R52 cores do not combine TCM in lockstep ...
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 2, 0x4D,
+         "r52_1b_atcm_global@ebac0000", False),
+        # ... and no core uses the banks of another cluster.
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 0, 0x4A,
+         "r52_0b_atcm_global@eba80000", False),
+    ],
+)
+def test_remoteproc_v2_lockstep_uses_its_cluster_tcm(
+        monkeypatch, platform, core, pd_id, node_name, allowed):
+    """In R5 lockstep, core 0 may load the TCM banks of its whole cluster."""
+    channel_info, tcm = _remoteproc_v2_fixture(pd_id, None, node_name)
+    channel_info["cpu_config"] = openamp_xlnx.CPU_CONFIG.RPU_LOCKSTEP
+
+    result, _ = _construct_remoteproc_v2(
+        monkeypatch, platform, channel_info, tcm, rpu_core=core)
+
+    assert (result == "core") is allowed
+
+
+def test_remoteproc_v2_requires_tcm_reg(monkeypatch, capsys):
+    """A TCM node without reg is rejected instead of using the table."""
+    channel_info, tcm = _remoteproc_v2_fixture(with_reg=False)
+
+    result, _ = _construct_remoteproc_v2(
+        monkeypatch, openamp_xlnx.SOC_TYPE.VERSAL2, channel_info, tcm)
+
+    assert result is False
+    assert "is missing a valid reg property" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -541,6 +718,385 @@ def test_remoteproc_v2_reports_invalid_tcm_mapping(
     diagnostic = capsys.readouterr().out
     assert tcm.abs_path in diagnostic
     assert expected_error in diagnostic
+
+
+def _rpu_remote(core_pd, core_num=0, config="split"):
+    """Remote domain as YAML expansion leaves it for an RPU core."""
+    remote = LopperNode(-1, "/domains/RPU")
+    remote["cpu_config_str"] = [config]
+    remote["core_num"] = [core_num]
+    if core_pd is not None:
+        remote["rpu_pd_val"] = [0xA5, core_pd]
+    return remote
+
+
+@pytest.mark.parametrize(
+    "platform, core_pd, core_num, rpu_core",
+    [
+        # SDTs give cpus_r5_1 and every R52 cluster a single cpu@0, so
+        # core_num is 0; the core's power domain gives its number.
+        (openamp_xlnx.SOC_TYPE.ZYNQMP, 0x8, 0, 1),
+        (openamp_xlnx.SOC_TYPE.VERSAL, 0x18110006, 0, 1),
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET, 0x181100C0, 0, 1),
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET, 0x181100C2, 0, 3),
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 1, 0, 1),
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 7, 0, 7),
+        # A remote without a known RPU core power domain keeps core_num.
+        (openamp_xlnx.SOC_TYPE.VERSAL, None, 1, 1),
+        (openamp_xlnx.SOC_TYPE.VERSAL2, 0x181100C0, 3, 3),
+    ],
+)
+def test_rpu_core_comes_from_core_power_domain(
+        monkeypatch, platform, core_pd, core_num, rpu_core):
+    """The RPU core number comes from its power domain, not its CPU reg."""
+    monkeypatch.setattr(
+        openamp_xlnx, "get_platform", lambda tree, verbose=0: platform)
+    remote = _rpu_remote(core_pd, core_num)
+    split = openamp_xlnx.CPU_CONFIG.RPU_SPLIT
+
+    assert openamp_xlnx.determinte_rpu_core(None, split, remote) == \
+        openamp_xlnx.RPU_CORE(rpu_core)
+
+
+@pytest.mark.parametrize(
+    "platform, clusters",
+    [
+        (openamp_xlnx.SOC_TYPE.ZYNQMP, ["ffe00000"] * 2),
+        (openamp_xlnx.SOC_TYPE.VERSAL, ["ffe00000"] * 2),
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET,
+         ["eba00000", "eba00000", "eba80000", "eba80000"]),
+        (openamp_xlnx.SOC_TYPE.VERSAL2,
+         ["eba00000", "eba00000", "eba80000", "eba80000", "ebb00000",
+          "ebb00000", "ebb80000", "ebb80000", "ebc00000", "ebc00000"]),
+    ],
+)
+def test_cluster_address_is_core_0_atcm(platform, clusters):
+    """Each cluster is named after its core 0 ATCM address in the SDT."""
+    assert [openamp_xlnx.xlnx_remoteproc_v2_cluster_base_str(
+        platform, openamp_xlnx.RPU_CORE(core))
+        for core in range(len(clusters))] == clusters
+
+
+def _tcm_node(tree, name, size, pd_id):
+    """Add an SDT TCM node /axi/<name> with a reg and power-domains."""
+    node = LopperNode(-1, f"/axi/{name}")
+    node["xlnx,ip-name"] = ["tcm_global"]
+    node["reg"] = (
+        lopper_lib.int_to_cells(int(name.split("@")[1], 16), 2) +
+        lopper_lib.int_to_cells(size, 2))
+    node["power-domains"] = [0xA5, pd_id]
+    tree + node
+    return node
+
+
+@pytest.mark.parametrize(
+    "platform, remotes, expected",
+    [
+        # ZynqMP (Kria and ZCU102): both R5 cores in split mode.
+        (openamp_xlnx.SOC_TYPE.ZYNQMP,
+         [(0x7, [("psu_r5_0_atcm_global@ffe00000", 0x10000, 15)]),
+          (0x8, [("psu_r5_1_atcm_global@ffe90000", 0x10000, 17)])],
+         {"/remoteproc@ffe00000/r5f@0": 0x7,
+          "/remoteproc@ffe00000/r5f@1": 0x8}),
+        # Versal NET: RPU_A_1 in cluster A and RPU_B_0 in cluster B.
+        (openamp_xlnx.SOC_TYPE.VERSAL_NET,
+         [(0x181100C0, [("psx_r52_1a_atcm_global@eba40000", 0x10000,
+                         0x183180CE)]),
+          (0x181100C1, [("psx_r52_0b_atcm_global@eba80000", 0x10000,
+                         0x183180D1)])],
+         {"/remoteproc@eba00000/r52f@1": 0x181100C0,
+          "/remoteproc@eba80000/r52f@0": 0x181100C1}),
+        # Versal2 SCMI IDs: RPU_A_0 and RPU_A_1, and RPU_D_1.
+        (openamp_xlnx.SOC_TYPE.VERSAL2,
+         [(0, [("r52_0a_atcm_global@eba00000", 0x10000, 0x44)]),
+          (1, [("r52_1a_atcm_global@eba40000", 0x10000, 0x47)]),
+          (7, [("r52_1d_atcm_global@ebbc0000", 0x10000, 0x59)])],
+         {"/remoteproc@eba00000/r52f@0": 0,
+          "/remoteproc@eba00000/r52f@1": 1,
+          "/remoteproc@ebb80000/r52f@1": 7}),
+        # Versal2 SCMI IDs in clusters B and C: RPU_B_0 and RPU_C_1.
+        (openamp_xlnx.SOC_TYPE.VERSAL2,
+         [(2, [("r52_0b_atcm_global@eba80000", 0x10000, 0x4A)]),
+          (5, [("r52_1c_atcm_global@ebb40000", 0x10000, 0x53)])],
+         {"/remoteproc@eba80000/r52f@0": 2,
+          "/remoteproc@ebb00000/r52f@1": 5}),
+    ],
+)
+def test_remoteproc_v2_places_each_rpu_core(
+        monkeypatch, platform, remotes, expected):
+    """Remotes on any RPU core get their own cluster and core node."""
+    tree = LopperTree()
+    axi = LopperNode(-1, "/axi")
+    axi["#address-cells"] = [2]
+    axi["#size-cells"] = [2]
+    tree + axi
+    monkeypatch.setattr(
+        openamp_xlnx, "get_platform", lambda tree, verbose=0: platform)
+
+    for core_pd, tcms in remotes:
+        info = {"remote_node": _rpu_remote(core_pd)}
+        assert openamp_xlnx.xlnx_remoteproc_rpu_parse(tree, None, info, [])
+        tcm_nodes = [_tcm_node(tree, *tcm) for tcm in tcms]
+        assert openamp_xlnx.xlnx_remoteproc_v2_construct_cluster(
+            tree, info, tcm_nodes)
+
+    cores = [n for n in tree["/"].subnodes()
+             if n.name.startswith(("r5f@", "r52f@"))]
+    assert {n.abs_path: n.propval("power-domains", list)[1]
+            for n in cores} == expected
+
+    # Each cluster maps the ATCM of each of its cores, tagged with the
+    # core's bank.
+    for cluster in {n.parent for n in cores}:
+        ranges = cluster.propval("ranges", list)
+        banks = sorted(int(n.name.split("@")[1])
+                       for n in cluster.subnodes(children_only=True))
+        assert sorted(ranges[0::6]) == banks
+
+
+def test_remoteproc_v2_rejects_second_relation_for_core(monkeypatch, capsys):
+    """Two remoteproc relations for one RPU core fail on the second one."""
+    tree = LopperTree()
+    axi = LopperNode(-1, "/axi")
+    axi["#address-cells"] = [2]
+    axi["#size-cells"] = [2]
+    tree + axi
+    monkeypatch.setattr(
+        openamp_xlnx, "get_platform",
+        lambda tree, verbose=0: openamp_xlnx.SOC_TYPE.ZYNQMP)
+    atcm = _tcm_node(tree, "psu_r5_1_atcm_global@ffe90000", 0x10000, 17)
+    btcm = _tcm_node(tree, "psu_r5_1_btcm_global@ffeb0000", 0x10000, 18)
+
+    # Two domains on RPU1, such as a baremetal and a Zephyr domain.
+    for index, tcm in enumerate((atcm, btcm)):
+        info = {"remote_node": _rpu_remote(0x8)}
+        assert openamp_xlnx.xlnx_remoteproc_rpu_parse(tree, None, info, [])
+        result = openamp_xlnx.xlnx_remoteproc_v2_construct_cluster(
+            tree, info, [tcm])
+        if index == 0:
+            assert result
+            ranges = tree["/remoteproc@ffe00000"].propval("ranges", list)
+
+    assert result is False
+    assert tree["/remoteproc@ffe00000"].propval("ranges", list) == ranges
+    assert ("/remoteproc@ffe00000/r5f@1 already exists; each RPU core can "
+            "have only one remoteproc relation") in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "relations, expected_error",
+    [
+        # A cluster in lockstep runs on its core 0.
+        ([(0x8, "lockstep", "psu_r5_1_atcm_global@ffe90000", 17)],
+         "RPU core 1 is core 1 of its cluster; a cluster in lockstep runs "
+         "on its core 0"),
+        # Core 1 is not free while the cluster runs in lockstep ...
+        ([(0x7, "lockstep", "psu_r5_0_atcm_global@ffe00000", 15),
+          (0x8, "split", "psu_r5_1_atcm_global@ffe90000", 17)],
+         "/remoteproc@ffe00000/r5f@0 already uses /remoteproc@ffe00000; a "
+         "cluster in lockstep can have only one remoteproc relation"),
+        # ... and a cluster with a split core cannot switch to lockstep.
+        ([(0x8, "split", "psu_r5_1_atcm_global@ffe90000", 17),
+          (0x7, "lockstep", "psu_r5_0_atcm_global@ffe00000", 15)],
+         "/remoteproc@ffe00000/r5f@1 already uses /remoteproc@ffe00000; a "
+         "cluster in lockstep can have only one remoteproc relation"),
+    ],
+)
+def test_remoteproc_v2_lockstep_cluster_has_one_relation(
+        monkeypatch, capsys, relations, expected_error):
+    """A cluster in lockstep has one remoteproc relation, on its core 0."""
+    tree = LopperTree()
+    axi = LopperNode(-1, "/axi")
+    axi["#address-cells"] = [2]
+    axi["#size-cells"] = [2]
+    tree + axi
+    monkeypatch.setattr(
+        openamp_xlnx, "get_platform",
+        lambda tree, verbose=0: openamp_xlnx.SOC_TYPE.ZYNQMP)
+
+    results = []
+    for core_pd, config, tcm_name, tcm_pd in relations:
+        info = {"remote_node": _rpu_remote(core_pd, config=config)}
+        assert openamp_xlnx.xlnx_remoteproc_rpu_parse(tree, None, info, [])
+        tcm = _tcm_node(tree, tcm_name, 0x10000, tcm_pd)
+        results.append(openamp_xlnx.xlnx_remoteproc_v2_construct_cluster(
+            tree, info, [tcm]))
+
+    assert all(results[:-1]) and results[-1] is False
+    assert expected_error in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "platform, core_pd, tcms, tcm_pds",
+    [
+        (openamp_xlnx.SOC_TYPE.ZYNQMP, 0x7,
+         ["psu-r5-0-atcm-global@ffe00000", "psu-r5-0-btcm-global@ffe20000",
+          "psu-r5-1-atcm-global@ffe90000", "psu-r5-1-btcm-global@ffeb0000"],
+         [0xF, 0x10, 0x11, 0x12]),
+        (openamp_xlnx.SOC_TYPE.VERSAL, 0x18110005,
+         ["psv_r5_0_atcm_global@ffe00000", "psv_r5_0_btcm_global@ffe20000",
+          "psv_r5_1_atcm_global@ffe90000", "psv_r5_1_btcm_global@ffeb0000"],
+         [0x1831800B, 0x1831800C, 0x1831800D, 0x1831800E]),
+    ],
+)
+def test_remoteproc_v2_r5_lockstep_matches_binding(
+        monkeypatch, platform, core_pd, tcms, tcm_pds):
+    """R5 lockstep maps core 1's banks after core 0's, as in the binding.
+
+    The xlnx,zynqmp-r5fss lockstep example: core 0 has ATCM and BTCM at
+    local 0x0 and 0x20000 (global 0xffe00000, 0xffe20000) and core 1's at
+    local 0x10000 and 0x30000 (global 0xffe10000, 0xffe30000), all in bank 0.
+    """
+    tree = LopperTree()
+    axi = LopperNode(-1, "/axi")
+    axi["#address-cells"] = [2]
+    axi["#size-cells"] = [2]
+    tree + axi
+    monkeypatch.setattr(
+        openamp_xlnx, "get_platform", lambda tree, verbose=0: platform)
+    info = {"remote_node": _rpu_remote(core_pd, config="lockstep")}
+    assert openamp_xlnx.xlnx_remoteproc_rpu_parse(tree, None, info, [])
+    nodes = [_tcm_node(tree, name, 0x10000, pd_id)
+             for name, pd_id in zip(tcms, tcm_pds)]
+
+    core = openamp_xlnx.xlnx_remoteproc_v2_construct_cluster(
+        tree, info, nodes)
+
+    cluster = tree["/remoteproc@ffe00000"]
+    assert cluster.propval("xlnx,cluster-mode", list) == [1]
+    assert cluster.propval("xlnx,tcm-mode", list) == [1]
+    assert cluster.propval("ranges", list) == [
+        0, 0x0, 0, 0xFFE00000, 0, 0x10000,
+        0, 0x20000, 0, 0xFFE20000, 0, 0x10000,
+        0, 0x10000, 0, 0xFFE10000, 0, 0x10000,
+        0, 0x30000, 0, 0xFFE30000, 0, 0x10000]
+    assert core.abs_path == "/remoteproc@ffe00000/r5f@0"
+    assert core.propval("reg", list) == [
+        0, 0x0, 0, 0x10000, 0, 0x20000, 0, 0x10000,
+        0, 0x10000, 0, 0x10000, 0, 0x30000, 0, 0x10000]
+    assert core.propval("reg-names", list) == [
+        "atcm0", "btcm0", "atcm1", "btcm1"]
+    assert core.propval("power-domains", list)[1::2] == [core_pd] + tcm_pds
+
+
+def test_remoteproc_v2_rejects_tcm_bank_listed_twice(monkeypatch, capsys):
+    """A TCM bank listed twice, such as by an SDT lockstep node, fails."""
+    tree = LopperTree()
+    axi = LopperNode(-1, "/axi")
+    axi["#address-cells"] = [2]
+    axi["#size-cells"] = [2]
+    tree + axi
+    monkeypatch.setattr(
+        openamp_xlnx, "get_platform",
+        lambda tree, verbose=0: openamp_xlnx.SOC_TYPE.ZYNQMP)
+    info = {"remote_node": _rpu_remote(0x7, config="lockstep")}
+    assert openamp_xlnx.xlnx_remoteproc_rpu_parse(tree, None, info, [])
+    # The SDT's psu_r5_0_atcm_lockstep node has core 0's ATCM power domain.
+    nodes = [_tcm_node(tree, "psu-r5-0-atcm-global@ffe00000", 0x10000, 15),
+             _tcm_node(tree, "psu-r5-0-atcm-lockstep@ffe10000", 0x10000, 15)]
+
+    assert openamp_xlnx.xlnx_remoteproc_v2_construct_cluster(
+        tree, info, nodes) is False
+    assert ("TCM node /axi/psu-r5-0-atcm-lockstep@ffe10000 is a TCM bank "
+            "that another elfload node of the remote already lists") in \
+        capsys.readouterr().out
+
+
+def test_rpmsg_allows_one_relation_per_remote_core():
+    """One host may have RPMsg relations to several remote cores."""
+    tree = LopperTree()
+    tree + LopperNode(-1, "/reserved-memory")
+    tree + LopperNode(-1, "/remoteproc@ffe00000")
+    for core_index in (0, 1):
+        carveouts = []
+        for name in ("vdev0vring0", "vdev0vring1", "vdev0buffer"):
+            node = LopperNode(
+                -1, f"/reserved-memory/rpu{core_index}{name}@"
+                    f"{0x9880000 + 0x100000 * core_index:x}")
+            tree + node
+            node.phandle_or_create()
+            carveouts.append(node)
+        core = LopperNode(-1, f"/remoteproc@ffe00000/r5f@{core_index}")
+        tree + core
+        core["memory-region"] = [carveouts[0].phandle]
+        ipi = LopperNode(-1, f"/ipi@ff34{core_index}000")
+        tree + ipi
+        ipi.phandle_or_create()
+        relation = LopperNode(
+            -1, f"/domains/APU/rpmsg-relation/relation{core_index}")
+        tree.sync()
+        assert openamp_xlnx.xlnx_rpmsg_update_tree_linux(
+            tree, relation, ipi, core, carveouts)
+        assert core.propval("mboxes", list) == [ipi.phandle, 0,
+                                                 ipi.phandle, 1]
+
+
+def test_rpmsg_rejects_second_relation_for_core(capsys):
+    """A second RPMsg relation to one remoteproc core fails."""
+    tree = LopperTree()
+    tree + LopperNode(-1, "/reserved-memory")
+    carveouts = []
+    for name in ("vdev0vring0@9880000", "vdev0vring1@9884000",
+                 "vdev0buffer@9888000"):
+        node = LopperNode(-1, f"/reserved-memory/{name}")
+        tree + node
+        node.phandle_or_create()
+        carveouts.append(node)
+    core = LopperNode(-1, "/remoteproc@ffe00000/r5f@0")
+    tree + LopperNode(-1, "/remoteproc@ffe00000")
+    tree + core
+    core["memory-region"] = [carveouts[0].phandle]
+    ipi = LopperNode(-1, "/ipi@ff340000")
+    tree + ipi
+    ipi.phandle_or_create()
+    relation = LopperNode(-1, "/domains/APU/rpmsg-relation/relation0")
+    tree.sync()
+
+    assert openamp_xlnx.xlnx_rpmsg_update_tree_linux(
+        tree, relation, ipi, core, list(carveouts))
+    assert not openamp_xlnx.xlnx_rpmsg_update_tree_linux(
+        tree, relation, ipi, core, list(carveouts))
+    assert ("/remoteproc@ffe00000/r5f@0 already has an RPMsg relation" in
+            capsys.readouterr().out)
+
+
+@pytest.mark.parametrize(
+    "libmetal_ipi, allowed",
+    [("/axi/ipi@ff340000/child@ff320000", False),
+     ("/axi/ipi@ff350000/child@ff320000", True)],
+)
+def test_libmetal_rejects_ipi_used_by_rpmsg(
+        monkeypatch, libmetal_ipi, allowed):
+    """libmetal cannot use an IPI agent that RPMsg uses as a mailbox."""
+    tree = LopperTree()
+    for path in ("/axi", "/axi/ipi@ff340000", "/axi/ipi@ff340000/child@ff310000",
+                 "/axi/ipi@ff340000/child@ff320000", "/axi/ipi@ff350000",
+                 "/axi/ipi@ff350000/child@ff320000"):
+        tree + LopperNode(-1, path)
+    for path in ("/axi/ipi@ff340000/child@ff310000", libmetal_ipi):
+        tree[path].phandle_or_create()
+        tree[path]["xlnx,ipi-bitmask"] = [0x100]
+    # RPMsg on RPU0 through IPI agent ff340000.
+    core = LopperNode(-1, "/remoteproc@ffe00000/r5f@0")
+    tree + LopperNode(-1, "/remoteproc@ffe00000")
+    tree + core
+    rpmsg_mbox = tree["/axi/ipi@ff340000/child@ff310000"].phandle
+    core["mboxes"] = [rpmsg_mbox, 0, rpmsg_mbox, 1]
+    # libmetal to RPU1.
+    relation = LopperNode(-1, "/domains/APU/libmetal-relation")
+    tree + LopperNode(-1, "/domains")
+    tree + LopperNode(-1, "/domains/APU")
+    tree + relation
+    channel = LopperNode(-1, "/domains/APU/libmetal-relation/relation0")
+    tree + channel
+    channel["mbox"] = [tree[libmetal_ipi].phandle]
+    tree.sync()
+    monkeypatch.setattr(
+        openamp_xlnx, "get_platform",
+        lambda tree, verbose=0: openamp_xlnx.SOC_TYPE.ZYNQMP)
+
+    assert openamp_xlnx.xlnx_libmetal_linux_setup_ipi(
+        tree, relation, "psu_cortexa53_0") is allowed
 
 
 def test_zephyr_ipc_shm_replaces_domain_carveout_references():

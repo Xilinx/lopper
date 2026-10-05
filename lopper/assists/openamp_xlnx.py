@@ -38,7 +38,7 @@ from openamp_xlnx_common import (
     _openamp_domain_selects_cpu,
 )
 from baremetalconfig_xlnx import get_cpu_node
-from lopper_lib import node_reg_start_size
+from lopper_lib import int_to_cells, node_reg_start_size
 from string import ascii_lowercase as alc
 
 _init(__name__)
@@ -298,6 +298,12 @@ def xlnx_rpmsg_update_tree_linux(tree, node, ipi_node, core_node, rpmsg_carveout
         the Linux remoteproc driver.
     """
     print(" -> xlnx_rpmsg_update_tree_linux", node)
+    # The core's remoteproc driver takes one mailbox and one vdev0buffer;
+    # a second RPMsg relation would replace the first one's mailbox.
+    if core_node.propval("mboxes") != ['']:
+        print(f"ERROR: {core_node.abs_path} already has an RPMsg relation; "
+              f"{node.abs_path} is a second one for the same RPU core")
+        return False
     vdev0buf_node = [n for n in rpmsg_carveouts if "vdev0buf" in n.name]
     if len(vdev0buf_node) == 1:
         vdev0buf_node[0] + LopperProp(name="compatible", value="shared-dma-pool")
@@ -858,6 +864,22 @@ def xlnx_libmetal_linux_setup_ipi(tree, relation_node, machine, verbose = 0 ):
             _error("openamp_xlnx: libmetal: cannot resolve IPI for %s" % node.abs_path)
             return False
 
+        # Linux binds an IPI agent either to the mailbox driver, as RPMsg
+        # needs, or to UIO, as libmetal needs; RPMsg relations are processed
+        # first, so their mboxes are already in the tree.
+        for user in tree["/"].subnodes():
+            mboxes = user.propval("mboxes", list)
+            if mboxes == [""] or not isinstance(mboxes[0], int):
+                continue
+            mbox = tree.pnode(mboxes[0])
+            if mbox is not None and mbox.parent is not None and \
+                    mbox.parent.abs_path == ipi_node.parent.abs_path:
+                _error("openamp_xlnx: libmetal: %s uses IPI %s, which %s "
+                       "already uses as a mailbox; use another IPI for "
+                       "libmetal" % (node.abs_path, ipi_node.parent.abs_path,
+                                     user.abs_path))
+                return False
+
         # setup IPI mask so UIO device's corresponding DT node has the remote's bitmask set.
         ipi_node.parent + LopperProp(name="libmetal,uio-ipi-bitmask", value=ipi_node.propval("xlnx,ipi-bitmask"))
 
@@ -1009,10 +1031,21 @@ def determinte_rpu_core(tree, cpu_config, remote_node):
         RPU_CORE | bool: Enum representing the selected core, or False on failure.
 
     Algorithm:
-        Validates the presence of ``core_num`` and converts it into the appropriate
-        ``RPU_CORE`` enum instance.
+        RPU cores have consecutive power-domain IDs, so the remote core's ID
+        in ``rpu_pd_val`` minus the platform's first RPU core ID gives the
+        core's number across all RPU clusters. SDTs give each R52 cluster,
+        and some give each R5 cluster, a single cpu@0, so ``core_num`` (the
+        CPU reg) is only used when the core's power domain is not known.
     """
     print(" -> determinte_rpu_core", cpu_config, remote_node)
+    rpu_pd_val = remote_node.propval("rpu_pd_val")
+    platform = get_platform(tree)
+    if platform in rpu_core_pd_ids and len(rpu_pd_val) > 1 and \
+            isinstance(rpu_pd_val[1], int):
+        first_id, count = rpu_core_pd_ids[platform]
+        if 0 <= rpu_pd_val[1] - first_id < count:
+            return RPU_CORE(rpu_pd_val[1] - first_id)
+
     if remote_node.propval("core_num") == ['']:
         print(" determinte_rpu_core failed. could not find core_num property no node: ", remote_node)
         return False
@@ -1169,9 +1202,13 @@ def xlnx_remoteproc_v2_add_cluster(tree, platform, cpu_config, cluster_ranges_va
             print("ERROR: ", "split" if cpu_config == CPU_CONFIG.RPU_SPLIT else "lockstep", "for cpu value mismatches the cluster.")
             return False
 
-        # only in split case, let range value be extended by both cores
+        # In split mode the cluster maps the banks of both cores: append this
+        # core's ranges to those already in the cluster node.
         if cpu_config == CPU_CONFIG.RPU_SPLIT:
-            cluster_node_props["ranges"].extend(cluster_ranges_val)
+            existing_ranges = cluster_node.propval("ranges", list)
+            if existing_ranges == [""]:
+                existing_ranges = []
+            cluster_node["ranges"] = existing_ranges + list(cluster_ranges_val)
 
     except KeyError:
         cluster_node = LopperNode(-1, cluster_node_path)
@@ -1246,20 +1283,20 @@ def xlnx_remoteproc_v2_cluster_base_str(platform, rpu_core):
         SOC_TYPE.VERSAL_NET: {
             RPU_CORE.RPU_0: "eba00000",
             RPU_CORE.RPU_1: "eba00000",
-            RPU_CORE.RPU_2: "eba40000",
-            RPU_CORE.RPU_3: "eba40000",
+            RPU_CORE.RPU_2: "eba80000",
+            RPU_CORE.RPU_3: "eba80000",
         },
         SOC_TYPE.VERSAL2: {
             RPU_CORE.RPU_0: "eba00000",
             RPU_CORE.RPU_1: "eba00000",
-            RPU_CORE.RPU_2: "ebb00000",
-            RPU_CORE.RPU_3: "ebb00000",
-            RPU_CORE.RPU_4: "ebc00000",
-            RPU_CORE.RPU_5: "ebc00000",
-            RPU_CORE.RPU_6: "ebac0000",
-            RPU_CORE.RPU_7: "ebac0000",
-            RPU_CORE.RPU_8: "ebbc0000",
-            RPU_CORE.RPU_9: "ebbc0000",
+            RPU_CORE.RPU_2: "eba80000",
+            RPU_CORE.RPU_3: "eba80000",
+            RPU_CORE.RPU_4: "ebb00000",
+            RPU_CORE.RPU_5: "ebb00000",
+            RPU_CORE.RPU_6: "ebb80000",
+            RPU_CORE.RPU_7: "ebb80000",
+            RPU_CORE.RPU_8: "ebc00000",
+            RPU_CORE.RPU_9: "ebc00000",
         },
         SOC_TYPE.ZYNQMP: {
             RPU_CORE.RPU_0: "ffe00000",
@@ -1272,6 +1309,26 @@ def xlnx_remoteproc_v2_cluster_base_str(platform, rpu_core):
     }
 
     return base_addresses[platform][rpu_core]
+
+def xlnx_rpu_tcm_owner(platform, tcm_id):
+    """Return the number of the RPU core that owns a TCM bank.
+
+    Args:
+        platform (SOC_TYPE): Detected platform.
+        tcm_id (int): Power-domain ID of the TCM bank, as listed in
+            ``rpu_tcm_pd_ids`` for the platform.
+
+    Returns:
+        int | None: RPU core number, or None when the ID is not a TCM bank
+        of the platform.
+    """
+    if platform not in rpu_tcm_pd_ids or not isinstance(tcm_id, int):
+        return None
+    first_id, banks = rpu_tcm_pd_ids[platform]
+    index = tcm_id - first_id
+    if 0 <= index < banks * rpu_core_pd_ids[platform][1]:
+        return index // banks
+    return None
 
 def xlnx_remoteproc_v2_construct_cluster(tree, openamp_channel_info, channel_elfload_nodes, verbose = 0):
     """Build the remoteproc cluster and core nodes for a channel.
@@ -1315,6 +1372,14 @@ def xlnx_remoteproc_v2_construct_cluster(tree, openamp_channel_info, channel_elf
 
     core_reg_names_mappings = r52_core_reg_names_mappings if get_platform(tree, 0) in [ SOC_TYPE.VERSAL2, SOC_TYPE.VERSAL_NET ] else r5_core_reg_names_mappings
 
+    # In R5 lockstep, the TCM of both cores is combined: core 1's ATCM and
+    # BTCM follow core 0's at local 0x10000 and 0x30000, and the cluster maps
+    # each local address to the cluster's global base plus that address. R52
+    # cores do not combine TCM in lockstep.
+    r5_lockstep = (cpu_config == CPU_CONFIG.RPU_LOCKSTEP and
+                   platform in (SOC_TYPE.ZYNQMP, SOC_TYPE.VERSAL))
+    tcm_bank_ids = set()
+
     # loop through TCM nodes
     for n in [ n for n in channel_elfload_nodes if n.propval("xlnx,ip-name") != [''] ]:
         # Preserve the complete provider/specifier tuple for the generated
@@ -1341,11 +1406,13 @@ def xlnx_remoteproc_v2_construct_cluster(tree, openamp_channel_info, channel_elf
         if legacy_pd_id is None and pd_id in legacy_memory_nodes:
             legacy_pd_id = pd_id
 
-        # Transitional SDTs may carry the legacy key separately. This remains
-        # a compatibility fallback; modern Versal2 mapping does not require it.
+        # Transitional SDTs may carry the legacy key separately. Versal2
+        # uses only the SCMI power-domains ID: xlnx,power-domain can
+        # disagree with it, and falling back would pair one bank's
+        # address with another bank's power domain.
         legacy_pd = n.propval("xlnx,power-domain", list)
-        if (legacy_pd_id is None and legacy_pd and
-                legacy_pd != [""]):
+        if (legacy_pd_id is None and platform != SOC_TYPE.VERSAL2 and
+                legacy_pd and legacy_pd != [""]):
             legacy_pd_id = legacy_pd[0]
 
         mapping = legacy_memory_nodes.get(legacy_pd_id)
@@ -1361,8 +1428,45 @@ def xlnx_remoteproc_v2_construct_cluster(tree, openamp_channel_info, channel_elf
                   f"power-domains ID {pd_id_string}{legacy_id_string}")
             return False
 
-        core_reg_val.extend(mapping["rpu_view"])
-        cluster_ranges_val.extend(mapping["system_view"])
+        # Each bank is listed once; the SDT's R5 lockstep TCM nodes, for
+        # example, carry core 0's power domains.
+        if legacy_pd_id in tcm_bank_ids:
+            print(f"ERROR: TCM node {node_path} is a TCM bank that another "
+                  f"elfload node of the remote already lists")
+            return False
+        tcm_bank_ids.add(legacy_pd_id)
+
+        # A core may only load its own TCM banks; in R5 lockstep, core 0
+        # uses the banks of both cores in its cluster.
+        owner = xlnx_rpu_tcm_owner(
+            platform, pd_id if platform == SOC_TYPE.VERSAL2 else legacy_pd_id)
+        if owner is not None and rpu_core is not False:
+            core = int(rpu_core)
+            if owner != core and not (r5_lockstep and owner // 2 == core // 2):
+                print(f"ERROR: TCM node {node_path} belongs to RPU core "
+                      f"{owner}, but the remote runs on RPU core {core}")
+                return False
+
+        # The SDT is authoritative for the TCM bank's global address and
+        # size. The table only supplies the core-local view (bank index
+        # and local offset), which the R52 SDTs do not describe.
+        tcm_base, tcm_size = node_reg_start_size(n)
+        if tcm_base is None or not tcm_size:
+            print(f"ERROR: TCM node {node_path} is missing a valid "
+                  "reg property")
+            return False
+        # Core-local view of the bank: remoteproc bank index and local offset.
+        local_view = mapping["rpu_view"][:2]
+        if r5_lockstep and owner is not None and owner % 2 == 1:
+            local_view = [0, local_view[1] + 0x10000]
+            tcm_base = int(xlnx_remoteproc_v2_cluster_base_str(
+                platform, rpu_core), 16) + local_view[1]
+
+        # Remoteproc ranges and reg use two address and two size cells.
+        size_cells = int_to_cells(tcm_size, 2)
+        core_reg_val.extend(local_view + size_cells)
+        cluster_ranges_val.extend(local_view + int_to_cells(tcm_base, 2) +
+                                  size_cells)
 
         # map TCM node name to binding compliant TCM name
         if not any(tcm_name_substr in n.name.lower() for tcm_name_substr in core_reg_names_mappings):
@@ -1375,6 +1479,34 @@ def xlnx_remoteproc_v2_construct_cluster(tree, openamp_channel_info, channel_elf
 
     # construct remoteproc cluster node
     cluster_node_path = "/remoteproc@" + xlnx_remoteproc_v2_cluster_base_str(platform, rpu_core)
+
+    # A core runs one firmware, so it has one remoteproc relation, and a
+    # cluster in lockstep runs one firmware on its core 0. Check before the
+    # cluster node changes: a second core node would replace the first one's
+    # properties.
+    core_index = int(rpu_core) % 2
+    lockstep = cpu_config == CPU_CONFIG.RPU_LOCKSTEP
+    if lockstep and core_index != 0:
+        print(f"ERROR: RPU core {int(rpu_core)} is core {core_index} of its "
+              "cluster; a cluster in lockstep runs on its core 0")
+        return False
+    try:
+        cluster_node = tree[cluster_node_path]
+    except KeyError:
+        cluster_node = None
+    if cluster_node is not None:
+        lockstep_cluster = lockstep or cluster_node.propval(
+            "xlnx,cluster-mode", list) == [int(CPU_CONFIG.RPU_LOCKSTEP)]
+        for existing in cluster_node.subnodes(children_only=True):
+            if lockstep_cluster:
+                print(f"ERROR: {existing.abs_path} already uses "
+                      f"{cluster_node_path}; a cluster in lockstep can have "
+                      "only one remoteproc relation")
+                return False
+            if existing.name.endswith(f"@{core_index}"):
+                print(f"ERROR: {existing.abs_path} already exists; each RPU "
+                      "core can have only one remoteproc relation")
+                return False
     if not xlnx_remoteproc_v2_add_cluster(tree, platform, cpu_config, cluster_ranges_val, cluster_node_path):
         return False
 
@@ -1421,7 +1553,8 @@ def xlnx_remoteproc_rpu_parse(tree, node, openamp_channel_info, elfload_nodes, v
 
     openamp_channel_info["rpu_core_pd_prop"] = remote_node.props("rpu_pd_val")[0]
     openamp_channel_info["cpu_config"] = cpu_config
-    openamp_channel_info["rpu_core"] = str(int(rpu_core))
+    # Index of the core in its two-core cluster, used to name the core node.
+    openamp_channel_info["rpu_core"] = str(int(rpu_core) % 2)
 
     return True
 
