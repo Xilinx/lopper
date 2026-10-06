@@ -238,3 +238,271 @@ class TestOverlayE2E:
         combined = result.stdout + result.stderr
         assert "user-overlay.dtsi" in combined, \
             f"Expected user-overlay.dtsi to appear in lopper output:\n{combined}"
+
+
+class TestOverlayNestedLabels:
+    """Labels on nodes below an overlay's fragment target must survive.
+
+    dtc records the label of every labelled overlay node under /__symbols__,
+    and nowhere else: the fragment target itself is recovered from __fixups__,
+    but anything deeper is only named there. Requesting symbols when compiling
+    the overlay is therefore the difference between a labelled node keeping its
+    name and being emitted anonymously.
+
+    Graph bindings make this the common case rather than a corner: ports /
+    port@N / endpoint puts the labelled node three levels below the target, so
+    any capture or display pipeline description depends on it.
+    """
+
+    # A labelled endpoint three levels below the fragment target, which is the
+    # shape of every device tree graph binding.
+    _OVERLAY = """\
+/dts-v1/;
+/plugin/;
+
+&mmi_dc {
+    ports {
+        port@0 {
+            dc_in_0: endpoint {
+            };
+        };
+    };
+};
+"""
+
+    def _compile(self, tmp_path):
+        """Compile the overlay against the base and return the tree metadata."""
+        base_file = tmp_path / "system-top.dts"
+        base_file.write_text(_BASE_DTS)
+
+        overlay_file = tmp_path / "nested.dtso"
+        overlay_file.write_text(self._OVERLAY)
+
+        sdt = LopperSDT(str(base_file))
+        sdt.dryrun = False
+        sdt.verbose = 0
+        sdt.werror = False
+        sdt.output_file = str(tmp_path / "out.dts")
+        sdt.cleanup_flag = True
+        sdt.save_temps = False
+        sdt.enhanced = True
+        sdt.outdir = str(tmp_path)
+        sdt.setup(sdt.dts, [], "", True, libfdt=True)
+
+        sdt._compile_overlay_subtrees([str(overlay_file)], str(tmp_path))
+        return sdt.tree._metadata
+
+    def test_symbols_are_collected_from_the_overlay(self, tmp_path):
+        """The overlay is compiled with symbols, so its labels are available.
+
+        Compiled without dtc's -@ the overlay DTB has no /__symbols__ at all,
+        and there is then nothing to recover the label from -- the failure is
+        silent and total rather than partial.
+        """
+        md = self._compile(tmp_path)
+
+        labels = md.get('overlay_symbol_labels', {})
+        assert labels, \
+            "no overlay symbol labels collected: the overlay was compiled " \
+            "without symbols, so dtc emitted no __symbols__ node"
+
+        collected = [lbl for pairs in labels.values() for _, lbl in pairs]
+        assert 'dc_in_0' in collected, \
+            f"the labelled endpoint was not among the collected labels: {collected}"
+
+    def test_nested_label_is_set_on_the_overlay_node(self, tmp_path):
+        """The label is applied to the node, not just returned alongside it.
+
+        Consumers that merge the overlay pick labels up from the returned list,
+        but those that copy the nodes instead -- fragment_add_for_refs() builds
+        &label fragments that way -- never see it. Setting it on the node means
+        both get it, since deepcopy carries the label.
+        """
+        md = self._compile(tmp_path)
+
+        found = {}
+
+        def walk(node):
+            if node.label:
+                found[node.label] = node.abs_path
+            for child in node.child_nodes.values():
+                walk(child)
+
+        for nodes in md.get('overlay_subtrees', {}).values():
+            for node in nodes:
+                walk(node)
+
+        assert 'dc_in_0' in found, \
+            f"the endpoint node carries no label; labelled nodes found: {found}"
+
+    def test_fragment_target_keeps_its_own_label(self, tmp_path):
+        """Baseline: the target label still comes from __fixups__ as before.
+
+        That path is independent of __symbols__, so it would keep working even
+        with symbols unavailable. Asserted so a regression there is not
+        mistaken for the nested-label failure.
+        """
+        md = self._compile(tmp_path)
+
+        roots = [n for nodes in md.get('overlay_subtrees', {}).values()
+                 for n in nodes]
+        assert roots, "no overlay subtrees were registered"
+        assert any(n.label == 'mmi_dc' for n in roots), \
+            f"fragment target lost its label: {[(n.abs_path, n.label) for n in roots]}"
+
+
+_FIXUP_BASE_DTS = """\
+/dts-v1/;
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+    compatible = "test";
+
+    amba: amba {
+        compatible = "simple-bus";
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        tgt: widget@a0000000 {
+            compatible = "test,widget";
+            reg = <0xa0000000 0x1000>;
+        };
+
+        sink: sink@b0000000 {
+            compatible = "test,sink";
+            reg = <0xb0000000 0x1000>;
+
+            sink_ep: endpoint {
+            };
+        };
+    };
+};
+"""
+
+# References sink_ep, which nothing in the base tree references. dtc therefore
+# never assigns it a phandle, which is the case the resolution has to cope
+# with rather than the exception.
+_FIXUP_OVERLAY = """\
+/dts-v1/;
+/plugin/;
+
+&tgt {
+    ports {
+        port@0 {
+            tgt_ep: endpoint {
+                remote-endpoint = <&sink_ep>;
+            };
+        };
+    };
+};
+"""
+
+
+class TestOverlayFixupResolution:
+    """A reference leaving an overlay must survive to the output.
+
+    dtc compiles an overlay without a base to resolve against, so a reference
+    out of it becomes 0xffffffff with the wanted label recorded in __fixups__.
+    Something has to bind that placeholder before the result is written, or the
+    property refers to nothing and is dropped.
+
+    The two consumers reach that point differently -- one merges the overlay
+    into a tree, the other transcribes it into a &label fragment -- so both are
+    covered here.
+    """
+
+    def _prepare(self, tmp_path):
+        base_file = tmp_path / "system-top.dts"
+        base_file.write_text(_FIXUP_BASE_DTS)
+
+        overlay_file = tmp_path / "fixups.dtso"
+        overlay_file.write_text(_FIXUP_OVERLAY)
+
+        sdt = LopperSDT(str(base_file))
+        sdt.dryrun = False
+        sdt.verbose = 0
+        sdt.werror = False
+        sdt.output_file = str(tmp_path / "out.dts")
+        sdt.cleanup_flag = True
+        sdt.save_temps = False
+        sdt.enhanced = True
+        sdt.outdir = str(tmp_path)
+        sdt.setup(sdt.dts, [], "", True, libfdt=True)
+
+        sdt._compile_overlay_subtrees([str(overlay_file)], str(tmp_path))
+        return sdt
+
+    def test_target_without_a_phandle_still_resolves_on_merge(self, tmp_path):
+        """A referenced node that dtc gave no phandle gets one.
+
+        dtc assigns a phandle only to a node something already references. A
+        node referenced solely by the overlay therefore has none, and skipping
+        it would abandon exactly the case this resolution exists for.
+        """
+        sdt = self._prepare(tmp_path)
+        merged = sdt.tree.overlay_tree("fixups")
+
+        holder = merged.__nodes__.get("/amba/widget@a0000000/ports/port@0/endpoint")
+        assert holder is not None, \
+            "the overlay's endpoint node is not in the merged tree"
+
+        prop = holder.__props__.get("remote-endpoint")
+        assert prop is not None, "remote-endpoint was dropped during the merge"
+
+        sink = merged.lnodes("sink_ep", exact=True)
+        assert sink, "the reference target is missing from the merged tree"
+        assert sink[0].phandle, \
+            "the target was left without a phandle, so nothing could be bound"
+        assert prop.value and prop.value[0] == sink[0].phandle, \
+            f"placeholder was not bound: {prop.value} != {sink[0].phandle}"
+
+    def test_transcribed_fragment_keeps_the_reference(self, tmp_path):
+        """The fragment path binds the placeholder too.
+
+        Nothing resolves fixups when an overlay is transcribed into a &label
+        fragment rather than merged -- that is the shape the PL overlay assists
+        emit -- so the placeholder reached the output and the property went
+        with it.
+        """
+        from lopper.tree import LopperTree
+
+        sdt = self._prepare(tmp_path)
+
+        out = LopperTree()
+        out.overlay_of(sdt.tree)        # drives fragment_add_for_refs()
+
+        endpoints = [n for p, n in out.__nodes__.items()
+                     if p.endswith("/ports/port@0/endpoint")]
+        assert endpoints, \
+            f"no fragment was emitted for the overlay: {sorted(out.__nodes__)}"
+
+        prop = endpoints[0].__props__.get("remote-endpoint")
+        assert prop is not None, \
+            "remote-endpoint was dropped from the emitted fragment"
+        assert prop.value and prop.value[0] != 0xffffffff, \
+            "the dtc placeholder reached the fragment unbound"
+
+    def test_reference_is_emitted_by_label(self, tmp_path):
+        """The written form is the label, not the number it resolved to.
+
+        A fragment is written to a source file and compiled later, against a
+        tree whose phandle numbering has no reason to match this one. Only the
+        label is meaningful outside the process that produced it.
+        """
+        from lopper.tree import LopperTree
+
+        sdt = self._prepare(tmp_path)
+
+        out = LopperTree()
+        out.overlay_of(sdt.tree)
+        out.resolve()
+
+        endpoints = [n for p, n in out.__nodes__.items()
+                     if p.endswith("/ports/port@0/endpoint")]
+        assert endpoints, "no fragment emitted"
+
+        prop = endpoints[0].__props__["remote-endpoint"]
+        rendered = getattr(prop, "string_val", "") or ""
+        assert "&sink_ep" in rendered, \
+            f"reference was not written by label: {rendered!r}"
