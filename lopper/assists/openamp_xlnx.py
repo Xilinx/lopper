@@ -38,7 +38,11 @@ from openamp_xlnx_common import (
     _openamp_domain_selects_cpu,
 )
 from baremetalconfig_xlnx import get_cpu_node
-from lopper_lib import int_to_cells, node_reg_start_size
+from lopper_lib import (
+    int_to_cells,
+    node_property_cells,
+    node_reg_start_size,
+)
 from string import ascii_lowercase as alc
 
 _init(__name__)
@@ -404,8 +408,12 @@ def xlnx_openamp_get_ddr_elf_load(machine, sdt):
                 print("OPENAMP: XLNX: ERROR: libmetal remote domain needs elfload property.")
                 return False
             elfload_node = sdt.tree.pnode(elfload[0])
-            reg_val = elfload_node.propval("reg")
-            return (reg_val[1], reg_val[3], "LIBMETAL_DDR")
+            try:
+                base, size = _required_reg_region(elfload_node)
+            except ValueError as exc:
+                print(exc)
+                return False
+            return (base, size, "LIBMETAL_DDR")
         print("OPENAMP: XLNX: ERROR: libmetal invalid domain setup.")
         return False
 
@@ -430,12 +438,14 @@ def xlnx_openamp_get_ddr_elf_load(machine, sdt):
                 return False
 
             # return reg from match
-            reg_val = relevant_elfload_nodes[0].propval("reg")
-            if reg_val == ['']:
-                print("OPENAMP: XLNX: ERROR: expected 'reg' property for elfload entry", relevant_elfload_nodes[0])
+            try:
+                base, size = _required_reg_region(
+                    relevant_elfload_nodes[0])
+            except ValueError as exc:
+                print(exc)
                 return False
 
-            return (reg_val[1], reg_val[3], "RSC_TABLE")
+            return (base, size, "RSC_TABLE")
 
     print("OPENAMP: XLNX: ERROR: unable to find elf load carveout")
     return False
@@ -515,11 +525,8 @@ def xlnx_openamp_configure_zephyr_ipc_shm(tree, ipc_nodes):
     regions = []
     ipc_phandles = set()
     for node in ipc_nodes:
-        reg = node.propval("reg", list)
-        if len(reg) < 4 or reg[3] <= 0:
-            raise ValueError("OPENAMP: XLNX: IPC carveout %s has invalid reg" %
-                             node.abs_path)
-        regions.append((reg[1], reg[1] + reg[3], node))
+        base, size = _required_reg_region(node)
+        regions.append((base, base + size, node))
         ipc_phandles.add(node.phandle)
     regions.sort(key=lambda region: region[0])
 
@@ -537,7 +544,10 @@ def xlnx_openamp_configure_zephyr_ipc_shm(tree, ipc_nodes):
 
     ipc_node = LopperNode(-1, "/reserved-memory/ipc@%s" % hex(base)[2:])
     ipc_node.label = "ipc_shm"
-    ipc_node + LopperProp(name="reg", value=[0, base, 0, size])
+    address_cells, size_cells = node_property_cells(tree["/reserved-memory"])
+    ipc_reg = (int_to_cells(base, address_cells) +
+               int_to_cells(size, size_cells))
+    ipc_node + LopperProp(name="reg", value=ipc_reg)
     ipc_node + LopperProp(name="compatible", value=["mmio-sram"])
     ipc_node + LopperProp(name="status", value="okay")
     tree + ipc_node
@@ -614,7 +624,12 @@ def xlnx_rpmsg_update_tree_zephyr(machine, tree, ipi_node, domain_node, ipc_node
     if direct_ipm_target:
         mbox_ipm_node = ipi_node
     else:
-        mbox_ipm_node = LopperNode(-1, "/mbox_ipi_%s_%s" % (hex(ipi_node['reg'][1])[2:], hex(ipi_node.parent['reg'][1])[2:]))
+        ipi_base, _ = _required_reg_region(ipi_node)
+        controller_base, _ = _required_reg_region(ipi_node.parent)
+        mbox_ipm_node = LopperNode(
+            -1,
+            "/mbox_ipi_%s_%s" %
+            (hex(ipi_base)[2:], hex(controller_base)[2:]))
         mbox_ipm_props = { "compatible" : "zephyr,mbox-ipm", "mbox-names" : ['tx', 'rx'], "status": "okay", "mboxes" : [ipi_node.phandle, 0, ipi_node.phandle, 1] }
         [mbox_ipm_node +  LopperProp(name=n, value=mbox_ipm_props[n]) for n in mbox_ipm_props]
         tree.add(mbox_ipm_node)
@@ -792,16 +807,36 @@ def xlnx_openamp_gen_outputs_only(tree, machine, output_file, memory_region_node
         header to the requested output path.
     """
     vrings = [n for n in memory_region_nodes if 'vring' in n.name]
-    vring_total_sz = hex(sum(n.propval("reg")[3] for n in vrings))
-    shm_pa = hex(min(n.propval("reg")[1] for n in vrings))
-    shbuf_sz = hex([n.propval("reg")[1] for n in memory_region_nodes if 'vdev0buffer' in n.name][0])
-
+    buffers = [n for n in memory_region_nodes if 'vdev0buffer' in n.name]
     remote_ipi = host_ipi.parent
+
+    try:
+        vring_regions = [_required_reg_region(node) for node in vrings]
+        if not vring_regions:
+            raise ValueError("OPENAMP: XLNX: no vring carveouts were found")
+        if len(buffers) != 1:
+            raise ValueError(
+                "OPENAMP: XLNX: expected one vdev0buffer carveout; found %d" %
+                len(buffers))
+        shbuf_base, shbuf_size = _required_reg_region(buffers[0])
+        remote_ipi_base, _ = _required_reg_region(remote_ipi)
+    except ValueError as exc:
+        _error(str(exc))
+        return False
+
+    shm_base = min(base for base, _ in vring_regions)
+    if shbuf_base < shm_base:
+        _error("OPENAMP: XLNX: vdev0buffer precedes the vring carveouts")
+        return False
+
+    shm_pa = hex(shm_base)
+    shbuf_sz = hex(shbuf_size)
+    shbuf_offset = hex(shbuf_base - shm_base)
 
     remote_vect_id = remote_ipi.propval('xlnx,int-id')[0]
     ipi_irq_vect_id = hex(remote_vect_id)
     ipi_irq_vect_id_rtos = hex(remote_vect_id-32)
-    remote_ipi_str = hex(remote_ipi.propval('reg')[1])
+    remote_ipi_str = hex(remote_ipi_base)
     host_bitmask = hex(host_ipi.propval('xlnx,ipi-bitmask')[0])
 
     try:
@@ -817,7 +852,7 @@ def xlnx_openamp_gen_outputs_only(tree, machine, output_file, memory_region_node
         "RING_RX": "FW_RSC_U32_ADDR_ANY",
         "SHARED_MEM_PA": shm_pa,
         "SHARED_MEM_SIZE": shbuf_sz,
-        "SHARED_BUF_OFFSET": vring_total_sz,
+        "SHARED_BUF_OFFSET": shbuf_offset,
         "EXTRAS":"",
         }
 
@@ -1054,13 +1089,6 @@ def determinte_rpu_core(tree, cpu_config, remote_node):
     return RPU_CORE(core_index)
 
 
-def cells_to_int(cells):
-    val = 0
-    for c in cells:
-        val = (val << 32) | c
-    return val
-
-
 def xlnx_validate_carveouts(tree, carveouts):
     """Verify that carveout regions do not overlap within reserved memory.
 
@@ -1093,36 +1121,31 @@ def xlnx_validate_carveouts(tree, carveouts):
         print("ERROR: malformed reserved memory - expected #size-cells and #address-cells")
         return False
 
-    addr_cells = res_mem_node.propval('#address-cells')[0]
-    size_cells = res_mem_node.propval('#size-cells')[0]
-
-
-    carveout_pairs = [ [ carveout.propval("reg")[1], carveout.propval("reg")[3] ] for carveout in carveouts ]
+    try:
+        carveout_pairs = {
+            _required_reg_region(carveout) for carveout in carveouts
+        }
+    except ValueError as exc:
+        _error(str(exc))
+        return False
 
     # validate no overlaps or conflicts by generating 2d array of reg values from each reserved memory
     # this array contains reg values for such validation
-    res_mem_regs = [ n.propval("reg") for n in res_mem_node.subnodes(children_only=True) if n.propval("reg") != [''] ]
-
-    for i in range(len(res_mem_regs)):
-        reg1 = res_mem_regs[i]
-
-        # Defensive check
-        if len(reg1) < addr_cells + size_cells:
+    res_mem_regions = []
+    for node in res_mem_node.subnodes(children_only=True):
+        base, size = node_reg_start_size(node)
+        if base is None or size is None or size <= 0:
             continue
+        res_mem_regions.append((base, size))
 
-        base1 = cells_to_int(reg1[:addr_cells])
-        size1 = cells_to_int(reg1[addr_cells:addr_cells + size_cells])
+    for i in range(len(res_mem_regions)):
+        base1, size1 = res_mem_regions[i]
 
-        for j in range(i + 1, len(res_mem_regs)):
-            reg2 = res_mem_regs[j]
-
-            if len(reg2) < addr_cells + size_cells:
-                continue
-
-            base2 = cells_to_int(reg2[:addr_cells])
-            size2 = cells_to_int(reg2[addr_cells:addr_cells + size_cells])
+        for j in range(i + 1, len(res_mem_regions)):
+            base2, size2 = res_mem_regions[j]
             # Only validate relevant carveouts
-            if [base1, size1] not in carveout_pairs:
+            if ((base1, size1) not in carveout_pairs and
+                    (base2, size2) not in carveout_pairs):
                 continue
             # Overlap check
             if base1 < base2 + size2 and base2 < base1 + size1:
