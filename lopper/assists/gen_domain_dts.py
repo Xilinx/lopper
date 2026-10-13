@@ -60,6 +60,16 @@ def is_compat( node, compat_string_to_test ):
     return ""
 
 
+def find_fpga_parent(sdt):
+    """Find the root-level fpga-region node that has fpga-mgr."""
+    for node in sdt.tree['/'].subnodes():
+        if (node.depth == 1 and
+            'fpga-region' in node.propval('compatible', list) and
+            node.propval('fpga-mgr') != ['']):
+            return node
+    return None
+
+
 def filter_ipi_nodes_for_cpu(sdt, machine):
     """
     Filter IPI nodes for A78 processors:
@@ -215,14 +225,14 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                     if not has_reg and not has_ranges or not has_at_symbol:
                         nodes_to_move.append(subnode)
 
-            # Move the identified nodes to root (top-level nodes only, preserving their subnodes)
-            for subnode in nodes_to_move:
-                # Simply move the node by updating its path and parent
-                subnode.abs_path = subnode.abs_path.replace("/amba_pl/", "/")
+            fpga_parent = find_fpga_parent(sdt)
 
-                # Remove the original node from amba_pl and add the new node to root
-                amba_pl_node.delete(subnode)
-                sdt.tree.add(subnode)
+            for subnode in nodes_to_move:
+                is_pr = ('fpga-region' in subnode.propval('compatible', list)
+                         and fpga_parent is not None)
+                new_path = (fpga_parent.abs_path + "/" + subnode.name if is_pr
+                            else subnode.abs_path.replace("/amba_pl/", "/"))
+                sdt.tree.move(subnode, subnode.abs_path, new_path)
 
     filter_ipi_nodes_for_cpu(sdt, machine)
 
@@ -438,6 +448,13 @@ def xlnx_generate_domain_dts(tgt_node, sdt, options):
                     continue
                 elif (xlnx_openamp_keep_node(linux_dt, False, node, sdt.tree) or
                       _node_must_be_preserved(node, sdt.tree)):
+                    continue
+                # sdtgen can merge contiguous R5 TCM GLOBAL windows into one
+                # address-map entry (e.g. psv_r5_0_atcm_global size 0x40000), so
+                # individual *-tcm-global / *-lockstep nodes are unmapped and
+                # would be pruned here. Keep them for baremetal so create_bsp
+                # still emits TCM GLOBAL definitions in bsp.yaml and xparameters.h.
+                elif not linux_dt and node.propval('compatible') != [''] and "tcm" in node.propval('compatible', list)[0]:
                     continue
                 # dual-mapped 8-cell reg won't match either domain's address-map; preserve here so
                 # zephyr_domain_dts.py's xlnx_remove_unsupported_nodes can slice it
