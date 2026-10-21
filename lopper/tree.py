@@ -2635,6 +2635,7 @@ class LopperNode(object):
             # Note: duplicate phandle detection is done lazily at resolve() time
             # via lopper.audit.check_duplicate_phandles() for better performance
             self.tree.__pnodes__[value] = self
+            self.tree._phandle_seen( value )
 
         # Set the phandle attribute (after index updates to avoid recursion via __setattr__)
         self.__dict__['phandle'] = value
@@ -3115,6 +3116,7 @@ class LopperNode(object):
 
         # Update the tree's phandle index so pnode() lookups work
         self.tree.__pnodes__[new_ph] = self
+        self.tree._phandle_seen( new_ph )
 
         _debug( "phandle {self.phandle} created for node {self.abs_path}" )
 
@@ -4238,6 +4240,11 @@ class LopperTree:
         self.__nnodes__ = OrderedDict()
         # nodes, indexed by phandle
         self.__pnodes__ = OrderedDict()
+        # highest phandle this tree has ever handed out. __pnodes__ only knows
+        # what is live, so deleting the highest numbered node would otherwise
+        # lower the mark and let the next allocation reuse that number. See
+        # phandle_gen().
+        self.__phandle_watermark__ = 0
         # nodes, indexed by label
         self.__lnodes__ = OrderedDict()
         # nodes. indexed by aliases
@@ -4446,6 +4453,12 @@ class LopperTree:
         # prop.resolve() / tree.deref() work correctly on the copy.
         for node in result.__nodes__.values():
             node.tree = result
+
+        # Shift the overlay clear of this tree's numbering before merging.
+        # __pnodes__ is keyed by phandle, so an overlay node arriving on a
+        # number the base already uses silently evicts the base's entry and
+        # the references to it stop resolving.
+        self.apply_potential_overlay( name )
 
         for ov_node in self._metadata.get('overlay_subtrees', {}).get(name, []):
             _merge_node_into_tree(result, ov_node)
@@ -5006,6 +5019,14 @@ class LopperTree:
         # --- source 2: user overlay subtrees (-i files) ---
         subtrees = self._metadata.get('overlay_subtrees', {})
         for stem, nodes in subtrees.items():
+            # Writing an overlay out beside this tree's content is a form of
+            # applying it: both end up in one file, and a number means one
+            # thing there. The overlay was compiled on its own and numbered
+            # from 1, as this tree did, so shift it clear before anything is
+            # transcribed. Per overlay and in order, so several of them clear
+            # each other as well as the base.
+            self.apply_potential_overlay( stem )
+
             for ov_node in nodes:
                 if not ov_node.label:
                     lopper.log._warning(f"overlay subtree node {ov_node.abs_path} has no label, skipping")
@@ -5242,22 +5263,22 @@ class LopperTree:
 
             if not target.phandle or target.phandle < 0:
                 # Referenced only by the overlay, so dtc never gave it one.
-                #
-                # It has to be clear of both trees, not just the one the target
-                # sits in.  The overlay was compiled on its own and numbered
-                # its internal phandles from 1, so minting from the base alone
-                # will collide with them and the reference silently resolves to
-                # whichever overlay node already holds that number.
-                highest = 0
-                for tree in search:
-                    pnodes = getattr( tree, '__pnodes__', None ) or {}
-                    if pnodes:
-                        highest = max( highest, max(pnodes.keys()) )
-                for node in fragment.subnodes():
-                    if node.phandle and node.phandle > highest:
-                        highest = node.phandle
+                # It has to be distinct across both trees rather than just the
+                # one the target sits in, since each numbered its phandles
+                # without knowing about the other.
+                others = [ t for t in search if t is not owner ]
+                new_phandle = owner.phandle_gen( also=others )
 
-                target.phandle = highest + 1
+                # The fragment is not in a tree yet -- it is added once this
+                # returns -- so the phandles it carries are in neither index
+                # and phandle_gen() cannot see them. They are the ones most
+                # likely to collide, being numbered from 1 by the standalone
+                # overlay compile, so step over them explicitly.
+                for node in fragment.subnodes():
+                    if node.phandle and node.phandle >= new_phandle:
+                        new_phandle = node.phandle + 1
+
+                target.phandle = new_phandle
 
             for ref in refs:
                 try:
@@ -5379,31 +5400,161 @@ class LopperTree:
         """
         return list(self.__pnodes__.keys())
 
-    def phandle_gen( self ):
+    def apply_potential_overlay( self, name ):
+        """Shift a held overlay's phandles clear of this tree, without merging
+
+        A standalone overlay compile numbers its phandles from 1, exactly as
+        this tree did, so the two have handed the same numbers to different
+        nodes. libfdt settles that at fdt_overlay_apply() time by shifting
+        every phandle in the overlay past the base's maximum before anything
+        is merged, which makes a clash arithmetically impossible rather than
+        something to detect and repair.
+
+        This is that step on its own. The overlay is renumbered and this
+        tree's mark is raised past it, but nothing is merged and this tree is
+        not modified. An overlay may still be written out separately as its
+        own source afterwards -- that is a form of apply rather than a
+        different operation, and it is where an unshifted overlay does its
+        damage: a base property holding a number the overlay also uses
+        resolves to the overlay's node and is written as a reference to it.
+
+        The shift accumulates. Each call takes its delta from the mark the
+        last one raised, so a second overlay clears this tree *and* the first
+        overlay, which is what libfdt gets by applying them in sequence.
+
+        Renumbering is in place. Nothing is lost by it -- a phandle number
+        carries no meaning beyond being distinct within its tree -- so an
+        overlay can be shifted again later if it is applied somewhere else.
+
+        The overlay's own internal references still hold their original
+        numbers in the property cells. Those are rebound by path rather than
+        by value, so they pick up whatever the target ends up with, which
+        means resolution has to run after this and never before.
+
+        What this deliberately does not do is publish the overlay's symbols.
+        libfdt's last apply step folds an applied overlay's __symbols__ into
+        the base so later overlays can reference them, but that is a
+        consequence of really applying: the base gained the nodes. Nothing is
+        applied here and the base is untouched, so an overlay referencing a
+        label defined in another overlay does not resolve. dtc has no cross
+        overlay notion when compiling either -- that resolution only exists
+        at apply time against a live base -- so there is nothing to carry
+        over when overlays are written out as source.
+
+        Args:
+           name (string): overlay name (stem), as registered
+
+        Returns:
+           int: the delta applied, 0 if there was nothing to shift
+        """
+        nodes = self._metadata.get( 'overlay_subtrees', {} ).get( name )
+        if not nodes:
+            return 0
+
+        delta = getattr( self, '__phandle_watermark__', 0 )
+        if self.__pnodes__:
+            delta = max( delta, max( self.__pnodes__.keys() ) )
+
+        if delta <= 0:
+            return 0
+
+        highest = 0
+
+        def _shift( node ):
+            nonlocal highest
+            if node.phandle and node.phandle > 0:
+                node.phandle = node.phandle + delta
+                highest = max( highest, node.phandle )
+            for child in node.child_nodes.values():
+                _shift( child )
+
+        for n in nodes:
+            _shift( n )
+
+        self._phandle_seen( highest )
+
+        lopper.log._debug( f"overlay '{name}': phandles shifted by {delta}" )
+
+        return delta
+
+    def _phandle_seen( self, phandle ):
+        """Record that this tree has carried this phandle number.
+
+        Called wherever __pnodes__ gains an entry, so the allocator's mark
+        covers every number the tree has ever held rather than only the ones
+        it minted itself. A phandle that arrived from dtc or was loaded from
+        a dtb has to retire exactly as one from phandle_gen() does -- the
+        reference left behind when its node is deleted does not care where
+        the number originally came from.
+
+        Args:
+           phandle (int): the number now in use
+        """
+        try:
+            if phandle and phandle > getattr( self, '__phandle_watermark__', 0 ):
+                self.__phandle_watermark__ = phandle
+        except Exception:
+            pass
+
+    def phandle_gen( self, also=None ):
         """Generate a phandle for use in a node
 
         Creates a unique phandle for a node. This is basic tracking and is
         used since fdt_find_max_phandle is not fully exposed, and removes
         a binding to libfdt.
 
+        Unique within this tree by default, which is all a phandle has to be
+        while it stays here. A node that will be referenced from somewhere
+        else needs more than that: a tree compiled on its own starts numbering
+        from 1, so two trees brought together have numbered the same phandles
+        independently, and one minted from either alone collides with the
+        other. Pass the trees it has to be distinct from as `also`.
+
         Args:
-           None
+           also (list of LopperTree, optional): further trees the result must
+                                                not collide with
 
         Returns:
            phandle number
 
         """
-        if self.__pnodes__:
-            sorted_phandles = sorted(list(self.__pnodes__.keys()))
-            highest_phandle = sorted_phandles[-1]
-        else:
-            # no phandles at all yet!
-            highest_phandle = 0
+        trees = [ self ] + list( also or [] )
+
+        highest_phandle = 0
+        # (see _phandle_seen() for how the watermark is maintained)
+        for tree in trees:
+            pnodes = getattr( tree, '__pnodes__', None )
+            if pnodes:
+                highest_phandle = max( highest_phandle, max( pnodes.keys() ) )
+            # A number that has been handed out before must not come back,
+            # even once the node holding it is gone. __pnodes__ only knows
+            # what is live, so deleting the highest numbered node lowers that
+            # maximum and the next allocation lands exactly on the number it
+            # just freed. Properties elsewhere are still holding it: deleting
+            # a node does not rewrite the references to it, so such a
+            # reference is left pointing at a bare integer. While that integer
+            # resolves to nothing the reference is dangling, and write time
+            # strict mode drops it, which is the visible failure we want.
+            # Reissue the number and it silently resolves again, to whatever
+            # unrelated node now holds it.
+
+            highest_phandle = max( highest_phandle,
+                                   getattr( tree, '__phandle_watermark__', 0 ) )
 
         ret_phandle = highest_phandle + 1
         if ret_phandle == 0:
             _warning( "phandle of 0 (invalid) was generated, tree may be corrupted" )
             ret_phandle = ret_phandle + 1
+
+        # Record against every tree the caller asked this to be distinct from,
+        # since the number is now spoken for across all of them regardless of
+        # which one the node ends up in.
+        for tree in trees:
+            try:
+                if ret_phandle > getattr( tree, '__phandle_watermark__', 0 ):
+                    tree.__phandle_watermark__ = ret_phandle
+            except Exception:
+                pass
 
         return ret_phandle
 
@@ -6070,6 +6221,7 @@ class LopperTree:
             self.__nnodes__[node.number] = node
         if node.phandle > 0:
             self.__pnodes__[node.phandle] = node
+            self._phandle_seen( node.phandle )
         if node.label:
             try:
                 if self.__lnodes__[node.label]:
